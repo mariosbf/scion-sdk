@@ -84,6 +84,8 @@ pub mod test_builder;
 /// Signed-message helpers for authenticated payloads.
 pub mod signed_message;
 
+pub mod hummingbird;
+
 /// Minimum MTU along any path or within any AS.
 pub const PATH_MIN_MTU: u16 = 1280;
 
