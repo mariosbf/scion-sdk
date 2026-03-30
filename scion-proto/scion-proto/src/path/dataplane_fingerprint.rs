@@ -16,6 +16,8 @@ use std::{fmt, ops::Deref};
 
 use sha2::{Digest, Sha256};
 
+use crate::path::EncodedHopField;
+
 use super::Path;
 
 /// A fingerprint for a SCION path, derived from the dataplane path.

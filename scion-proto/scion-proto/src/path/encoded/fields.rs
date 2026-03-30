@@ -19,7 +19,7 @@ use std::{iter, num::NonZeroU16, slice::ChunksExact, time::Duration};
 use bytes::Buf;
 use chrono::{DateTime, Utc};
 
-use crate::path::{StandardHopField, InfoField};
+use crate::path::{InfoField, StandardHopField};
 
 /// A SCION path info field.
 ///
@@ -94,29 +94,17 @@ impl AsRef<[u8]> for EncodedInfoField {
     }
 }
 
-/// A SCION path hop field.
-///
-/// Contains information to be processed by SCION routers, such as path interfaces and
-/// hop expiration time.
-#[repr(transparent)]
-#[derive(Debug, PartialEq, Eq)]
-pub struct EncodedHopField {
-    inner: [u8],
-}
-
-impl EncodedHopField {
+/// A trait for views into SCION hop fields.
+/// Structs that implement EncodeHopField are unsized.
+pub trait EncodedHopField {
     /// The length of the hop field in bytes.
-    pub const LENGTH: usize = StandardHopField::ENCODED_SIZE;
+    const LENGTH: usize;
 
     /// A view of a HopField in a SCION standard path.
     ///
     /// This is an unsized type, meaning that it must always be used behind a pointer
     /// like `&` or [`Box`].
-    pub fn new(data: &[u8]) -> &Self {
-        assert_eq!(data.len(), StandardHopField::ENCODED_SIZE);
-
-        unsafe { &*(data as *const [u8] as *const Self) }
-    }
+    fn new(data: &[u8]) -> &Self;
 
     /// A mutable view of a HopField in a SCION standard path.
     ///
@@ -124,66 +112,43 @@ impl EncodedHopField {
     ///
     /// This is an unsized type, meaning that it must always be used behind a pointer
     /// like `&` or [`Box`].
-    pub fn new_mut(data: &mut [u8]) -> &mut Self {
-        assert_eq!(data.len(), StandardHopField::ENCODED_SIZE);
-        unsafe { &mut *(data as *mut [u8] as *mut Self) }
-    }
+    fn new_mut(data: &mut [u8]) -> &mut Self;
 
     /// Returns true if the ConsIngress Router Alert flag is set.
     ///
     /// When set on the hop field, the ConsIngress Router Alert flag indicates to the processing
     /// ingress router (in the construction/beaconing direction) that it should process the L4
     /// payload in the packet.
-    pub fn is_cons_ingress_router_alert(&self) -> bool {
-        (self.inner[0] & StandardHopField::FLAGS_INGRESS_ROUTER_ALERT) != 0
-    }
+    fn is_cons_ingress_router_alert(&self) -> bool;
 
     /// Sets (true) or unsets (false) the ConsIngress Router Alert flag.
     ///
     /// See [is_cons_ingress_router_alert][`Self::is_cons_ingress_router_alert`] for a description
     /// of the flag.
-    pub fn set_cons_ingress_router_alert(&mut self, enable: bool) {
-        if enable {
-            self.inner[0] |= StandardHopField::FLAGS_INGRESS_ROUTER_ALERT;
-        } else {
-            self.inner[0] &= !StandardHopField::FLAGS_INGRESS_ROUTER_ALERT;
-        }
-    }
+    fn set_cons_ingress_router_alert(&mut self, enable: bool);
 
     /// Returns true if the ConsEgress Router Alert flag is set.
     ///
     /// When set on the hop field, the ConsEgress Router Alert flag indicates to the processing
     /// egress router (in the construction/beaconing direction) that it should process the L4
     /// payload in the packet.
-    pub fn is_cons_egress_router_alert(&self) -> bool {
-        (self.inner[0] & StandardHopField::FLAGS_EGRESS_ROUTER_ALERT) != 0
-    }
+    fn is_cons_egress_router_alert(&self) -> bool;
 
     /// Sets (true) or unsets (false) the ConsEgress Router Alert flag.
     ///
     /// See [is_cons_egress_router_alert][`Self::is_cons_egress_router_alert`] for a description
     /// of the flag.
-    pub fn set_cons_egress_router_alert(&mut self, enable: bool) {
-        if enable {
-            self.inner[0] |= StandardHopField::FLAGS_EGRESS_ROUTER_ALERT;
-        } else {
-            self.inner[0] &= !StandardHopField::FLAGS_EGRESS_ROUTER_ALERT;
-        }
-    }
+    fn set_cons_egress_router_alert(&mut self, enable: bool);
 
     /// Returns the ingress interface in the construction (beaconing) direction.
     ///
     /// Returns None if the hop field indicates that the ingress interface is the local AS.
-    pub fn cons_ingress_interface(&self) -> Option<NonZeroU16> {
-        NonZeroU16::new(((self.inner[2] as u16) << 8) | self.inner[3] as u16)
-    }
+    fn cons_ingress_interface(&self) -> Option<NonZeroU16>;
 
     /// Returns the egress interface in the construction (beaconing) direction.
     ///
     /// Returns None if the hop field indicates that the ingress interface is the local AS.
-    pub fn cons_egress_interface(&self) -> Option<NonZeroU16> {
-        NonZeroU16::new(((self.inner[4] as u16) << 8) | self.inner[5] as u16)
-    }
+    fn cons_egress_interface(&self) -> Option<NonZeroU16>;
 
     /// Returns the ingress interface according to the segment direction.
     ///
@@ -192,13 +157,7 @@ impl EncodedHopField {
     ///
     /// See [cons_ingress_interface][`Self::cons_ingress_interface`] for the ingress interface in
     /// the constructed direction.
-    pub fn ingress_interface(&self, info_field: &EncodedInfoField) -> Option<NonZeroU16> {
-        if info_field.is_constructed_dir() {
-            self.cons_ingress_interface()
-        } else {
-            self.cons_egress_interface()
-        }
-    }
+    fn ingress_interface(&self, info_field: &EncodedInfoField) -> Option<NonZeroU16>;
 
     /// Returns the egress interface according to the segment direction.
     ///
@@ -207,13 +166,7 @@ impl EncodedHopField {
     ///
     /// See [cons_egress_interface][`Self::cons_egress_interface`] for the egress interface in
     /// the constructed direction.
-    pub fn egress_interface(&self, info_field: &EncodedInfoField) -> Option<NonZeroU16> {
-        if info_field.is_constructed_dir() {
-            self.cons_egress_interface()
-        } else {
-            self.cons_ingress_interface()
-        }
-    }
+    fn egress_interface(&self, info_field: &EncodedInfoField) -> Option<NonZeroU16>;
 
     /// Returns the expiration offset of this hop field.
     ///
@@ -221,25 +174,104 @@ impl EncodedHopField {
     /// hop field will be valid.
     ///
     /// The exact expiry time can be calculated with the [expiry_time][`Self::expiry_time`] method.
-    pub fn expiry_offset(&self) -> Duration {
-        StandardHopField::DURATION_PER_EXP_UNIT * (1 + self.inner[1] as u32)
-    }
+    fn expiry_offset(&self) -> Duration;
 
     /// Returns the expiration time unit of this hop field.
-    pub fn expiration_units(&self) -> u8 {
-        self.inner[1]
-    }
+    fn expiration_units(&self) -> u8;
 
     /// Returns the expiration time of this hop field.
     ///
     /// This computes the hop field's expiry time relative to the the
     /// [timestamp][`EncodedInfoField::timestamp`] in the provided EncodedInfoField.
-    pub fn expiry_time(&self, info_field: &EncodedInfoField) -> DateTime<Utc> {
+    fn expiry_time(&self, info_field: &EncodedInfoField) -> DateTime<Utc>;
+}
+
+/// A SCION path hop field.
+///
+/// Contains information to be processed by SCION routers, such as path interfaces and
+/// hop expiration time.
+#[repr(transparent)]
+#[derive(Debug, PartialEq, Eq)]
+pub struct EncodedStandardHopField {
+    inner: [u8],
+}
+
+impl EncodedHopField for EncodedStandardHopField {
+    const LENGTH: usize = StandardHopField::ENCODED_SIZE;
+
+    fn new(data: &[u8]) -> &Self {
+        assert_eq!(data.len(), StandardHopField::ENCODED_SIZE);
+
+        unsafe { &*(data as *const [u8] as *const Self) }
+    }
+
+    fn new_mut(data: &mut [u8]) -> &mut Self {
+        assert_eq!(data.len(), StandardHopField::ENCODED_SIZE);
+        unsafe { &mut *(data as *mut [u8] as *mut Self) }
+    }
+
+    fn is_cons_ingress_router_alert(&self) -> bool {
+        (self.inner[0] & StandardHopField::FLAGS_INGRESS_ROUTER_ALERT) != 0
+    }
+
+    fn set_cons_ingress_router_alert(&mut self, enable: bool) {
+        if enable {
+            self.inner[0] |= StandardHopField::FLAGS_INGRESS_ROUTER_ALERT;
+        } else {
+            self.inner[0] &= !StandardHopField::FLAGS_INGRESS_ROUTER_ALERT;
+        }
+    }
+
+    fn is_cons_egress_router_alert(&self) -> bool {
+        (self.inner[0] & StandardHopField::FLAGS_EGRESS_ROUTER_ALERT) != 0
+    }
+
+    fn set_cons_egress_router_alert(&mut self, enable: bool) {
+        if enable {
+            self.inner[0] |= StandardHopField::FLAGS_EGRESS_ROUTER_ALERT;
+        } else {
+            self.inner[0] &= !StandardHopField::FLAGS_EGRESS_ROUTER_ALERT;
+        }
+    }
+
+    fn cons_ingress_interface(&self) -> Option<NonZeroU16> {
+        NonZeroU16::new(((self.inner[2] as u16) << 8) | self.inner[3] as u16)
+    }
+
+    fn cons_egress_interface(&self) -> Option<NonZeroU16> {
+        NonZeroU16::new(((self.inner[4] as u16) << 8) | self.inner[5] as u16)
+    }
+
+    fn ingress_interface(&self, info_field: &EncodedInfoField) -> Option<NonZeroU16> {
+        if info_field.is_constructed_dir() {
+            self.cons_ingress_interface()
+        } else {
+            self.cons_egress_interface()
+        }
+    }
+
+    fn egress_interface(&self, info_field: &EncodedInfoField) -> Option<NonZeroU16> {
+        if info_field.is_constructed_dir() {
+            self.cons_egress_interface()
+        } else {
+            self.cons_ingress_interface()
+        }
+    }
+
+    fn expiry_offset(&self) -> Duration {
+        StandardHopField::DURATION_PER_EXP_UNIT * (1 + self.inner[1] as u32)
+    }
+
+    fn expiry_time(&self, info_field: &EncodedInfoField) -> DateTime<Utc> {
         info_field.timestamp() + self.expiry_offset()
+    }
+
+    fn expiration_units(&self) -> u8 {
+        self.inner[1]
     }
 }
 
-impl AsRef<[u8]> for EncodedHopField {
+impl AsRef<[u8]> for EncodedStandardHopField {
     fn as_ref(&self) -> &[u8] {
         &self.inner
     }
@@ -291,7 +323,7 @@ macro_rules! field_iterator {
 
 field_iterator! {
     /// Iterator over hop fields in a SCION standard path header.
-    pub struct HopFields<'a> {field_type: EncodedHopField}
+    pub struct HopFields<'a> {field_type: EncodedStandardHopField}
 }
 
 field_iterator! {
@@ -425,7 +457,7 @@ mod tests {
 
         test_flag! {
             cons_ingress_router_alert_flag: {
-                field: EncodedHopField,
+                field: EncodedStandardHopField,
                 flag_mask: 0b0000_0010,
                 getter: is_cons_ingress_router_alert,
                 setter: set_cons_ingress_router_alert
@@ -434,7 +466,7 @@ mod tests {
 
         test_flag! {
             cons_egress_router_alert_flag: {
-                field: EncodedHopField,
+                field: EncodedStandardHopField,
                 flag_mask: 0b0000_0001,
                 getter: is_cons_egress_router_alert,
                 setter: set_cons_egress_router_alert
@@ -444,7 +476,7 @@ mod tests {
         #[test]
         fn cons_interfaces() {
             let hop_data = [0_u8, 0, 0xfe, 0xed, 0xab, 0xcd, 0, 0, 0, 0, 0, 0];
-            let hop_field = EncodedHopField::new(&hop_data);
+            let hop_field = EncodedStandardHopField::new(&hop_data);
 
             assert_eq!(hop_field.cons_ingress_interface(), NonZeroU16::new(0xfeed));
             assert_eq!(hop_field.cons_egress_interface(), NonZeroU16::new(0xabcd));
@@ -453,7 +485,7 @@ mod tests {
         #[test]
         fn cons_interfaces_none() {
             let hop_data = [0_u8, 0, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0];
-            let hop_field = EncodedHopField::new(&hop_data);
+            let hop_field = EncodedStandardHopField::new(&hop_data);
 
             assert_eq!(hop_field.cons_ingress_interface(), None);
             assert_eq!(hop_field.cons_egress_interface(), None);
@@ -462,7 +494,7 @@ mod tests {
         #[test]
         fn interfaces() {
             let hop_data = [0_u8, 0, 0xfe, 0xed, 0xab, 0xcd, 0, 0, 0, 0, 0, 0];
-            let hop_field = EncodedHopField::new(&hop_data);
+            let hop_field = EncodedStandardHopField::new(&hop_data);
             let mut info_data = [0_u8; 8];
             let info = EncodedInfoField::new_mut(&mut info_data);
 
@@ -479,7 +511,7 @@ mod tests {
 
         fn test_expiry_time(expiry_value: u8, info_timestamp: u32, expected: DateTime<Utc>) {
             let hop_data = [0u8, expiry_value, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-            let hop_field = EncodedHopField::new(&hop_data);
+            let hop_field = EncodedStandardHopField::new(&hop_data);
             let info_data = [[0u8, 0, 0, 0], info_timestamp.to_be_bytes()].concat();
             let info = EncodedInfoField::new(&info_data);
 
