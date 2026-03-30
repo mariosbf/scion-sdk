@@ -20,11 +20,11 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 
 pub use super::{
-    EncodedHopField, EncodedInfoField, EncodedSegment, EncodedSegments, HopFields, InfoFields,
+    EncodedStandardHopField, EncodedInfoField, EncodedSegment, EncodedSegments, HopFields, InfoFields,
 };
 use crate::{
     packet::DecodeError,
-    path::{InfoField, MetaHeader},
+    path::{EncodedHopField, InfoField, MetaHeader},
     wire_encoding::{WireDecode, WireEncode},
 };
 
@@ -164,7 +164,7 @@ where
 
     fn hop_fields_subset(&self, hop_index: usize, n_hop_fields: usize) -> HopFields<'_> {
         let start = self.meta_header.hop_field_offset(hop_index);
-        let stop = start + n_hop_fields * EncodedHopField::LENGTH;
+        let stop = start + n_hop_fields * EncodedStandardHopField::LENGTH;
 
         HopFields::new(&self.encoded_path[start..stop])
     }
@@ -236,11 +236,11 @@ where
 {
     /// Returns the [`EncodedHopField`] at the specified index as a mutable reference, if within
     /// range.
-    pub fn hop_field_mut(&mut self, index: usize) -> Option<&mut EncodedHopField> {
+    pub fn hop_field_mut(&mut self, index: usize) -> Option<&mut EncodedStandardHopField> {
         if index < self.meta_header.hop_fields_count() {
             let start = self.meta_header.hop_field_offset(index);
-            let slice = &mut self.encoded_path[start..(start + EncodedHopField::LENGTH)];
-            Some(EncodedHopField::new_mut(slice))
+            let slice = &mut self.encoded_path[start..(start + EncodedStandardHopField::LENGTH)];
+            Some(EncodedStandardHopField::new_mut(slice))
         } else {
             None
         }

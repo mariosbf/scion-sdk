@@ -24,10 +24,9 @@ use super::{
 use crate::{
     address::ScionAddr,
     packet::ByEndpoint,
-    path::DataPlanePath,
+    path::{DataPlanePath, EncodedHopField},
     scmp::{
-        SCMP_PROTOCOL_NUMBER, ScmpDecodeError, ScmpMessage, ScmpMessageBase, ScmpTracerouteRequest,
-        ScmpType,
+        ScmpDecodeError, ScmpMessage, ScmpMessageBase, ScmpTracerouteRequest, ScmpType, SCMP_PROTOCOL_NUMBER
     },
     wire_encoding::{WireDecode, WireEncodeVec},
 };

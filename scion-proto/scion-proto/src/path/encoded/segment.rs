@@ -18,6 +18,8 @@ use std::{iter::FusedIterator, ops::Range};
 
 use chrono::{DateTime, Utc};
 
+use crate::path::EncodedHopField;
+
 use super::{EncodedInfoField, HopFields};
 
 /// A segment of a SCION [`EncodedStandardPath`][super::EncodedStandardPath].
