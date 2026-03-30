@@ -19,7 +19,7 @@ use std::{iter, num::NonZeroU16, slice::ChunksExact, time::Duration};
 use bytes::Buf;
 use chrono::{DateTime, Utc};
 
-use crate::path::{HopField, InfoField};
+use crate::path::{StandardHopField, InfoField};
 
 /// A SCION path info field.
 ///
@@ -106,14 +106,14 @@ pub struct EncodedHopField {
 
 impl EncodedHopField {
     /// The length of the hop field in bytes.
-    pub const LENGTH: usize = HopField::ENCODED_SIZE;
+    pub const LENGTH: usize = StandardHopField::ENCODED_SIZE;
 
     /// A view of a HopField in a SCION standard path.
     ///
     /// This is an unsized type, meaning that it must always be used behind a pointer
     /// like `&` or [`Box`].
     pub fn new(data: &[u8]) -> &Self {
-        assert_eq!(data.len(), HopField::ENCODED_SIZE);
+        assert_eq!(data.len(), StandardHopField::ENCODED_SIZE);
 
         unsafe { &*(data as *const [u8] as *const Self) }
     }
@@ -125,7 +125,7 @@ impl EncodedHopField {
     /// This is an unsized type, meaning that it must always be used behind a pointer
     /// like `&` or [`Box`].
     pub fn new_mut(data: &mut [u8]) -> &mut Self {
-        assert_eq!(data.len(), HopField::ENCODED_SIZE);
+        assert_eq!(data.len(), StandardHopField::ENCODED_SIZE);
         unsafe { &mut *(data as *mut [u8] as *mut Self) }
     }
 
@@ -135,7 +135,7 @@ impl EncodedHopField {
     /// ingress router (in the construction/beaconing direction) that it should process the L4
     /// payload in the packet.
     pub fn is_cons_ingress_router_alert(&self) -> bool {
-        (self.inner[0] & HopField::FLAGS_INGRESS_ROUTER_ALERT) != 0
+        (self.inner[0] & StandardHopField::FLAGS_INGRESS_ROUTER_ALERT) != 0
     }
 
     /// Sets (true) or unsets (false) the ConsIngress Router Alert flag.
@@ -144,9 +144,9 @@ impl EncodedHopField {
     /// of the flag.
     pub fn set_cons_ingress_router_alert(&mut self, enable: bool) {
         if enable {
-            self.inner[0] |= HopField::FLAGS_INGRESS_ROUTER_ALERT;
+            self.inner[0] |= StandardHopField::FLAGS_INGRESS_ROUTER_ALERT;
         } else {
-            self.inner[0] &= !HopField::FLAGS_INGRESS_ROUTER_ALERT;
+            self.inner[0] &= !StandardHopField::FLAGS_INGRESS_ROUTER_ALERT;
         }
     }
 
@@ -156,7 +156,7 @@ impl EncodedHopField {
     /// egress router (in the construction/beaconing direction) that it should process the L4
     /// payload in the packet.
     pub fn is_cons_egress_router_alert(&self) -> bool {
-        (self.inner[0] & HopField::FLAGS_EGRESS_ROUTER_ALERT) != 0
+        (self.inner[0] & StandardHopField::FLAGS_EGRESS_ROUTER_ALERT) != 0
     }
 
     /// Sets (true) or unsets (false) the ConsEgress Router Alert flag.
@@ -165,9 +165,9 @@ impl EncodedHopField {
     /// of the flag.
     pub fn set_cons_egress_router_alert(&mut self, enable: bool) {
         if enable {
-            self.inner[0] |= HopField::FLAGS_EGRESS_ROUTER_ALERT;
+            self.inner[0] |= StandardHopField::FLAGS_EGRESS_ROUTER_ALERT;
         } else {
-            self.inner[0] &= !HopField::FLAGS_EGRESS_ROUTER_ALERT;
+            self.inner[0] &= !StandardHopField::FLAGS_EGRESS_ROUTER_ALERT;
         }
     }
 
@@ -222,7 +222,7 @@ impl EncodedHopField {
     ///
     /// The exact expiry time can be calculated with the [expiry_time][`Self::expiry_time`] method.
     pub fn expiry_offset(&self) -> Duration {
-        HopField::DURATION_PER_EXP_UNIT * (1 + self.inner[1] as u32)
+        StandardHopField::DURATION_PER_EXP_UNIT * (1 + self.inner[1] as u32)
     }
 
     /// Returns the expiration time unit of this hop field.

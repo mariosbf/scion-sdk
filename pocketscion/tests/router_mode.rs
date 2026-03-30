@@ -30,7 +30,7 @@ use pocketscion::{
 use scion_proto::{
     address::{ScionAddr, SocketAddr},
     packet::{ByEndpoint, ScionPacketScmp, ScionPacketUdp},
-    path::{DataPlanePath, EncodedStandardPath, HopField, InfoField, StandardPath},
+    path::{DataPlanePath, EncodedStandardPath, StandardHopField, InfoField, StandardPath},
     scmp::{ScmpEchoRequest, ScmpExternalInterfaceDown, ScmpMessage},
     wire_encoding::{WireDecode as _, WireEncodeVec as _},
 };
@@ -336,11 +336,11 @@ fn scion_path() -> EncodedStandardPath {
         cons_dir: true,
         ..Default::default()
     };
-    let hop1 = HopField {
+    let hop1 = StandardHopField {
         cons_egress: 2,
         ..Default::default()
     };
-    let hop2 = HopField {
+    let hop2 = StandardHopField {
         cons_ingress: 3,
         ..Default::default()
     };

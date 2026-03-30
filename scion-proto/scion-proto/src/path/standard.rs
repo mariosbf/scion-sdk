@@ -36,7 +36,7 @@ pub struct StandardPath {
     /// Info fields of the path.
     pub info_fields: Vec<InfoField>,
     /// Hop fields of the path.
-    pub hop_fields: Vec<HopField>,
+    pub hop_fields: Vec<StandardHopField>,
 }
 
 /// Data plane path builder errors.
@@ -66,7 +66,7 @@ impl StandardPath {
     pub fn add_segment(
         &mut self,
         info_field: InfoField,
-        hop_fields: Vec<HopField>,
+        hop_fields: Vec<StandardHopField>,
     ) -> Result<(), DataPlanePathBuilderError> {
         if self.info_fields.len() >= 3 {
             return Err(DataPlanePathBuilderError::TooManySegments);
@@ -99,7 +99,7 @@ impl StandardPath {
         let hop_fields = sciparse_path
             .iter_hop_fields()
             .map(|f| {
-                HopField {
+                StandardHopField {
                     ingress_router_alert: f
                         .flags
                         .contains(HopFieldFlags::CONS_INGRESS_ROUTER_ALERT),
@@ -197,7 +197,7 @@ impl WireDecode<Bytes> for StandardPath {
         }
 
         for _ in 0..meta_header.hop_fields_count() {
-            let hop_field = HopField::decode(data)?;
+            let hop_field = StandardHopField::decode(data)?;
             hop_fields.push(hop_field);
         }
 
@@ -297,6 +297,24 @@ impl WireDecode<Bytes> for InfoField {
     }
 }
 
+/// Combines methods common to different types of HopFields, such as regular
+/// SCION HopFields (see [`StandardHopField`]) and Hummingbird HopFields.
+pub trait HopField {
+    /// Returns the normalized interfaces of the HopField. \
+    /// (ingress, egress)
+    fn interfaces(&self, is_construction_dir: bool) -> (u16, u16);
+
+    /// Returns the normalized SCMP alerts of the HopField. \
+    /// (ingress, egress)
+    fn alerts(&self, is_construction_dir: bool) -> (bool, bool);
+
+    /// Returns expiry offset of packet in seconds.
+    fn expiry_offset(&self) -> Duration;
+
+    /// Returns the unix epoch in seconds of when the HopField expires.
+    fn expiry_time(&self, info_field: &InfoField) -> DateTime<Utc>;
+}
+
 /// HopField is the HopField used in the SCION and OneHop path types.
 ///
 /// The Hop Field has the following format:
@@ -311,7 +329,7 @@ impl WireDecode<Bytes> for InfoField {
 /// |                              MAC                              |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 #[derive(Debug, Default, Clone)]
-pub struct HopField {
+pub struct StandardHopField {
     /// IngressRouterAlert flag. If the IngressRouterAlert is set, the ingress router (in
     /// construction direction) will process the L4 payload in the packet.
     pub ingress_router_alert: bool,
@@ -333,17 +351,17 @@ pub struct HopField {
     pub mac: [u8; 6],
 }
 
-impl HopField {
+impl StandardHopField {
     /// The encoded size of a HopField.
     pub const ENCODED_SIZE: usize = 12;
     pub(super) const FLAGS_EGRESS_ROUTER_ALERT: u8 = 0b01;
     pub(super) const FLAGS_INGRESS_ROUTER_ALERT: u8 = 0b10;
 
     pub(super) const DURATION_PER_EXP_UNIT: Duration = Duration::from_millis(337_500);
+}
 
-    /// Returns the normalized interfaces of the HopField. \
-    /// (ingress, egress)
-    pub fn interfaces(&self, is_construction_dir: bool) -> (u16, u16) {
+impl HopField for StandardHopField {
+    fn interfaces(&self, is_construction_dir: bool) -> (u16, u16) {
         if is_construction_dir {
             (self.cons_ingress, self.cons_egress)
         } else {
@@ -351,9 +369,7 @@ impl HopField {
         }
     }
 
-    /// Returns the normalized SCMP alerts of the HopField. \
-    /// (ingress, egress)
-    pub fn alerts(&self, is_construction_dir: bool) -> (bool, bool) {
+    fn alerts(&self, is_construction_dir: bool) -> (bool, bool) {
         if is_construction_dir {
             (self.ingress_router_alert, self.egress_router_alert)
         } else {
@@ -361,18 +377,16 @@ impl HopField {
         }
     }
 
-    /// Returns expiry offset of packet in seconds.
-    pub fn expiry_offset(&self) -> Duration {
+    fn expiry_offset(&self) -> Duration {
         Self::DURATION_PER_EXP_UNIT * (1 + self.exp_time as u32)
     }
 
-    /// Returns the unix epoch in seconds of when the HopField expires.
-    pub fn expiry_time(&self, info_field: &InfoField) -> DateTime<Utc> {
+    fn expiry_time(&self, info_field: &InfoField) -> DateTime<Utc> {
         info_field.timestamp() + self.expiry_offset()
     }
 }
 
-impl WireEncode for HopField {
+impl WireEncode for StandardHopField {
     type Error = InadequateBufferSize;
 
     fn encoded_length(&self) -> usize {
@@ -395,7 +409,7 @@ impl WireEncode for HopField {
     }
 }
 
-impl WireDecode<Bytes> for HopField {
+impl WireDecode<Bytes> for StandardHopField {
     type Error = DecodeError;
 
     fn decode(data: &mut Bytes) -> Result<Self, Self::Error> {

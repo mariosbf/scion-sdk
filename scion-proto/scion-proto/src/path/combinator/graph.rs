@@ -22,7 +22,7 @@ use crate::{
     address::IsdAsn,
     packet::ByEndpoint,
     path::{
-        HopField, InfoField, Metadata, Path, PathInterface, PathSegment, SegmentID, StandardPath,
+        StandardHopField, InfoField, Metadata, Path, PathInterface, PathSegment, SegmentID, StandardPath,
     },
 };
 
@@ -645,7 +645,7 @@ impl<'a> PathSolution<'a> {
                     Some(peer_idx) if idx == solution_edge.edge.shortcut_idx => {
                         // Peer hop field.
                         let peer = &as_entry.peer_entries[peer_idx];
-                        let hopfield = HopField {
+                        let hopfield = StandardHopField {
                             exp_time: peer.hop_field.exp_time,
                             cons_ingress: peer.hop_field.cons_ingress,
                             cons_egress: peer.hop_field.cons_egress,
@@ -659,7 +659,7 @@ impl<'a> PathSolution<'a> {
                     }
                     _ => {
                         // Regular hop field.
-                        let hopfield = HopField {
+                        let hopfield = StandardHopField {
                             exp_time: as_entry.hop_entry.hop_field.exp_time,
                             cons_ingress: as_entry.hop_entry.hop_field.cons_ingress,
                             cons_egress: as_entry.hop_entry.hop_field.cons_egress,
