@@ -99,7 +99,7 @@ pub struct EncodedHummingbirdHopField {
 }
 
 impl EncodedHummingbirdHopField {
-    /// Cehcks whether the flyover bit is set.
+    /// Checks whether the flyover bit is set.
     pub fn is_flyover(&self) -> bool {
         self.inner[0] & FlyoverHopField::FLYOVER_BIT != 0
     }
@@ -430,9 +430,37 @@ impl EncodedFlyoverHopField {
     const LENGTH: usize = FlyoverHopField::ENCODED_SIZE;
 }
 
-impl EncodedHopField for EncodedFlyoverHopField {
-    // TODO: Add methods to get/set flyover-specific information, such as reservation details.
+impl EncodedFlyoverHopField {
+    /// Returns the reservation ID from the flyover hop field.
+    pub fn reservation_id(&self) -> u32 {
+        let res_id_and_bw = ((self.inner[12] as u32) << 24)
+            | ((self.inner[13] as u32) << 16)
+            | ((self.inner[14] as u32) << 8)
+            | self.inner[15] as u32;
+        res_id_and_bw >> 10
+    }
 
+    /// Returns the bandwidth from the flyover hop field.
+    pub fn bandwidth(&self) -> u16 {
+        let res_id_and_bw = ((self.inner[12] as u32) << 24)
+            | ((self.inner[13] as u32) << 16)
+            | ((self.inner[14] as u32) << 8)
+            | self.inner[15] as u32;
+        (res_id_and_bw & 0x3FF) as u16
+    }
+
+    /// Returns the reservation start offset from the flyover hop field.
+    pub fn reservation_start_offset(&self) -> Duration {
+        Duration::from_secs(((self.inner[16] as u64) << 8) | self.inner[17] as u64)
+    }
+
+    /// Returns the reservation duration from the flyover hop field.
+    pub fn reservation_duration(&self) -> u16 {
+        ((self.inner[18] as u16) << 8) | self.inner[19] as u16
+    }
+}
+
+impl EncodedHopField for EncodedFlyoverHopField {
     fn new(data: &[u8]) -> &Self {
         assert_eq!(data.len(), Self::LENGTH);
 
@@ -508,5 +536,50 @@ impl EncodedHopField for EncodedFlyoverHopField {
 impl AsRef<[u8]> for EncodedFlyoverHopField {
     fn as_ref(&self) -> &[u8] {
         &self.inner
+    }
+}
+
+/// Iterator over hop fields in a Hummingbird path.
+pub struct HummingbirdHopFields<'a> {
+    inner: &'a [u8],
+}
+
+impl<'a> HummingbirdHopFields<'a> {
+    /// Creates a new iterator over hop fields in a Hummingbird path.
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { inner: data }
+    }
+}
+
+impl<'a> Iterator for HummingbirdHopFields<'a> {
+    type Item = &'a EncodedFlyoverHopField;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.inner.is_empty() {
+            return None;
+        }
+
+        let is_flyover = self.inner[0] & FlyoverHopField::FLYOVER_BIT != 0;
+
+        #[allow(clippy::collapsible_else_if)]
+        if is_flyover {
+            // Flyover hop field.
+            if self.inner.len() < FlyoverHopField::ENCODED_SIZE {
+                None
+            } else {
+                let (current, rest) = self.inner.split_at(FlyoverHopField::ENCODED_SIZE);
+                self.inner = rest;
+                Some(EncodedFlyoverHopField::new(current))
+            }
+        } else {
+            // Standard hop field.
+            if self.inner.len() < StandardHopField::ENCODED_SIZE {
+                None
+            } else {
+                let (current, rest) = self.inner.split_at(StandardHopField::ENCODED_SIZE);
+                self.inner = rest;
+                Some(EncodedFlyoverHopField::new(current))
+            }
+        }
     }
 }
