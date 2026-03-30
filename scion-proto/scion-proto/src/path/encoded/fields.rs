@@ -97,9 +97,6 @@ impl AsRef<[u8]> for EncodedInfoField {
 /// A trait for views into SCION hop fields.
 /// Structs that implement EncodeHopField are unsized.
 pub trait EncodedHopField {
-    /// The length of the hop field in bytes.
-    const LENGTH: usize;
-
     /// A view of a HopField in a SCION standard path.
     ///
     /// This is an unsized type, meaning that it must always be used behind a pointer
@@ -193,9 +190,12 @@ pub struct EncodedStandardHopField {
     inner: [u8],
 }
 
-impl EncodedHopField for EncodedStandardHopField {
-    const LENGTH: usize = StandardHopField::ENCODED_SIZE;
+impl EncodedStandardHopField {
+    /// The length of the hop field in bytes.
+    pub const LENGTH: usize = StandardHopField::ENCODED_SIZE;
+}
 
+impl EncodedHopField for EncodedStandardHopField {
     fn new(data: &[u8]) -> &Self {
         assert_eq!(data.len(), StandardHopField::ENCODED_SIZE);
 

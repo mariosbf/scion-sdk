@@ -6,7 +6,10 @@ use std::{num::NonZeroU16, time::Duration};
 
 use crate::{
     packet::{DecodeError, InadequateBufferSize},
-    path::{EncodedHopField, EncodedInfoField, HopField, InfoField, StandardHopField},
+    path::{
+        EncodedHopField, EncodedInfoField, EncodedStandardHopField, HopField, InfoField,
+        StandardHopField,
+    },
     wire_encoding::{WireDecode, WireEncode},
 };
 
@@ -84,6 +87,155 @@ impl WireEncode for HummingbirdHopField {
         match self {
             Self::Standard(hop_field) => hop_field.encode_to_unchecked(buffer),
             Self::Flyover(flyover_hop_field) => flyover_hop_field.encode_to_unchecked(buffer),
+        }
+    }
+}
+
+/// A view into a Hummingbird path hop field.
+#[repr(transparent)]
+#[derive(Debug, PartialEq, Eq)]
+pub struct EncodedHummingbirdHopField {
+    inner: [u8],
+}
+
+impl EncodedHummingbirdHopField {
+    /// Cehcks whether the flyover bit is set.
+    pub fn is_flyover(&self) -> bool {
+        self.inner[0] & FlyoverHopField::FLYOVER_BIT != 0
+    }
+
+    /// Checks whether the flyover bit is set in the first byte. If it is set, the
+    /// lenth of the data must be equal to the encoded size of a FlyoverHop
+    /// field, otherwise it must be equal to the encoded size of a StandardHopField.
+    /// Panics if these conditions are not met.
+    fn assert_length(&self) {
+        assert!(!self.inner.is_empty());
+
+        assert!(if self.is_flyover() {
+            self.inner.len() == FlyoverHopField::ENCODED_SIZE
+        } else {
+            self.inner.len() == StandardHopField::ENCODED_SIZE
+        });
+    }
+}
+
+macro_rules! dispatch_to_correct_encoding {
+    (fn $method_name:ident(&self $(, $arg_name:ident : $arg_type:ty)*) $(-> $return_type:ty)?) => {
+        fn $method_name(&self $(, $arg_name : $arg_type)*) $(-> $return_type)? {
+            if self.is_flyover() {
+                EncodedFlyoverHopField::new(&self.inner).$method_name($($arg_name),*)
+            } else {
+                EncodedStandardHopField::new(&self.inner).$method_name($($arg_name),*)
+            }
+        }
+    };
+    (fn $method_name:ident(&mut self $(, $arg_name:ident : $arg_type:ty)*) $(-> $return_type:ty)?) => {
+        fn $method_name(&mut self $(, $arg_name : $arg_type)*) $(-> $return_type)? {
+            if self.is_flyover() {
+                EncodedFlyoverHopField::new_mut(&mut self.inner).$method_name($($arg_name),*)
+            } else {
+                EncodedStandardHopField::new_mut(&mut self.inner).$method_name($($arg_name),*)
+            }
+        }
+    }
+}
+
+impl EncodedHopField for EncodedHummingbirdHopField {
+    /// Creates a new view into a Hummingbird path hop field.
+    ///
+    /// # Panics
+    /// Checks whether the flyover bit is set in the first byte. If it is set, the
+    /// lenth of the data must be equal to the encoded size of a FlyoverHopField,
+    /// otherwise it must be equal to the encoded size of a StandardHopField.
+    /// Panics if these conditions are not met.
+    fn new(data: &[u8]) -> &Self {
+        let result = unsafe { &*(data as *const [u8] as *const Self) };
+        result.assert_length();
+
+        result
+    }
+
+    /// Creates a mutable view into a Hummingbird path hop field.
+    ///
+    /// # Panics
+    /// Checks whether the flyover bit is set in the first byte. If it is set, the
+    /// lenth of the data must be equal to the encoded size of a FlyoverHopField,
+    /// otherwise it must be equal to the encoded size of a StandardHopField.
+    /// Panics if these conditions are not met.
+    fn new_mut(data: &mut [u8]) -> &mut Self {
+        let result = unsafe { &mut *(data as *mut [u8] as *mut Self) };
+        result.assert_length();
+
+        result
+    }
+
+    dispatch_to_correct_encoding!(
+        fn is_cons_ingress_router_alert(&self) -> bool
+    );
+
+    dispatch_to_correct_encoding!(
+        fn is_cons_egress_router_alert(&self) -> bool
+    );
+
+    dispatch_to_correct_encoding!(
+        fn set_cons_egress_router_alert(&mut self, enable: bool)
+    );
+
+    dispatch_to_correct_encoding!(
+        fn set_cons_ingress_router_alert(&mut self, enable: bool)
+    );
+
+    dispatch_to_correct_encoding!(
+        fn cons_ingress_interface(&self) -> Option<NonZeroU16>
+    );
+
+    dispatch_to_correct_encoding!(
+        fn cons_egress_interface(&self) -> Option<NonZeroU16>
+    );
+
+    dispatch_to_correct_encoding!(
+        fn ingress_interface(&self, info_field: &EncodedInfoField) -> Option<NonZeroU16>
+    );
+
+    dispatch_to_correct_encoding!(
+        fn egress_interface(&self, info_field: &EncodedInfoField) -> Option<NonZeroU16>
+    );
+
+    dispatch_to_correct_encoding!(
+        fn expiry_offset(&self) -> Duration
+    );
+
+    dispatch_to_correct_encoding!(
+        fn expiry_time(&self, info_field: &EncodedInfoField) -> DateTime<Utc>
+    );
+}
+
+impl<'a> TryFrom<&'a EncodedHummingbirdHopField> for &'a EncodedStandardHopField {
+    // Note(mariosbf): We could create a specific Error type for this, but
+    // the default use is probably to check if the flyover bit is set, before
+    // converting and calling expect.
+    type Error = &'static str;
+
+    fn try_from(value: &'a EncodedHummingbirdHopField) -> Result<Self, Self::Error> {
+        if value.is_flyover() {
+            Err("Cannot convert a flyover hop field to a standard hop field")
+        } else {
+            Ok(EncodedStandardHopField::new(&value.inner))
+        }
+    }
+}
+
+impl<'a> TryFrom<&'a EncodedHummingbirdHopField> for &'a EncodedFlyoverHopField {
+    // Note(mariosbf): We could create a specific Error type for this, but
+    // the default use is probably to check if the flyover bit is set, before
+    // converting and calling expect.
+    type Error = &'static str;
+
+    fn try_from(value: &'a EncodedHummingbirdHopField) -> Result<Self, Self::Error> {
+        if value.is_flyover() {
+            Err("Cannot convert a standard hop field to a flyover hop field")
+        } else {
+            Ok(EncodedFlyoverHopField::new(&value.inner))
         }
     }
 }
@@ -269,8 +421,13 @@ pub struct EncodedFlyoverHopField {
     inner: [u8],
 }
 
-impl EncodedHopField for EncodedFlyoverHopField {
+impl EncodedFlyoverHopField {
+    /// The length of a flyover hop field in bytes.
     const LENGTH: usize = FlyoverHopField::ENCODED_SIZE;
+}
+
+impl EncodedHopField for EncodedFlyoverHopField {
+    // TODO: Add methods to get/set flyover-specific information, such as reservation details.
 
     fn new(data: &[u8]) -> &Self {
         assert_eq!(data.len(), Self::LENGTH);
