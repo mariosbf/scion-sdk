@@ -91,7 +91,7 @@ use crate::{
     address::{Asn, EndhostAddr, Isd, IsdAsn, SocketAddr},
     packet::{ByEndpoint, FlowId, ScionPacketRaw, ScionPacketScmp, ScionPacketUdp},
     path::{
-        DataPlanePath, HopField, InfoField, MetaHeader, Metadata, Path, PathInterface,
+        DataPlanePath, StandardHopField, InfoField, MetaHeader, Metadata, Path, PathInterface,
         SegmentLength, StandardPath,
         crypto::{ForwardingKey, calculate_hop_mac, mac_chaining_step, validate_segment_macs},
         exp_time_to_duration,
@@ -627,7 +627,7 @@ pub struct TestPathBuilderHopField {
 }
 
 impl TestPathBuilderHopField {
-    fn into_hop_field(self, mac_beta: u16, timestamp: u32) -> HopField {
+    fn into_hop_field(self, mac_beta: u16, timestamp: u32) -> StandardHopField {
         let (cons_ingress, cons_egress) = match self.cons_dir {
             true => (self.ingress_if, self.egress_if),
             false => (self.egress_if, self.ingress_if),
@@ -638,7 +638,7 @@ impl TestPathBuilderHopField {
             false => (self.egress_router_alert, self.ingress_router_alert),
         };
 
-        HopField {
+        StandardHopField {
             cons_ingress,
             cons_egress,
             ingress_router_alert,

@@ -17,7 +17,7 @@
 use aes::cipher::{consts::U16, generic_array::GenericArray};
 use thiserror::Error;
 
-use crate::path::{HopField, InfoField};
+use crate::path::{StandardHopField, InfoField};
 
 /// 16 Byte Forwarding Key
 pub type ForwardingKey = GenericArray<u8, U16>;
@@ -105,7 +105,7 @@ pub fn mac_chaining_step(accumulator: u16, hop_mac: [u8; 6]) -> u16 {
 #[allow(unused)]
 pub fn validate_segment_macs(
     info: &InfoField,
-    fields: &[(HopField, ForwardingKey)],
+    fields: &[(StandardHopField, ForwardingKey)],
     is_construction_direction: bool,
 ) -> Result<(), MacValidateError> {
     let mut accumulator = if is_construction_direction {

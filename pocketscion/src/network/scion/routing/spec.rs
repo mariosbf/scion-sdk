@@ -19,12 +19,10 @@ use bytes::Bytes;
 use scion_proto::{
     address::IsdAsn,
     packet::{
-        ScionHeaders, ScionPacketRaw,
-        layout::{BitOffset, ScionPacketOffset},
+        layout::{BitOffset, ScionPacketOffset}, ScionHeaders, ScionPacketRaw
     },
     path::{
-        DataPlanePath, HopField, HopFieldIndex, InfoField, InfoFieldIndex, MetaHeader,
-        StandardPath, crypto::ForwardingKey,
+        crypto::ForwardingKey, DataPlanePath, HopField, HopFieldIndex, InfoField, InfoFieldIndex, MetaHeader, StandardHopField, StandardPath
     },
     scmp::{
         ParameterProblemCode, ScmpErrorMessage, ScmpExternalInterfaceDown, ScmpParameterProblem,
@@ -597,7 +595,7 @@ impl SpecRoutingLogic {
         (segment_start, segment_end): (usize, usize),
         info_field: &InfoField,
         info_field_index: usize,
-        hop_field: &HopField,
+        hop_field: &StandardHopField,
         hop_index: usize,
         now: ScionNetworkTime,
     ) -> Result<(), ScmpErrorMessage> {
@@ -663,7 +661,7 @@ impl SpecRoutingLogic {
 }
 
 fn calculate_hop_mac(
-    hop_field: &HopField,
+    hop_field: &StandardHopField,
     info_field: &InfoField,
     forwarding_key: &ForwardingKey,
 ) -> [u8; 6] {
@@ -911,9 +909,9 @@ fn create_path_decode_error(
 
 fn try_get_hop<'hop>(
     scion_packet: &ScionPacketRaw,
-    hop_fields: &'hop [HopField],
+    hop_fields: &'hop [StandardHopField],
     hop_index: usize,
-) -> Result<&'hop HopField, ScmpErrorMessage> {
+) -> Result<&'hop StandardHopField, ScmpErrorMessage> {
     if let Some(hop) = hop_fields.get(hop_index) {
         return Ok(hop);
     }

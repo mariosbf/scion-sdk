@@ -423,7 +423,7 @@ mod test {
     use crate::{
         address::{ScionAddr, ScionAddrV4, ScionAddrV6},
         packet::{ByEndpoint, FlowId, ScionPacketRaw},
-        path::{DataPlanePath, HopField, InfoField, StandardPath},
+        path::{DataPlanePath, StandardHopField, InfoField, StandardPath},
         wire_encoding::WireEncodeVec,
     };
 
@@ -466,7 +466,7 @@ mod test {
                             seg_id: 0,
                             timestamp_epoch: 0,
                         },
-                        vec![HopField::default()],
+                        vec![StandardHopField::default()],
                     )
                     .expect("failed to add segment")
             }
