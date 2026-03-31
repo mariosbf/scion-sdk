@@ -49,7 +49,7 @@ where
     /// # Panics
     ///
     /// If hop_fields is empty.
-    pub(super) fn new(info_field: &'a EncodedInfoField, hop_fields: Hs) -> Self {
+    pub fn new(info_field: &'a EncodedInfoField, hop_fields: Hs) -> Self {
         assert!(hop_fields.clone().peekable().peek().is_some());
         Self {
             info_field,
@@ -94,7 +94,7 @@ impl<'a, Hs> EncodedSegments<'a, Hs>
 where
     Hs: Clone,
 {
-    pub(super) fn new(segments: [Option<EncodedSegment<'a, Hs>>; 3]) -> Self {
+    pub fn new(segments: [Option<EncodedSegment<'a, Hs>>; 3]) -> Self {
         let end = segments.iter().position(Option::is_none).unwrap_or(3);
         Self {
             inner: segments,

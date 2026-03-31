@@ -533,6 +533,7 @@ impl AsRef<[u8]> for EncodedFlyoverHopField {
 }
 
 /// Iterator over hop fields in a Hummingbird path.
+#[derive(Clone)]
 pub struct HummingbirdHopFields<'a> {
     inner: &'a [u8],
 }
