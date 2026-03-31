@@ -289,7 +289,7 @@ macro_rules! field_iterator {
         }
 
         impl<$life> $name<$life> {
-            pub(super) fn new(data: &'a [u8]) -> Self {
+            pub fn new(data: &'a [u8]) -> Self {
                 assert_eq!(data.len() % <$field>::LENGTH, 0);
                 Self {
                     inner: data.chunks_exact(<$field>::LENGTH),
