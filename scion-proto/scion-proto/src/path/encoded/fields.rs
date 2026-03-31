@@ -327,84 +327,11 @@ field_iterator! {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    macro_rules! test_case {
-        ($name:ident: $func:ident($arg1:expr$(, $arg:expr)*)) => {
-            #[test]
-            fn $name() {
-                $func($arg1 $(, $arg)*)
-            }
-        };
-    }
-
-    macro_rules! test_flag {
-        ($name:ident: {
-            field: $field:ty,
-            flag_mask: $mask:literal,
-            getter: $flag_getter:tt
-            $(, setter: $flag_setter:tt)?
-        }) => {
-            mod $name {
-                use super::*;
-
-                #[test]
-                fn getter() {
-                    let mut backing_array = [0u8; <$field>::LENGTH];
-
-                    let field = <$field>::new(&backing_array);
-                    assert!(!field.$flag_getter());
-
-                    backing_array[0] = $mask;
-
-                    let field = <$field>::new(&backing_array);
-                    assert!(field.$flag_getter());
-                }
-
-                $(
-                    #[test]
-                    fn setter() {
-                        let mut backing_array = [0u8; <$field>::LENGTH];
-                        backing_array[0] = !$mask;
-                        let field = <$field>::new_mut(&mut backing_array);
-
-                        assert!(!field.$flag_getter());
-                        field.$flag_setter(true);
-                        assert!(field.$flag_getter());
-
-                        let mut backing_array = [$mask; <$field>::LENGTH];
-                        backing_array[0] = $mask;
-                        let field = <$field>::new_mut(&mut backing_array);
-
-                        assert!(field.$flag_getter());
-                        field.$flag_setter(false);
-                        assert!(!field.$flag_getter());
-                    }
-
-                    #[test]
-                    fn idempotent_set() {
-                        let mut backing_array = [0u8; <$field>::LENGTH];
-                        backing_array[0] = !$mask;
-                        let field = <$field>::new_mut(&mut backing_array);
-
-                        assert!(!field.$flag_getter());
-                        field.$flag_setter(false);
-                        assert!(!field.$flag_getter());
-
-                        let mut backing_array = [$mask; <$field>::LENGTH];
-                        backing_array[0] = $mask;
-                        let field = <$field>::new_mut(&mut backing_array);
-
-                        assert!(field.$flag_getter());
-                        field.$flag_setter(true);
-                        assert!(field.$flag_getter());
-                    }
-
-                )?
-            }
-        };
-    }
+    use crate::test_hopfield_flag;
+    use crate::test_case;
 
     mod info_field {
+
         use super::*;
 
         #[test]
@@ -427,7 +354,7 @@ mod tests {
             );
         }
 
-        test_flag! {
+        test_hopfield_flag! {
             peering_flag: {
                 field: EncodedInfoField,
                 flag_mask: 0b0000_0010,
@@ -435,7 +362,7 @@ mod tests {
             }
         }
 
-        test_flag! {
+        test_hopfield_flag! {
             constructed_dir_flag: {
                 field: EncodedInfoField,
                 flag_mask: 0b0000_0001,
@@ -448,7 +375,7 @@ mod tests {
     mod hop_field {
         use super::*;
 
-        test_flag! {
+        test_hopfield_flag! {
             cons_ingress_router_alert_flag: {
                 field: EncodedStandardHopField,
                 flag_mask: 0b0000_0010,
@@ -457,7 +384,7 @@ mod tests {
             }
         }
 
-        test_flag! {
+        test_hopfield_flag! {
             cons_egress_router_alert_flag: {
                 field: EncodedStandardHopField,
                 flag_mask: 0b0000_0001,

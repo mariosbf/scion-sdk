@@ -464,7 +464,8 @@ impl EncodedHopField for EncodedFlyoverHopField {
     }
 
     fn new_mut(data: &mut [u8]) -> &mut Self {
-        assert_eq!(data.len(), StandardHopField::ENCODED_SIZE);
+        assert_eq!(data.len(), Self::LENGTH);
+
         unsafe { &mut *(data as *mut [u8] as *mut Self) }
     }
 
@@ -573,5 +574,210 @@ impl<'a> Iterator for HummingbirdHopFields<'a> {
                 Some(EncodedFlyoverHopField::new(current))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{path::hummingbird::EncodedFlyoverHopField, test_case, test_hopfield_flag};
+    use std::num::NonZeroU16;
+
+    test_hopfield_flag! {
+        cons_ingress_router_alert_flag: {
+            field: EncodedFlyoverHopField,
+            flag_mask: 0b0000_0010,
+            getter: is_cons_ingress_router_alert,
+            setter: set_cons_ingress_router_alert
+        }
+    }
+
+    test_hopfield_flag! {
+        cons_egress_router_alert_flag: {
+            field: EncodedFlyoverHopField,
+            flag_mask: 0b0000_0001,
+            getter: is_cons_egress_router_alert,
+            setter: set_cons_egress_router_alert
+        }
+    }
+
+    #[test]
+    fn cons_interfaces() {
+        let hop_data = [
+            0_u8, 0, 0xfe, 0xed, 0xab, 0xcd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let hop_field = EncodedFlyoverHopField::new(&hop_data);
+
+        assert_eq!(hop_field.cons_ingress_interface(), NonZeroU16::new(0xfeed));
+        assert_eq!(hop_field.cons_egress_interface(), NonZeroU16::new(0xabcd));
+    }
+
+    #[test]
+    fn cons_interfaces_none() {
+        let hop_data = [
+            0_u8, 0, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let hop_field = EncodedFlyoverHopField::new(&hop_data);
+
+        assert_eq!(hop_field.cons_ingress_interface(), None);
+        assert_eq!(hop_field.cons_egress_interface(), None);
+    }
+
+    #[test]
+    fn interfaces() {
+        let hop_data = [
+            0_u8, 0, 0xfe, 0xed, 0xab, 0xcd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let hop_field = EncodedFlyoverHopField::new(&hop_data);
+        let mut info_data = [0_u8; 8];
+        let info = EncodedInfoField::new_mut(&mut info_data);
+
+        info.set_constructed_dir(true);
+
+        assert_eq!(hop_field.ingress_interface(info), NonZeroU16::new(0xfeed));
+        assert_eq!(hop_field.egress_interface(info), NonZeroU16::new(0xabcd));
+
+        info.set_constructed_dir(false);
+
+        assert_eq!(hop_field.ingress_interface(info), NonZeroU16::new(0xabcd));
+        assert_eq!(hop_field.egress_interface(info), NonZeroU16::new(0xfeed));
+    }
+
+    fn test_expiry_time(expiry_value: u8, info_timestamp: u32, expected: DateTime<Utc>) {
+        let hop_data = [
+            0u8,
+            expiry_value,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let hop_field = EncodedFlyoverHopField::new(&hop_data);
+        let info_data = [[0u8, 0, 0, 0], info_timestamp.to_be_bytes()].concat();
+        let info = EncodedInfoField::new(&info_data);
+
+        assert_eq!(hop_field.expiry_time(info), expected);
+    }
+
+    test_case! {
+        expiry_min:
+            test_expiry_time(0, 0, DateTime::from_timestamp(337, 500_000_000).unwrap())
+    }
+
+    test_case! {
+        expiry_min_max:
+            test_expiry_time(255, 0, DateTime::UNIX_EPOCH + Duration::from_secs(24 * 60 * 60))
+    }
+
+    test_case! {
+        expiry_arbitrary:
+            test_expiry_time(199, 1_703_462_400, DateTime::from_timestamp(1_703_529_900, 0).unwrap())
+    }
+
+    fn test_reservation_id(bytes: [u8; 4], expected: u32) {
+        let mut hop_data = [0u8; FlyoverHopField::ENCODED_SIZE];
+        hop_data[12..16].copy_from_slice(&bytes);
+        let hop_field = EncodedFlyoverHopField::new(&hop_data);
+        assert_eq!(hop_field.reservation_id(), expected);
+    }
+
+    test_case! {
+        reservation_id_zero:
+            test_reservation_id([0x00, 0x00, 0x00, 0x00], 0)
+    }
+
+    test_case! {
+        reservation_id_one:
+            test_reservation_id([0x00, 0x00, 0x04, 0x00], 1)
+    }
+
+    test_case! {
+        reservation_id_max:
+            test_reservation_id([0xFF, 0xFF, 0xFC, 0x00], 0x3F_FFFF)
+    }
+
+    fn test_bandwidth(bytes: [u8; 2], expected: u16) {
+        let mut hop_data = [0u8; FlyoverHopField::ENCODED_SIZE];
+        hop_data[14..16].copy_from_slice(&bytes);
+        let hop_field = EncodedFlyoverHopField::new(&hop_data);
+        assert_eq!(hop_field.bandwidth(), expected);
+    }
+
+    test_case! {
+        bandwidth_zero:
+            test_bandwidth([0x00, 0x00], 0)
+    }
+
+    test_case! {
+        bandwidth_one:
+            test_bandwidth([0x00, 0x01], 1)
+    }
+
+    test_case! {
+        bandwidth_max:
+            test_bandwidth([0x03, 0xFF], 0x3FF)
+    }
+
+    fn test_reservation_start_offset(high_byte: u8, low_byte: u8, expected_secs: u64) {
+        let mut hop_data = [0u8; FlyoverHopField::ENCODED_SIZE];
+        hop_data[16] = high_byte;
+        hop_data[17] = low_byte;
+        let hop_field = EncodedFlyoverHopField::new(&hop_data);
+        assert_eq!(
+            hop_field.reservation_start_offset(),
+            Duration::from_secs(expected_secs)
+        );
+    }
+
+    test_case! {
+        reservation_start_offset_zero:
+            test_reservation_start_offset(0x00, 0x00, 0)
+    }
+
+    test_case! {
+        reservation_start_offset_one:
+            test_reservation_start_offset(0x00, 0x01, 1)
+    }
+
+    test_case! {
+        reservation_start_offset_max:
+            test_reservation_start_offset(0xFF, 0xFF, 0xFFFF)
+    }
+
+    fn test_reservation_duration(high_byte: u8, low_byte: u8, expected: u16) {
+        let mut hop_data = [0u8; FlyoverHopField::ENCODED_SIZE];
+        hop_data[18] = high_byte;
+        hop_data[19] = low_byte;
+        let hop_field = EncodedFlyoverHopField::new(&hop_data);
+        assert_eq!(hop_field.reservation_duration(), expected);
+    }
+
+    test_case! {
+        reservation_duration_zero:
+            test_reservation_duration(0x00, 0x00, 0)
+    }
+
+    test_case! {
+        reservation_duration_one:
+            test_reservation_duration(0x00, 0x01, 1)
+    }
+
+    test_case! {
+        reservation_duration_max:
+            test_reservation_duration(0xFF, 0xFF, 0xFFFF)
     }
 }
