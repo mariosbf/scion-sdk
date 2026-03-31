@@ -14,7 +14,10 @@
 // limitations under the License.
 //! Encoded SCION path segments.
 
-use std::{iter::FusedIterator, ops::Range};
+use std::{
+    iter::FusedIterator,
+    ops::{Deref, Range},
+};
 
 use chrono::{DateTime, Utc};
 
@@ -27,19 +30,27 @@ use super::{EncodedInfoField, HopFields};
 /// Allows retrieving the info and hop fields associated with the path segment,
 /// as well as the overall expiry time of the segment.
 #[derive(Debug, Clone)]
-pub struct EncodedSegment<'a> {
+pub struct EncodedSegment<'a, Hs = HopFields<'a>>
+where
+    Hs: Clone,
+{
     info_field: &'a EncodedInfoField,
-    hop_fields: HopFields<'a>,
+    hop_fields: Hs,
 }
 
-impl<'a> EncodedSegment<'a> {
+impl<'a, H, HRef, Hs> EncodedSegment<'a, Hs>
+where
+    H: EncodedHopField + ?Sized,
+    HRef: Deref<Target = H>,
+    Hs: Clone + Iterator<Item = HRef>,
+{
     /// Creates a new view of a non-empty segment.
     ///
     /// # Panics
     ///
     /// If hop_fields is empty.
-    pub(super) fn new(info_field: &'a EncodedInfoField, hop_fields: HopFields<'a>) -> Self {
-        assert_ne!(hop_fields.len(), 0);
+    pub(super) fn new(info_field: &'a EncodedInfoField, hop_fields: Hs) -> Self {
+        assert!(hop_fields.clone().peekable().peek().is_some());
         Self {
             info_field,
             hop_fields,
@@ -53,7 +64,7 @@ impl<'a> EncodedSegment<'a> {
 
     /// Returns an iterator over the [`EncodedHopField`][super::EncodedHopField]s associated with
     /// this segment.
-    pub fn hop_fields(&self) -> HopFields<'a> {
+    pub fn hop_fields(&self) -> Hs {
         self.hop_fields.clone()
     }
 
