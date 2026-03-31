@@ -553,7 +553,7 @@ impl<'a> HummingbirdHopFields<'a> {
 }
 
 impl<'a> Iterator for HummingbirdHopFields<'a> {
-    type Item = &'a EncodedFlyoverHopField;
+    type Item = &'a EncodedHummingbirdHopField;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.inner.is_empty() {
@@ -570,7 +570,7 @@ impl<'a> Iterator for HummingbirdHopFields<'a> {
             } else {
                 let (current, rest) = self.inner.split_at(FlyoverHopField::ENCODED_SIZE);
                 self.inner = rest;
-                Some(EncodedFlyoverHopField::new(current))
+                Some(EncodedHummingbirdHopField::new(current))
             }
         } else {
             // Standard hop field.
@@ -579,7 +579,7 @@ impl<'a> Iterator for HummingbirdHopFields<'a> {
             } else {
                 let (current, rest) = self.inner.split_at(StandardHopField::ENCODED_SIZE);
                 self.inner = rest;
-                Some(EncodedFlyoverHopField::new(current))
+                Some(EncodedHummingbirdHopField::new(current))
             }
         }
     }
@@ -588,7 +588,11 @@ impl<'a> Iterator for HummingbirdHopFields<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{path::hummingbird::EncodedFlyoverHopField, test_case, test_hopfield_flag};
+    use crate::{
+        path::{hummingbird::EncodedFlyoverHopField, EncodedHopField, StandardHopField},
+        test_case,
+        test_hopfield_flag,
+    };
     use std::num::NonZeroU16;
 
     test_hopfield_flag! {
@@ -787,5 +791,122 @@ mod tests {
     test_case! {
         reservation_duration_max:
             test_reservation_duration(0xFF, 0xFF, 0xFFFF)
+    }
+
+    #[test]
+    fn hop_fields_empty() {
+        let mut iter = HummingbirdHopFields::new(&[]);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn hop_fields_single_flyover() {
+        let mut hop_data = [0u8; FlyoverHopField::ENCODED_SIZE];
+        hop_data[0] = FlyoverHopField::FLYOVER_BIT;
+        hop_data[2] = 0xAB;
+        hop_data[3] = 0xCD;
+        let mut iter = HummingbirdHopFields::new(&hop_data);
+
+        let field = iter.next().unwrap();
+        assert!(field.is_flyover());
+        assert_eq!(field.cons_ingress_interface(), NonZeroU16::new(0xABCD));
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn hop_fields_single_standard() {
+        let mut hop_data = [0u8; StandardHopField::ENCODED_SIZE];
+        hop_data[2] = 0xFE;
+        hop_data[3] = 0xED;
+        let mut iter = HummingbirdHopFields::new(&hop_data);
+
+        let field = iter.next().unwrap();
+        assert!(!field.is_flyover());
+        assert_eq!(field.cons_ingress_interface(), NonZeroU16::new(0xFEED));
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn hop_fields_two_flyovers() {
+        let mut hop_data = [0u8; 2 * FlyoverHopField::ENCODED_SIZE];
+        // First flyover field.
+        hop_data[0] = FlyoverHopField::FLYOVER_BIT;
+        hop_data[2] = 0xAB;
+        hop_data[3] = 0xCD;
+        // Second flyover field (starts at byte 20).
+        hop_data[20] = FlyoverHopField::FLYOVER_BIT;
+        hop_data[22] = 0x12;
+        hop_data[23] = 0x34;
+        let mut iter = HummingbirdHopFields::new(&hop_data);
+
+        let field1 = iter.next().unwrap();
+        assert!(field1.is_flyover());
+        assert_eq!(field1.cons_ingress_interface(), NonZeroU16::new(0xABCD));
+
+        let field2 = iter.next().unwrap();
+        assert!(field2.is_flyover());
+        assert_eq!(field2.cons_ingress_interface(), NonZeroU16::new(0x1234));
+
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn hop_fields_two_standards() {
+        let mut hop_data = [0u8; 2 * StandardHopField::ENCODED_SIZE];
+        // First standard field.
+        hop_data[2] = 0xFE;
+        hop_data[3] = 0xED;
+        // Second standard field (starts at byte 12).
+        hop_data[14] = 0x56;
+        hop_data[15] = 0x78;
+        let mut iter = HummingbirdHopFields::new(&hop_data);
+
+        let field1 = iter.next().unwrap();
+        assert!(!field1.is_flyover());
+        assert_eq!(field1.cons_ingress_interface(), NonZeroU16::new(0xFEED));
+
+        let field2 = iter.next().unwrap();
+        assert!(!field2.is_flyover());
+        assert_eq!(field2.cons_ingress_interface(), NonZeroU16::new(0x5678));
+
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn hop_fields_flyover_then_standard() {
+        let mut hop_data = [0u8; FlyoverHopField::ENCODED_SIZE + StandardHopField::ENCODED_SIZE];
+        // Flyover field.
+        hop_data[0] = FlyoverHopField::FLYOVER_BIT;
+        hop_data[2] = 0xAB;
+        hop_data[3] = 0xCD;
+        // Standard field (starts at byte 20).
+        hop_data[22] = 0xFE;
+        hop_data[23] = 0xED;
+        let mut iter = HummingbirdHopFields::new(&hop_data);
+
+        let field1 = iter.next().unwrap();
+        assert!(field1.is_flyover());
+        assert_eq!(field1.cons_ingress_interface(), NonZeroU16::new(0xABCD));
+
+        let field2 = iter.next().unwrap();
+        assert!(!field2.is_flyover());
+        assert_eq!(field2.cons_ingress_interface(), NonZeroU16::new(0xFEED));
+
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn hop_fields_truncated_flyover() {
+        let mut hop_data = [0u8; FlyoverHopField::ENCODED_SIZE - 1];
+        hop_data[0] = FlyoverHopField::FLYOVER_BIT;
+        let mut iter = HummingbirdHopFields::new(&hop_data);
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn hop_fields_truncated_standard() {
+        let hop_data = [0u8; StandardHopField::ENCODED_SIZE - 1];
+        let mut iter = HummingbirdHopFields::new(&hop_data);
+        assert!(iter.next().is_none());
     }
 }
