@@ -25,7 +25,7 @@ use crate::path::EncodedHopField;
 
 use super::{EncodedInfoField, HopFields};
 
-/// A segment of a SCION [`EncodedStandardPath`][super::EncodedStandardPath].
+/// A segment of a SCION path.
 ///
 /// Allows retrieving the info and hop fields associated with the path segment,
 /// as well as the overall expiry time of the segment.
@@ -77,18 +77,24 @@ where
     }
 }
 
-/// An iterator over the [`EncodedSegment`]s in a SCION
-/// [`EncodedStandardPath`][super::EncodedStandardPath].
+/// An iterator over the [`EncodedSegment`]s in a SCION path.
 ///
 /// This `struct` is created by the [`segments`][super::EncodedStandardPath::segments] method on
 /// [`EncodedStandardPath`][super::EncodedStandardPath]. See its documentation for more information.
-pub struct EncodedSegments<'a> {
-    inner: [Option<EncodedSegment<'a>>; 3],
+/// TODO: Add reference to EncodedHummingbirdPath
+pub struct EncodedSegments<'a, Hs = HopFields<'a>>
+where
+    Hs: Clone,
+{
+    inner: [Option<EncodedSegment<'a, Hs>>; 3],
     valid_range: Range<usize>,
 }
 
-impl<'a> EncodedSegments<'a> {
-    pub(super) fn new(segments: [Option<EncodedSegment<'a>>; 3]) -> Self {
+impl<'a, Hs> EncodedSegments<'a, Hs>
+where
+    Hs: Clone,
+{
+    pub(super) fn new(segments: [Option<EncodedSegment<'a, Hs>>; 3]) -> Self {
         let end = segments.iter().position(Option::is_none).unwrap_or(3);
         Self {
             inner: segments,
@@ -97,8 +103,8 @@ impl<'a> EncodedSegments<'a> {
     }
 }
 
-impl<'a> Iterator for EncodedSegments<'a> {
-    type Item = EncodedSegment<'a>;
+impl<'a, Hs: Clone> Iterator for EncodedSegments<'a, Hs> {
+    type Item = EncodedSegment<'a, Hs>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.valid_range.next().map(|idx| {
@@ -109,7 +115,7 @@ impl<'a> Iterator for EncodedSegments<'a> {
     }
 }
 
-impl DoubleEndedIterator for EncodedSegments<'_> {
+impl<Hs: Clone> DoubleEndedIterator for EncodedSegments<'_, Hs> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.valid_range.next_back().map(|idx| {
             self.inner[idx]
@@ -119,10 +125,10 @@ impl DoubleEndedIterator for EncodedSegments<'_> {
     }
 }
 
-impl ExactSizeIterator for EncodedSegments<'_> {
+impl<Hs: Clone> ExactSizeIterator for EncodedSegments<'_, Hs> {
     fn len(&self) -> usize {
         self.valid_range.len()
     }
 }
 
-impl FusedIterator for EncodedSegments<'_> {}
+impl<Hs: Clone> FusedIterator for EncodedSegments<'_, Hs> {}
