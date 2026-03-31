@@ -250,7 +250,7 @@ macro_rules! bounded_uint {
             pub const BITS: u32 = $bits;
 
             /// The maximum possible value for an instance of this type.
-            pub const MAX: Self = Self((1 << $bits) - 1);
+            pub const MAX: Self = Self(((1_u128 << Self::BITS) - 1) as $type);
 
             /// Create a new instance if the value is at most `Self::MAX.value()`.
             pub const fn new(value: $type) -> Option<Self> {
