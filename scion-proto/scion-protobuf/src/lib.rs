@@ -72,3 +72,12 @@ pub mod crypto {
         include!("proto/proto.crypto.v1.rs");
     }
 }
+
+/// Types and services for the Hummingbird flyover reservation protocol.
+pub mod hbird {
+    /// Version 1 Hummingbird types and services.
+    pub mod v1 {
+        include!("proto/proto.hbird.v1.rs");
+    }
+    pub use v1::h_bird_service_client::HBirdServiceClient;
+}
