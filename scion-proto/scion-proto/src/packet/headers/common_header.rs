@@ -423,12 +423,12 @@ mod tests {
         #[test]
         fn valid_unknown_path_type() {
             let (mut data, expected) = base_header();
-            data[8] = 0x05;
+            data[8] = 0x06;
 
             assert_eq!(
                 CommonHeader::decode(&mut data.as_slice()).expect("must successfully decode"),
                 CommonHeader {
-                    path_type: PathType::Other(5),
+                    path_type: PathType::Other(6),
                     ..expected
                 }
             );

@@ -64,6 +64,18 @@ impl PathScoring for PathLengthScorer {
                     .map(|seg| seg.hop_fields().len() - 2)
                     .sum()
             }
+            scion_proto::path::DataPlanePath::Hummingbird(encoded_hummingbird_path) => {
+                // TODO: This is a comparatively expensive operation. Calculating
+                // the number of hop fields in a Hummingbird path requires iterating
+                // through the path to see which hop fields have the flyover bit
+                // set.
+                // Should this be replaced with some heuristic value or is this fine?
+                encoded_hummingbird_path
+                    .hop_fields()
+                    .map(|_| 1)
+                    .sum::<usize>()
+                    - 2
+            }
             scion_proto::path::DataPlanePath::Unsupported { .. } => {
                 HOP_COUNT_FOR_MIN_SCORE as usize
             }

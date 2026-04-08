@@ -210,6 +210,20 @@ impl EncodedHopField for EncodedHummingbirdHopField {
     );
 }
 
+impl EncodedHummingbirdHopField {
+    /// Returns a view into the Hummingbird hop field as a standard hop field. 
+    /// The MAC is wrong if the hop field is a flyover hop field that contains
+    /// an aggregated MAC. 
+    ///
+    /// Boder routers should de-aggregate the MAC before forwarding SCION packets 
+    /// with a reservation. Therefore, if the path was obtained from an incoming
+    /// SCION packet, then the returned standard hop field should have the correct 
+    /// MAC.
+    pub fn standard_hopfield_unchecked(&self) -> &EncodedStandardHopField {
+        EncodedStandardHopField::new(&self.inner[..StandardHopField::ENCODED_SIZE])
+    }
+}
+
 impl<'a> TryFrom<&'a EncodedHummingbirdHopField> for &'a EncodedStandardHopField {
     // Note(mariosbf): We could create a specific Error type for this, but
     // the default use is probably to check if the flyover bit is set, before
@@ -232,7 +246,7 @@ impl<'a> TryFrom<&'a EncodedHummingbirdHopField> for &'a EncodedFlyoverHopField 
     type Error = &'static str;
 
     fn try_from(value: &'a EncodedHummingbirdHopField) -> Result<Self, Self::Error> {
-        if value.is_flyover() {
+        if !value.is_flyover() {
             Err("Cannot convert a standard hop field to a flyover hop field")
         } else {
             Ok(EncodedFlyoverHopField::new(&value.inner))

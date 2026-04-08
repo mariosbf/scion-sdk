@@ -6,7 +6,7 @@ use bytes::{Buf, BufMut};
 
 use crate::{
     packet::{DecodeError, InadequateBufferSize},
-    path::DataPlanePathErrorKind,
+    path::{DataPlanePathErrorKind, SegmentLength},
     wire_encoding::{self, WireDecode, WireEncode},
 };
 
@@ -198,8 +198,8 @@ pub struct HummingbirdMetaHeader {
     /// The length of each of the segments in bytes.
     ///
     /// Note: In a regular SCION meta header, the segment length fields are  
-    /// the number of hop fields in the segment. In contrast, in the Hummingbird 
-    /// meta header, the segment length fields are the number of bytes in the 
+    /// the number of hop fields in the segment. In contrast, in the Hummingbird
+    /// meta header, the segment length fields are the number of bytes in the
     /// segment divided by 4.
     ///
     ///
@@ -300,7 +300,8 @@ impl HummingbirdMetaHeader {
     pub(super) fn encoded_path_length(&self) -> usize {
         Self::LENGTH
             + self.info_fields_count() * Self::INFO_FIELD_LENGTH
-            + self.segment_lengths
+            + self
+                .segment_lengths
                 .iter()
                 .map(|seg_len| seg_len.length())
                 .sum::<usize>()

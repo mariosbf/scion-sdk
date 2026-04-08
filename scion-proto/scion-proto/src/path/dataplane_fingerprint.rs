@@ -37,6 +37,10 @@ impl DataPlanePathFingerprint {
     /// at a known Source AS deterministically maps to exactly one specific sequence of
     /// traversed ASes. Therefore, hashing (Src, Dst, Interfaces) is topologically
     /// equivalent to hashing the full control plane path segment.
+    ///
+    /// Note that Hummingbird paths are supported, but they are treated like
+    /// standard paths, i.e., the fingerprint is derived from the sequence of interfaces,
+    /// irrespective of reservations.
     pub fn new<T: Deref<Target = [u8]>>(path: &Path<T>) -> DataPlanePathFingerprint {
         let mut hasher = Sha256::new();
         match &path.data_plane_path {
@@ -47,20 +51,14 @@ impl DataPlanePathFingerprint {
             crate::path::DataPlanePath::Standard(encoded_standard_path) => {
                 hasher.update(path.isd_asn.source.to_be_bytes());
                 hasher.update(path.isd_asn.destination.to_be_bytes());
-                encoded_standard_path.hop_fields().for_each(|hf| {
-                    hasher.update(
-                        hf.cons_ingress_interface()
-                            .map(|i| i.get())
-                            .unwrap_or(0)
-                            .to_be_bytes(),
-                    );
-                    hasher.update(
-                        hf.cons_egress_interface()
-                            .map(|i| i.get())
-                            .unwrap_or(0)
-                            .to_be_bytes(),
-                    );
-                });
+
+                Self::digest_hopfields(&mut hasher, encoded_standard_path.hop_fields());
+            }
+            crate::path::DataPlanePath::Hummingbird(encoded_hummingbird_path) => {
+                hasher.update(path.isd_asn.source.to_be_bytes());
+                hasher.update(path.isd_asn.destination.to_be_bytes());
+
+                Self::digest_hopfields(&mut hasher, encoded_hummingbird_path.hop_fields());
             }
             crate::path::DataPlanePath::Unsupported { path_type, bytes } => {
                 // Not really a valid fingerprint, but it's not worth special-casing.
@@ -73,6 +71,27 @@ impl DataPlanePathFingerprint {
         }
 
         DataPlanePathFingerprint(hasher.finalize().into())
+    }
+
+    fn digest_hopfields<H, HRef>(hasher: &mut Sha256, hopfields: impl IntoIterator<Item = HRef>)
+    where
+        H: EncodedHopField + ?Sized,
+        HRef: Deref<Target = H>,
+    {
+        for hf in hopfields {
+            hasher.update(
+                hf.cons_ingress_interface()
+                    .map(|i| i.get())
+                    .unwrap_or(0)
+                    .to_be_bytes(),
+            );
+            hasher.update(
+                hf.cons_egress_interface()
+                    .map(|i| i.get())
+                    .unwrap_or(0)
+                    .to_be_bytes(),
+            );
+        }
     }
 
     /// Writes the fingerprint as lower or upper case hex, without the leading 0x.
