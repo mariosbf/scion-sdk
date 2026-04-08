@@ -2,12 +2,6 @@
 //!
 //! See also [path::hummingbird].
 
-use std::time::Duration;
-
-use chrono::{DateTime, Utc};
-
-use crate::address::IsdAsn;
-
 /// Bandwidth for Hummingbird reservations.  
 #[derive(Clone, PartialEq, Eq, Hash, Copy, Debug, Default)]
 pub struct Bandwidth {
