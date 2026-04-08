@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use std::{num::NonZeroU16, time::Duration};
 
 use crate::{
+    hummingbird::Bandwidth,
     packet::{DecodeError, InadequateBufferSize},
     path::{
         EncodedHopField, EncodedInfoField, EncodedStandardHopField, HopField, InfoField,
@@ -215,13 +216,13 @@ impl EncodedHopField for EncodedHummingbirdHopField {
 }
 
 impl EncodedHummingbirdHopField {
-    /// Returns a view into the Hummingbird hop field as a standard hop field. 
+    /// Returns a view into the Hummingbird hop field as a standard hop field.
     /// The MAC is wrong if the hop field is a flyover hop field that contains
-    /// an aggregated MAC. 
+    /// an aggregated MAC.
     ///
-    /// Boder routers should de-aggregate the MAC before forwarding SCION packets 
+    /// Boder routers should de-aggregate the MAC before forwarding SCION packets
     /// with a reservation. Therefore, if the path was obtained from an incoming
-    /// SCION packet, then the returned standard hop field should have the correct 
+    /// SCION packet, then the returned standard hop field should have the correct
     /// MAC.
     pub fn standard_hopfield_unchecked(&self) -> &EncodedStandardHopField {
         EncodedStandardHopField::new(&self.inner[..StandardHopField::ENCODED_SIZE])
@@ -312,8 +313,7 @@ pub struct FlyoverHopField {
 
     /// ResBW is a 10-bit representation of the bandwidth of the reservation
     /// being used by this FlyoverHopField.
-    /// TODO: Is the encoding fixed yet?
-    pub res_bw: u16,
+    pub res_bw: Bandwidth,
 
     /// ResStartOffset is the 16-bit offset in seconds between the BaseTimestamp
     /// of the path meta header and the the start of the reservation being used
@@ -383,7 +383,7 @@ impl WireEncode for FlyoverHopField {
         buffer.put_u16(self.cons_ingress);
         buffer.put_u16(self.cons_egress);
         buffer.put_slice(&self.aggregated_mac);
-        let res_id_and_bw = ((self.res_id & 0x3FFFFF) << 10) | (self.res_bw & 0x3FF) as u32;
+        let res_id_and_bw = ((self.res_id & 0x3FFFFF) << 10) | self.res_bw.encode() as u32;
         buffer.put_u32(res_id_and_bw);
         buffer.put_u16(self.res_start_offset);
         buffer.put_u16(self.res_duration);
@@ -410,7 +410,7 @@ impl WireDecode<Bytes> for FlyoverHopField {
         let aggregated_mac = data.split_to(6).slice(..6).to_vec().try_into().unwrap();
         let res_id_and_bw = data.get_u32();
         let res_id = res_id_and_bw >> 10;
-        let res_bw = (res_id_and_bw & 0x3FF) as u16;
+        let res_bw = Bandwidth::decode((res_id_and_bw & 0x3FF) as u16);
         let res_start_offset = data.get_u16();
         let res_duration = data.get_u16();
 
@@ -604,9 +604,8 @@ impl<'a> Iterator for HummingbirdHopFields<'a> {
 mod tests {
     use super::*;
     use crate::{
-        path::{hummingbird::EncodedFlyoverHopField, EncodedHopField, StandardHopField},
-        test_case,
-        test_hopfield_flag,
+        path::{EncodedHopField, StandardHopField, hummingbird::EncodedFlyoverHopField},
+        test_case, test_hopfield_flag,
     };
     use std::num::NonZeroU16;
 

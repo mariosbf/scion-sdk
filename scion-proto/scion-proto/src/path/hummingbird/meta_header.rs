@@ -6,7 +6,7 @@ use bytes::{Buf, BufMut};
 
 use crate::{
     packet::{DecodeError, InadequateBufferSize},
-    path::{DataPlanePathErrorKind, SegmentLength},
+    path::DataPlanePathErrorKind,
     wire_encoding::{self, WireDecode, WireEncode},
 };
 

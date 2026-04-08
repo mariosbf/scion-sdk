@@ -50,6 +50,7 @@ pub mod reliable;
 pub mod scmp;
 pub mod test;
 pub mod wire_encoding;
+pub mod hummingbird;
 
 pub(crate) mod utils;
 
