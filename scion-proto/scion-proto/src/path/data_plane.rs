@@ -22,6 +22,7 @@ use bytes::{Buf, BufMut, Bytes};
 use super::encoded::EncodedStandardPath;
 use crate::{
     packet::{DecodeError, InadequateBufferSize},
+    path::hummingbird::EncodedHummingbirdPath,
     utils::encoded_type,
     wire_encoding::{WireDecode, WireDecodeWithContext, WireEncode},
 };
@@ -38,7 +39,9 @@ encoded_type!(
         /// Experimental Epic path type.
         Epic = 3,
         /// Experimental Colibri path type.
-        Colibri = 4;
+        Colibri = 4,
+        /// Experimental Hummingbird path type.
+        Hummingbird = 5;
         /// Other, unrecognized path types.
         Other = _,
     }
@@ -56,6 +59,8 @@ pub enum DataPlanePath<T = Bytes> {
     EmptyPath,
     /// The standard SCION path header.
     Standard(EncodedStandardPath<T>),
+    /// The Hummingbird SCION path header.
+    Hummingbird(EncodedHummingbirdPath<T>),
     /// The raw bytes of an unsupported path header type.
     Unsupported {
         /// The path's type.
@@ -77,6 +82,7 @@ impl<T> DataPlanePath<T> {
         match self {
             Self::EmptyPath => PathType::Empty,
             Self::Standard(_) => PathType::Scion,
+            Self::Hummingbird(_) => PathType::Hummingbird,
             Self::Unsupported { path_type, .. } => *path_type,
         }
     }
@@ -96,6 +102,7 @@ where
         match self {
             DataPlanePath::EmptyPath => &[],
             DataPlanePath::Standard(path) => path.raw(),
+            DataPlanePath::Hummingbird(path) => path.raw(),
             DataPlanePath::Unsupported { bytes, .. } => bytes.deref(),
         }
     }
@@ -110,6 +117,9 @@ where
         match self {
             DataPlanePath::EmptyPath => DataPlanePath::EmptyPath,
             DataPlanePath::Standard(path) => DataPlanePath::Standard(path.copy_to_slice(buffer)),
+            DataPlanePath::Hummingbird(path) => {
+                DataPlanePath::Hummingbird(path.copy_to_slice(buffer))
+            }
             DataPlanePath::Unsupported { path_type, bytes } => {
                 buffer.copy_from_slice(bytes);
                 DataPlanePath::Unsupported {
@@ -122,21 +132,37 @@ where
 
     /// Reverse the path to the provided slice.
     ///
+    /// Note that reversing a Hummingbird path produces a Standard path as
+    /// Hummingbird reservations are not bidirectional.
+    /// See [EncodedHummingbirdPath::to_reversed] for more details on reversing
+    /// Hummingbird paths.
+    ///
     /// Unsupported path types are copied to the slice, as is.
     pub fn reverse_to_slice<'b>(&self, buffer: &'b mut [u8]) -> DataPlanePath<&'b mut [u8]> {
         match self {
             DataPlanePath::EmptyPath => DataPlanePath::EmptyPath,
             DataPlanePath::Standard(path) => DataPlanePath::Standard(path.reverse_to_slice(buffer)),
+            DataPlanePath::Hummingbird(path) => {
+                DataPlanePath::Standard(path.reverse_to_slice(buffer))
+            }
             DataPlanePath::Unsupported { .. } => self.copy_to_slice(buffer),
         }
     }
 
     /// Reverses the path.
+    ///
+    /// Note that reversing a Hummingbird path produces a Standard path as
+    /// Hummingbird reservations are not bidirectional.
+    /// See [`EncodedHummingbirdPath::to_reversed`] for more details on reversing
+    /// Hummingbird paths.
     pub fn to_reversed(&self) -> Result<DataPlanePath, UnsupportedPathType> {
         match self {
             Self::EmptyPath => Ok(DataPlanePath::EmptyPath),
             Self::Standard(standard_path) => {
                 Ok(DataPlanePath::Standard(standard_path.to_reversed()))
+            }
+            Self::Hummingbird(hummingbird_path) => {
+                Ok(DataPlanePath::Standard(hummingbird_path.to_reversed()))
             }
             Self::Unsupported { path_type, .. } => Err(UnsupportedPathType(u8::from(*path_type))),
         }
@@ -149,12 +175,11 @@ impl DataPlanePath<Bytes> {
         match self {
             Self::EmptyPath => Self::EmptyPath,
             Self::Standard(path) => Self::Standard(path.deep_copy()),
-            Self::Unsupported { path_type, bytes } => {
-                Self::Unsupported {
-                    path_type: *path_type,
-                    bytes: Bytes::copy_from_slice(bytes),
-                }
-            }
+            Self::Hummingbird(path) => Self::Hummingbird(path.deep_copy()),
+            Self::Unsupported { path_type, bytes } => Self::Unsupported {
+                path_type: *path_type,
+                bytes: Bytes::copy_from_slice(bytes),
+            },
         }
     }
 
@@ -163,6 +188,12 @@ impl DataPlanePath<Bytes> {
         match self {
             Self::EmptyPath => (),
             Self::Standard(standard_path) => *standard_path = standard_path.to_reversed(),
+            Self::Hummingbird(_) => {
+                // Cannot reverse Hummingbird paths in place because the
+                // length of the path may change as a result of reversing the
+                // path.
+                return Err(UnsupportedPathType(PathType::Hummingbird.into()));
+            }
             Self::Unsupported { path_type, .. } => {
                 return Err(UnsupportedPathType(u8::from(*path_type)));
             }
@@ -175,12 +206,11 @@ impl DataPlanePath<Bytes> {
         match self {
             DataPlanePath::EmptyPath => DataPlanePath::EmptyPath,
             DataPlanePath::Standard(path) => DataPlanePath::Standard(path.to_slice_path()),
-            DataPlanePath::Unsupported { path_type, bytes } => {
-                DataPlanePath::Unsupported {
-                    path_type: *path_type,
-                    bytes: bytes.deref(),
-                }
-            }
+            DataPlanePath::Hummingbird(path) => DataPlanePath::Hummingbird(path.to_slice_path()),
+            DataPlanePath::Unsupported { path_type, bytes } => DataPlanePath::Unsupported {
+                path_type: *path_type,
+                bytes: bytes.deref(),
+            },
         }
     }
 }
@@ -191,12 +221,11 @@ impl<T: AsRef<[u8]>> DataPlanePath<T> {
         match self {
             DataPlanePath::EmptyPath => DataPlanePath::EmptyPath,
             DataPlanePath::Standard(path) => DataPlanePath::Standard(path.to_bytes_path()),
-            DataPlanePath::Unsupported { path_type, bytes } => {
-                DataPlanePath::Unsupported {
-                    path_type: *path_type,
-                    bytes: Bytes::copy_from_slice(bytes.as_ref()),
-                }
-            }
+            DataPlanePath::Hummingbird(path) => DataPlanePath::Hummingbird(path.to_bytes_path()),
+            DataPlanePath::Unsupported { path_type, bytes } => DataPlanePath::Unsupported {
+                path_type: *path_type,
+                bytes: Bytes::copy_from_slice(bytes.as_ref()),
+            },
         }
     }
 }
@@ -238,6 +267,7 @@ impl WireEncode for DataPlanePath {
     fn encoded_length(&self) -> usize {
         match self {
             Self::Standard(path) => path.raw().len(),
+            Self::Hummingbird(path) => path.raw().len(),
             Self::EmptyPath => 0,
             Self::Unsupported { bytes, .. } => bytes.len(),
         }
@@ -246,6 +276,7 @@ impl WireEncode for DataPlanePath {
     fn encode_to_unchecked<T: BufMut>(&self, buffer: &mut T) {
         match self {
             Self::Standard(path) => buffer.put(path.raw()),
+            Self::Hummingbird(path) => buffer.put(path.raw()),
             Self::EmptyPath => (),
             Self::Unsupported { bytes, .. } => buffer.put_slice(bytes),
         }

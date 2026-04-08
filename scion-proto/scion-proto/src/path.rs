@@ -139,6 +139,20 @@ where
                     )
                 }
             }
+            DataPlanePath::Hummingbird(_) => {
+                // TODO: Potentially replace with something more useful.
+                if let Some(metadata) = &self.metadata {
+                    write!(f, "HummingbirdPath Hops: ")?;
+                    metadata.format_interfaces(f)?;
+                    write!(f, " MTU: {}", metadata.mtu)
+                } else {
+                    write!(
+                        f,
+                        "HummingbirdPath: {} -> {} (no metadata)",
+                        self.isd_asn.source, self.isd_asn.destination
+                    )
+                }
+            }
         }
     }
 }
@@ -237,6 +251,7 @@ where
         match &self.data_plane_path {
             DataPlanePath::EmptyPath => None,
             DataPlanePath::Standard(path) => Some(path.expiry_time()),
+            DataPlanePath::Hummingbird(path) => Some(path.expiry_time()),
             DataPlanePath::Unsupported { .. } => None,
         }
     }
@@ -372,11 +387,9 @@ impl Path<Bytes> {
         let underlay_next_hop = match &value.interface {
             Some(daemon_grpc::Interface {
                 address: Some(daemon_grpc::Underlay { address }),
-            }) => {
-                address
-                    .parse()
-                    .map_err(|_| PathParseError::from(PathParseErrorKind::InvalidInterface))?
-            }
+            }) => address
+                .parse()
+                .map_err(|_| PathParseError::from(PathParseErrorKind::InvalidInterface))?,
             // TODO: Determine if the daemon returns paths that are strictly on the host.
             // If so, this is only an error if the path is non-empty
             _ => return Err(PathParseErrorKind::NoInterface.into()),

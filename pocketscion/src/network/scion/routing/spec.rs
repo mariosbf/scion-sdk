@@ -96,6 +96,15 @@ impl RoutingLogic for SpecRoutingLogic {
 
                     Ok(LocalAsRoutingAction::ForwardLocal { target_address }.into())
                 }
+                DataPlanePath::Hummingbird(_) => {
+                    tracing::warn!(path_type = ?PathType::Hummingbird, "Received unsupported path type");
+                    Err(scmp_parameter_problem(
+                        scion_packet,
+                        ParameterProblemCode::UnknownPathType,
+                        |_| ScionPacketOffset::common_header().path_type(),
+                    ))
+
+                }
                 DataPlanePath::Unsupported {
                     path_type,
                     bytes,
