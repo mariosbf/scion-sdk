@@ -2,6 +2,12 @@
 //!
 //! See also [path::hummingbird].
 
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+
+use crate::{address::IsdAsn, path::hummingbird::ReservationKey};
+
 /// Bandwidth for Hummingbird reservations.  
 #[derive(Clone, PartialEq, Eq, Hash, Copy, Debug, Default)]
 pub struct Bandwidth {
@@ -90,6 +96,41 @@ impl Bandwidth {
     }
 }
 
+/// Information about a Hummingbird reservation.
+#[derive(Debug, Clone)]
+pub struct ReservationInfo {
+    /// The ISD-AS for which bandwidth was reserved.
+    pub isd_as: IsdAsn,
+
+    /// The ingress interface for which bandwidth was reserved.
+    pub ingress_interface: u16,
+
+    /// The egress interface for which bandwidth was reserved.
+    pub egress_interface: u16,
+
+    /// The reservation ID.
+    pub res_id: u32,
+
+    /// The reserved bandwidth.
+    pub bandwidth: Bandwidth,
+
+    /// The start time of the reservation.
+    pub start: u32,
+
+    /// The duration for which the bandwidth is reserved.
+    pub duration: u16,
+}
+
+/// A full Hummingbird reservation.
+#[derive(Debug, Clone)]
+pub struct Reservation {
+    /// Information about the reservation.
+    pub info: ReservationInfo,
+
+    /// The path for which bandwidth was reserved.
+    pub reservation_key: ReservationKey,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,7 +195,10 @@ mod tests {
         for kbps in [0u64, 1, 31, 32, 64, 1024, 1_000_000] {
             let bw = Bandwidth::from_kbps(kbps).unwrap();
             let decoded = Bandwidth::decode(bw.encode());
-            assert_eq!(bw, decoded, "encode/decode roundtrip failed for {kbps} kbps");
+            assert_eq!(
+                bw, decoded,
+                "encode/decode roundtrip failed for {kbps} kbps"
+            );
         }
     }
 
@@ -162,7 +206,11 @@ mod tests {
     fn encode_fits_in_10_bits() {
         for kbps in [0u64, 1, 31, 32, 64, 1_000_000] {
             let encoded = Bandwidth::from_kbps(kbps).unwrap().encode();
-            assert_eq!(encoded & !Bandwidth::MASK, 0, "encoded value exceeds 10 bits for {kbps} kbps");
+            assert_eq!(
+                encoded & !Bandwidth::MASK,
+                0,
+                "encoded value exceeds 10 bits for {kbps} kbps"
+            );
         }
     }
 }
