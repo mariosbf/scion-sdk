@@ -2,7 +2,7 @@
 //!
 //! See also [path::hummingbird].
 
-use crate::{address::IsdAsn, path::hummingbird::ReservationKey};
+use crate::{address::IsdAsn, path::hummingbird::HbirdAuthKey};
 
 /// Bandwidth for Hummingbird reservations.  
 #[derive(Clone, PartialEq, Eq, Hash, Copy, Debug, Default)]
@@ -124,7 +124,7 @@ pub struct Reservation {
     pub info: ReservationInfo,
 
     /// The path for which bandwidth was reserved.
-    pub reservation_key: ReservationKey,
+    pub reservation_key: HbirdAuthKey,
 }
 
 #[cfg(test)]
