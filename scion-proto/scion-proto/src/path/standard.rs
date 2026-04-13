@@ -14,7 +14,7 @@
 // limitations under the License.
 //! Standard SCION path.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bytes::{Buf as _, BufMut, Bytes};
 use chrono::{DateTime, Utc};
@@ -22,7 +22,12 @@ use sciparse::path::standard::types::{HopFieldFlags, InfoFieldFlags};
 
 use super::{HopFieldIndex, InfoFieldIndex, MetaHeader, MetaReserved, SegmentLength, encoded};
 use crate::{
+    address::IsdAsn,
     packet::{DecodeError, InadequateBufferSize},
+    path::hummingbird::{
+        FlyoverHopField, HummingbirdCounter, HummingbirdHopField, HummingbirdMetaHeader,
+        HummingbirdPath, calculate_flyover_key, calculate_flyover_mac, xor_in_place,
+    },
     wire_encoding::{WireDecode, WireEncode},
 };
 
@@ -128,6 +133,50 @@ impl StandardPath {
             info_fields,
             hop_fields,
         }
+    }
+
+    /// Turns this path into a HummingbirdPath with the current timestamp and
+    /// a default counter value.
+    pub fn to_hummingbird(self) -> HummingbirdPath {
+        self.to_hummingbird_with_timestamp(SystemTime::now(), None)
+    }
+
+    /// Turns this path into a HummingbirdPath with the provided timestamp and
+    /// counter.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the provided timestamp is before the UNIX epoch, since the
+    /// HummingbirdMetaHeader requires a timestamp that is the number of seconds
+    /// since the UNIX epoch.
+    pub fn to_hummingbird_with_timestamp(
+        self,
+        timestamp: SystemTime,
+        counter: Option<HummingbirdCounter>,
+    ) -> HummingbirdPath {
+        let segments =
+            self.path_meta
+                .segment_lengths
+                .iter()
+                .scan(&self.hop_fields[..], |rest, &len| {
+                    let (head, tail) = rest.split_at(len.length());
+                    *rest = tail;
+                    Some(
+                        head.iter()
+                            .map(|hf| HummingbirdHopField::Standard(hf.clone()))
+                            .collect(),
+                    )
+                });
+
+        let mut hbird_path = HummingbirdPath::new_with_timestamp(timestamp, counter);
+        hbird_path.set_current_info_field_index(self.path_meta.current_info_field.into());
+        hbird_path.set_current_hop_field_index(self.path_meta.current_hop_field.into());
+
+        for (info_field, segment) in self.info_fields.into_iter().zip(segments) {
+            hbird_path.add_segment(info_field, segment).unwrap();
+        }
+
+        hbird_path
     }
 }
 
@@ -383,6 +432,55 @@ impl HopField for StandardHopField {
 
     fn expiry_time(&self, info_field: &InfoField) -> DateTime<Utc> {
         info_field.timestamp() + self.expiry_offset()
+    }
+}
+
+impl StandardHopField {
+    /// Turns this into a FlyoverHopField by applying a Hummingbird reservation.  
+    pub fn apply_reservation(
+        &self,
+        meta_header: HummingbirdMetaHeader,
+        reservation: &crate::hummingbird::Reservation,
+        destination: IsdAsn,
+        pkt_len: u16,
+    ) -> FlyoverHopField {
+        let flyover_key = calculate_flyover_key(
+            self.cons_ingress,
+            self.cons_egress,
+            reservation.info.res_id,
+            reservation.info.bandwidth,
+            reservation.info.start,
+            reservation.info.duration,
+            &reservation.reservation_key,
+        );
+
+        // TODO: Casting to u16 could be problematic
+        let res_start_offset = (meta_header.base_timestamp.get() - reservation.info.start) as u16;
+
+        let flyover_mac = calculate_flyover_mac(
+            destination.isd(),
+            destination.asn(),
+            pkt_len,
+            res_start_offset,
+            meta_header.millis_timestamp(),
+            meta_header.counter(),
+            &flyover_key,
+        );
+        let mut mac = self.mac;
+        xor_in_place(&mut mac, &flyover_mac);
+
+        FlyoverHopField {
+            ingress_router_alert: self.ingress_router_alert,
+            egress_router_alert: self.egress_router_alert,
+            exp_time: self.exp_time,
+            cons_ingress: self.cons_ingress,
+            cons_egress: self.cons_egress,
+            aggregated_mac: self.mac,
+            res_id: reservation.info.res_id,
+            res_bw: reservation.info.bandwidth,
+            res_start_offset,
+            res_duration: reservation.info.duration,
+        }
     }
 }
 

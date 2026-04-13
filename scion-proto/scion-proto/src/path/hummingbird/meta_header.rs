@@ -6,7 +6,9 @@ use bytes::{Buf, BufMut};
 
 use crate::{
     packet::{DecodeError, InadequateBufferSize},
-    path::DataPlanePathErrorKind,
+    path::{
+        DataPlanePathErrorKind, HopFieldIndex, InfoFieldIndex, SegmentLength, StandardHopField,
+    },
     wire_encoding::{self, WireDecode, WireEncode},
 };
 
@@ -16,16 +18,85 @@ wire_encoding::bounded_uint! {
     pub struct HummingbirdInfoFieldIndex(u8 : 2);
 }
 
-wire_encoding::bounded_uint! {
-    /// A 8-bit index into the hop fields.
-    #[derive(Default)]
-    pub struct HummingbirdHopfieldIndex(u8 : 8);
+impl From<InfoFieldIndex> for HummingbirdInfoFieldIndex {
+    fn from(value: InfoFieldIndex) -> Self {
+        Self(value.get())
+    }
+}
+
+/// A 8-bit index into the hop fields.
+/// Note that the hop field index for Hummingbird paths is a byte offset rather
+/// than a hop field count.
+/// The API exposes this field as a byte offset.
+#[derive(Default, Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
+pub struct HummingbirdHopfieldIndex(u8);
+
+impl HummingbirdHopfieldIndex {
+    /// The number of bits useable for an instance of this type.
+    pub const BITS: u32 = 8;
+
+    /// The maximum possible byte offset for an instance of this type.
+    pub const MAX: usize = u8::MAX as usize * 4;
+
+    /// Create a new instance with the provided value.
+    /// For this to succeed, the provided value must be a valid byte offset to a
+    /// hop field, i.e., it must be a multiple of 4 and at most
+    /// `Self::MAX`.
+    pub const fn new(value: usize) -> Option<Self> {
+        if !value.is_multiple_of(4) || value > Self::MAX {
+            return None;
+        }
+
+        Some(Self((value / 4) as u8))
+    }
+
+    /// Create a new instance with the provided value.
+    /// The value is assumed to be valid, i.e., a multiple of 4 and at most
+    /// `Self::MAX`.
+    pub const fn new_unchecked(value: usize) -> Self {
+        debug_assert!(
+            value.is_multiple_of(4),
+            "hop field index must be a multiple of 4"
+        );
+        debug_assert!(
+            value <= Self::MAX,
+            "hop field index must not exceed SELF::MAX",
+        );
+        Self((value / 4) as u8)
+    }
+
+    /// Get the value of this instance as its underlying type.
+    /// Note: This is a scaled byte offset, not a hop field count.
+    #[inline]
+    pub const fn encode(&self) -> u8 {
+        self.0
+    }
+
+    /// Get the value of this instance as a byte offset.
+    #[inline]
+    pub const fn byte_offset(&self) -> usize {
+        self.0 as usize * 4
+    }
+
+    /// Decode this value from its wire representation.
+    #[inline]
+    pub const fn decode(value: u8) -> Self {
+        Self(value)
+    }
+}
+
+impl From<HopFieldIndex> for HummingbirdHopfieldIndex {
+    fn from(value: HopFieldIndex) -> Self {
+        // Need to scale up by the number of bytes in a standard hop field
+        Self(value.get() * (StandardHopField::ENCODED_SIZE / 4) as u8)
+    }
 }
 
 #[derive(Default, Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Hash)]
 /// A 7-bit encoding of the number of hop fields in a Hummingbird path segment.
-/// Note that the length of the segment is encoded by the number of bytes in the
-/// segment divided by 4.
+///
+/// Note: This value is encoded by a 7-bit field representing the number of bytes
+/// in the segment divided by 4.
 pub struct HummingbirdSegmentLength(u8);
 
 impl HummingbirdSegmentLength {
@@ -33,64 +104,61 @@ impl HummingbirdSegmentLength {
     pub const BITS: u32 = 7;
 
     /// The maximum possible value for an instance of this type.
-    pub const MAX: Self = Self((1 << 7) - 1);
+    pub const MAX: usize = ((1 << 7) - 1) * 4;
 
-    /// Create a new instance if the value is at most `Self::MAX.value()`.
-    /// The `length` parameter is the number of bytes in the segment.
-    pub const fn new(segment_length: u16) -> Option<Self> {
-        if segment_length <= (Self::MAX.0 as u16) * 4 {
-            Some(Self((segment_length / 4) as u8))
-        } else {
-            None
+    /// Create a new instance with the provided value.
+    /// For this to succeed, the provided value must be a valid segment length in
+    /// bytes, i.e., it must be a multiple of 4 and at most `Self::MAX`.
+    pub const fn new(value: usize) -> Option<Self> {
+        if !value.is_multiple_of(4) || value > Self::MAX {
+            return None;
         }
+
+        Some(Self((value / 4) as u8))
     }
 
     /// Create a new instance with the provided value.
-    /// The value is assumed to already be the encoding of the segment length,
-    /// i.e., the number of bytes in the segment divided by 4.
     ///
     /// # Safety
     ///
     /// The value should be at most `Self::MAX.value()`.
-    pub const fn new_unchecked(value: u8) -> Self {
-        debug_assert!(value <= Self::MAX.0);
-        Self(value)
-    }
+    /// The value should be a multiple of 4.
+    pub const fn new_unchecked(value: usize) -> Self {
+        debug_assert!(
+            value <= Self::MAX,
+            "segment length must not exceed SELF::MAX",
+        );
+        debug_assert!(
+            value.is_multiple_of(4),
+            "segment length in bytes must be a multiple of 4",
+        );
 
-    /// Create a new instance from the number of bytes in the segment, without
-    /// checking that the value is at most `Self::MAX.value()`.
-    /// The value is calculated as the number of bytes in the segment divided by 4.
-    ///
-    /// # Safety
-    /// The `segment_length` should be at most `Self::MAX.value() * 4`.
-    pub const fn from_u16_unchecked(segment_length: u16) -> Self {
-        debug_assert!(segment_length <= (Self::MAX.0 as u16) * 4);
-        Self((segment_length / 4) as u8)
+        Self((value / 4) as u8)
     }
 
     /// Get the value of this instance as its underlying type.
     #[inline]
-    pub const fn get(&self) -> u8 {
+    pub const fn encode(&self) -> u8 {
         self.0
     }
-}
 
-impl From<u8> for HummingbirdSegmentLength {
-    fn from(value: u8) -> Self {
-        Self::new_unchecked(value)
+    /// Decode this value from its wire representation.
+    #[inline]
+    pub const fn decode(value: u8) -> Self {
+        Self(value)
     }
 }
 
-impl TryFrom<u16> for HummingbirdSegmentLength {
-    type Error = &'static str;
-
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        Self::new(value).ok_or("segment length exceeds maximum encodable length")
+impl From<SegmentLength> for HummingbirdSegmentLength {
+    fn from(value: SegmentLength) -> Self {
+        // A SegmentLength contains the number of hop fields
+        Self::new_unchecked(value.get() as usize * StandardHopField::ENCODED_SIZE)
     }
 }
 
 impl HummingbirdSegmentLength {
-    /// Gets the indicated length of the Hummingbird segment as a usize.
+    /// Gets the indicated length (number of bytes) of the Hummingbird  segment as
+    /// a usize.
     pub const fn length(&self) -> usize {
         self.0 as usize * 4
     }
@@ -175,7 +243,7 @@ wire_encoding::bounded_uint! {
 /// for HummingbirdMetaHeader. This is primarily because the Hummingbird path
 /// encoding diffuses the relationship between segment length and number of hop
 /// fields.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Copy)]
 pub struct HummingbirdMetaHeader {
     /// An index to the current info field for the packet on its way through the
     /// network.
@@ -246,7 +314,7 @@ impl HummingbirdMetaHeader {
 
     /// Returns the index of the current hop field.
     pub fn hop_field_index(&self) -> usize {
-        self.current_hop_field.get().into()
+        self.current_hop_field.byte_offset()
     }
 
     /// Returns the base timestamp.
@@ -324,11 +392,11 @@ impl WireEncode for HummingbirdMetaHeader {
     #[inline]
     fn encode_to_unchecked<T: BufMut>(&self, buffer: &mut T) {
         let fields1: u32 = (self.current_info_field.get() as u32)
-            | ((self.current_hop_field.get() as u32) << 2)
+            | ((self.current_hop_field.encode() as u32) << 2)
             | ((self.reserved.get() as u32) << 10)
-            | ((self.segment_lengths[0].get() as u32) << 11)
-            | ((self.segment_lengths[1].get() as u32) << 18)
-            | ((self.segment_lengths[2].get() as u32) << 25);
+            | ((self.segment_lengths[0].encode() as u32) << 11)
+            | ((self.segment_lengths[1].encode() as u32) << 18)
+            | ((self.segment_lengths[2].encode() as u32) << 25);
         let fields2: u32 = self.base_timestamp.get();
         let fields3: u32 = (self.millis_timestamp.get() as u32) | (self.counter.get() << 10);
         buffer.put_u32(fields1);
@@ -350,21 +418,21 @@ impl<T: Buf> WireDecode<T> for HummingbirdMetaHeader {
 
         let meta = Self {
             current_info_field: HummingbirdInfoFieldIndex(field::<0, 2>(fields1) as u8),
-            current_hop_field: HummingbirdHopfieldIndex(field::<2, 10>(fields1) as u8),
+            current_hop_field: HummingbirdHopfieldIndex::decode(field::<2, 10>(fields1) as u8),
             reserved: HummingbirdMetaReserved(field::<10, 11>(fields1) as u8),
             segment_lengths: [
-                HummingbirdSegmentLength(field::<11, 18>(fields1) as u8),
-                HummingbirdSegmentLength(field::<18, 25>(fields1) as u8),
-                HummingbirdSegmentLength(field::<25, 32>(fields1) as u8),
+                HummingbirdSegmentLength::decode(field::<11, 18>(fields1) as u8),
+                HummingbirdSegmentLength::decode(field::<18, 25>(fields1) as u8),
+                HummingbirdSegmentLength::decode(field::<25, 32>(fields1) as u8),
             ],
             base_timestamp: HummingbirdBaseTimestamp(fields2),
             millis_timestamp: HummingbirdMillisTimestamp(field::<0, 10>(fields3) as u16),
             counter: HummingbirdCounter(field::<10, 32>(fields3)),
         };
 
-        if meta.segment_lengths[2].get() > 0 && meta.segment_lengths[1].get() == 0
-            || meta.segment_lengths[1].get() > 0 && meta.segment_lengths[0].get() == 0
-            || meta.segment_lengths[0].get() == 0
+        if meta.segment_lengths[2].encode() > 0 && meta.segment_lengths[1].encode() == 0
+            || meta.segment_lengths[1].encode() > 0 && meta.segment_lengths[0].encode() == 0
+            || meta.segment_lengths[0].encode() == 0
         {
             return Err(DataPlanePathErrorKind::InvalidSegmentLengths.into());
         }
@@ -374,25 +442,6 @@ impl<T: Buf> WireDecode<T> for HummingbirdMetaHeader {
         }
         // Above errs also when info_fields_index() is 4, since info_fields_count() is at most 3
         debug_assert!(meta.info_field_index() <= 3);
-
-        let fallback_seg_index = 255; // Will never match and thus always return OutOfRange
-
-        // Sanity check: check that the hop field index is reasonable.
-        // We cannot compute the exact number of hop fields from the meta header,
-        // but we can compute an upper bound.
-        let segment_lengths_sum: usize = meta
-            .segment_lengths
-            .iter()
-            .map(|seg_len| seg_len.length())
-            .sum();
-        let max_hop_fields = (segment_lengths_sum - HummingbirdMetaHeader::LENGTH)
-            / HummingbirdMetaHeader::HOP_FIELD_LENGTH;
-
-        if meta.hop_field_index() >= max_hop_fields
-            || meta.segment_index().unwrap_or(fallback_seg_index) != meta.info_field_index()
-        {
-            return Err(DataPlanePathErrorKind::HopFieldOutOfRange.into());
-        }
 
         Ok(meta)
     }
@@ -441,7 +490,7 @@ mod tests {
     fn segment_length_new_valid() {
         assert_eq!(
             HummingbirdSegmentLength::new(12),
-            Some(HummingbirdSegmentLength::new_unchecked(3))
+            Some(HummingbirdSegmentLength::new_unchecked(12))
         );
     }
 
@@ -455,41 +504,14 @@ mod tests {
 
     #[test]
     fn segment_length_new_max() {
-        let max_bytes = (HummingbirdSegmentLength::MAX.get() as u16) * 4;
-        assert!(HummingbirdSegmentLength::new(max_bytes).is_some());
+        let max = HummingbirdSegmentLength::MAX;
+        assert!(HummingbirdSegmentLength::new(max).is_some());
     }
 
     #[test]
     fn segment_length_new_too_large() {
-        let over_max = (HummingbirdSegmentLength::MAX.get() as u16) * 4 + 4;
+        let over_max = HummingbirdSegmentLength::MAX + 4;
         assert_eq!(HummingbirdSegmentLength::new(over_max), None);
-    }
-
-    #[test]
-    fn segment_length_length() {
-        assert_eq!(HummingbirdSegmentLength::new_unchecked(6).length(), 24);
-        assert_eq!(HummingbirdSegmentLength::new_unchecked(0).length(), 0);
-        assert_eq!(HummingbirdSegmentLength::new_unchecked(1).length(), 4);
-    }
-
-    #[test]
-    fn segment_length_try_from_u16_valid() {
-        assert_eq!(
-            HummingbirdSegmentLength::try_from(8_u16),
-            Ok(HummingbirdSegmentLength::new_unchecked(2))
-        );
-    }
-
-    #[test]
-    fn segment_length_try_from_u16_too_large() {
-        let over_max = (HummingbirdSegmentLength::MAX.get() as u16) * 4 + 4;
-        assert!(HummingbirdSegmentLength::try_from(over_max).is_err());
-    }
-
-    #[test]
-    fn segment_length_from_u8() {
-        let s = HummingbirdSegmentLength::from(5_u8);
-        assert_eq!(s.get(), 5);
     }
 
     // ---------------------------------------------------------------------------
@@ -541,7 +563,7 @@ mod tests {
     fn info_fields_count_one() {
         let header = HummingbirdMetaHeader {
             segment_lengths: [
-                HummingbirdSegmentLength::new_unchecked(3),
+                HummingbirdSegmentLength::new_unchecked(12),
                 HummingbirdSegmentLength::new_unchecked(0),
                 HummingbirdSegmentLength::new_unchecked(0),
             ],
@@ -554,8 +576,8 @@ mod tests {
     fn info_fields_count_two() {
         let header = HummingbirdMetaHeader {
             segment_lengths: [
-                HummingbirdSegmentLength::new_unchecked(3),
-                HummingbirdSegmentLength::new_unchecked(3),
+                HummingbirdSegmentLength::new_unchecked(12),
+                HummingbirdSegmentLength::new_unchecked(12),
                 HummingbirdSegmentLength::new_unchecked(0),
             ],
             ..Default::default()
@@ -567,9 +589,9 @@ mod tests {
     fn info_fields_count_three() {
         let header = HummingbirdMetaHeader {
             segment_lengths: [
-                HummingbirdSegmentLength::new_unchecked(3),
-                HummingbirdSegmentLength::new_unchecked(3),
-                HummingbirdSegmentLength::new_unchecked(3),
+                HummingbirdSegmentLength::new_unchecked(12),
+                HummingbirdSegmentLength::new_unchecked(12),
+                HummingbirdSegmentLength::new_unchecked(12),
             ],
             ..Default::default()
         };
@@ -578,14 +600,13 @@ mod tests {
 
     #[test]
     fn segment_index_in_seg0() {
-        // segment_lengths[i].length() = get() * 4; each segment covers 12 bytes.
         let header = HummingbirdMetaHeader {
             segment_lengths: [
-                HummingbirdSegmentLength::new_unchecked(3), // length = 12
-                HummingbirdSegmentLength::new_unchecked(3),
-                HummingbirdSegmentLength::new_unchecked(3),
+                HummingbirdSegmentLength::new_unchecked(12),
+                HummingbirdSegmentLength::new_unchecked(12),
+                HummingbirdSegmentLength::new_unchecked(12),
             ],
-            current_hop_field: HummingbirdHopfieldIndex(5),
+            current_hop_field: HummingbirdHopfieldIndex::new_unchecked(0),
             ..Default::default()
         };
         assert_eq!(header.segment_index(), Some(0));
@@ -595,11 +616,11 @@ mod tests {
     fn segment_index_in_seg1() {
         let header = HummingbirdMetaHeader {
             segment_lengths: [
-                HummingbirdSegmentLength::new_unchecked(3), // length = 12
-                HummingbirdSegmentLength::new_unchecked(3),
-                HummingbirdSegmentLength::new_unchecked(3),
+                HummingbirdSegmentLength::new_unchecked(12),
+                HummingbirdSegmentLength::new_unchecked(12),
+                HummingbirdSegmentLength::new_unchecked(12),
             ],
-            current_hop_field: HummingbirdHopfieldIndex(12),
+            current_hop_field: HummingbirdHopfieldIndex::new_unchecked(12),
             ..Default::default()
         };
         assert_eq!(header.segment_index(), Some(1));
@@ -609,11 +630,11 @@ mod tests {
     fn segment_index_in_seg2() {
         let header = HummingbirdMetaHeader {
             segment_lengths: [
-                HummingbirdSegmentLength::new_unchecked(3), // length = 12
-                HummingbirdSegmentLength::new_unchecked(3),
-                HummingbirdSegmentLength::new_unchecked(3),
+                HummingbirdSegmentLength::new_unchecked(12),
+                HummingbirdSegmentLength::new_unchecked(12),
+                HummingbirdSegmentLength::new_unchecked(12),
             ],
-            current_hop_field: HummingbirdHopfieldIndex(24),
+            current_hop_field: HummingbirdHopfieldIndex::new_unchecked(24),
             ..Default::default()
         };
         assert_eq!(header.segment_index(), Some(2));
@@ -623,11 +644,11 @@ mod tests {
     fn segment_index_out_of_range() {
         let header = HummingbirdMetaHeader {
             segment_lengths: [
-                HummingbirdSegmentLength::new_unchecked(3), // length = 12
-                HummingbirdSegmentLength::new_unchecked(3),
-                HummingbirdSegmentLength::new_unchecked(3),
+                HummingbirdSegmentLength::new_unchecked(12),
+                HummingbirdSegmentLength::new_unchecked(12),
+                HummingbirdSegmentLength::new_unchecked(12),
             ],
-            current_hop_field: HummingbirdHopfieldIndex(36),
+            current_hop_field: HummingbirdHopfieldIndex::new_unchecked(36),
             ..Default::default()
         };
         assert_eq!(header.segment_index(), None);
@@ -662,10 +683,13 @@ mod tests {
         let header = HummingbirdMetaHeader::decode(&mut data.as_slice()).expect("valid decode");
 
         assert_eq!(header.current_info_field, HummingbirdInfoFieldIndex(0));
-        assert_eq!(header.current_hop_field, HummingbirdHopfieldIndex(0));
+        assert_eq!(
+            header.current_hop_field,
+            HummingbirdHopfieldIndex::new_unchecked(0)
+        );
         assert_eq!(
             header.segment_lengths[0],
-            HummingbirdSegmentLength::new_unchecked(6)
+            HummingbirdSegmentLength::new_unchecked(24)
         );
         assert_eq!(
             header.segment_lengths[1],
@@ -687,10 +711,13 @@ mod tests {
         let data = encode_fields(fields1(0, 2, 12, 0, 0), 1_000_000, f3);
         let header = HummingbirdMetaHeader::decode(&mut data.as_slice()).expect("valid decode");
 
-        assert_eq!(header.current_hop_field, HummingbirdHopfieldIndex(2));
+        assert_eq!(
+            header.current_hop_field,
+            HummingbirdHopfieldIndex::new_unchecked(8)
+        );
         assert_eq!(
             header.segment_lengths[0],
-            HummingbirdSegmentLength::new_unchecked(12)
+            HummingbirdSegmentLength::new_unchecked(48)
         );
         assert_eq!(header.base_timestamp, HummingbirdBaseTimestamp(1_000_000));
         assert_eq!(header.millis_timestamp, HummingbirdMillisTimestamp(500));
@@ -758,18 +785,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn decode_hop_field_out_of_range() {
-        // seg_len[0]=6 → max_hop_fields=1; hop=1 is out of range.
-        let data = encode_fields(fields1(0, 1, 6, 0, 0), 0, 0);
-        assert_eq!(
-            HummingbirdMetaHeader::decode(&mut data.as_slice()),
-            Err(DecodeError::InvalidPath(
-                DataPlanePathErrorKind::HopFieldOutOfRange
-            ))
-        );
-    }
-
     // ---------------------------------------------------------------------------
     // WireEncode + WireDecode roundtrip
     // ---------------------------------------------------------------------------
@@ -778,10 +793,10 @@ mod tests {
     fn encode_decode_roundtrip() {
         let original = HummingbirdMetaHeader {
             current_info_field: HummingbirdInfoFieldIndex(0),
-            current_hop_field: HummingbirdHopfieldIndex(2),
+            current_hop_field: HummingbirdHopfieldIndex::new_unchecked(8),
             reserved: HummingbirdMetaReserved(0),
             segment_lengths: [
-                HummingbirdSegmentLength::new_unchecked(12), // length=48, max_hop_fields=3
+                HummingbirdSegmentLength::new_unchecked(48),
                 HummingbirdSegmentLength::new_unchecked(0),
                 HummingbirdSegmentLength::new_unchecked(0),
             ],
