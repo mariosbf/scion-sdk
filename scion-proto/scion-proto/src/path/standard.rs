@@ -26,7 +26,7 @@ use crate::{
     packet::{DecodeError, InadequateBufferSize},
     path::hummingbird::{
         FlyoverHopField, HummingbirdCounter, HummingbirdHopField, HummingbirdMetaHeader,
-        HummingbirdPath, calculate_flyover_key, calculate_flyover_mac, xor_in_place,
+        HummingbirdPath, calculate_hbird_auth_key, calculate_flyover_mac, xor_in_place,
     },
     wire_encoding::{WireDecode, WireEncode},
 };
@@ -444,7 +444,7 @@ impl StandardHopField {
         destination: IsdAsn,
         pkt_len: u16,
     ) -> FlyoverHopField {
-        let flyover_key = calculate_flyover_key(
+        let flyover_key = calculate_hbird_auth_key(
             self.cons_ingress,
             self.cons_egress,
             reservation.info.res_id,

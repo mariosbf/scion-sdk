@@ -1,10 +1,10 @@
 //! Cryptographic functions for Hummingbird reservations.
 //!
 //! We divide keys into two categories:
-//! - Flyover keys: Used to calculate flyover MACs for a specific Hummingbird
-//!   path.
-//! - Reservation keys: Used to derive flyover keys for a reservation. This is
-//!   the key that you get when you redeem a reservation.
+//! - Hummingbird authentication keys: Used to authenticate attempts to use a reservation.
+//!   Denoted A_K in the Hummingbird paper.
+//! - Hummingbird keys: Used by ASes to derive authentication keys for 
+//!   reservations. Denoted SV_K in the Hummingbird paper.
 
 use aes::cipher::{BlockEncrypt, consts::U16, generic_array::GenericArray};
 
@@ -13,13 +13,15 @@ use crate::{
     hummingbird::Bandwidth,
 };
 
-/// 16-byte key from which the flyover keys are derived.
-/// [`calculate_flyover_key`] derives flyover keys from this key.
-pub type ReservationKey = GenericArray<u8, U16>;
+/// 16-byte keys from which ASes derive Hummingbird authentication keys.
+/// Denoted SV_K in the Hummingbird paper.
+/// [`calculate_hbird_auth_key`] derives auth keys from this key.
+pub type HbirdKey = GenericArray<u8, U16>;
 
 /// 16-byte key used to authenticate Hummingbird reservations (by calculating
 /// flyover MACs).
-pub type FlyoverKey = GenericArray<u8, U16>;
+/// Denoted A_K in the Hummingbird paper.
+pub type HbirdAuthKey = GenericArray<u8, U16>;
 
 /// Calculates the flyover MAC for a flyover hop.
 /// Note: Only calculates the flyover MAC, not the aggregated MAC.
@@ -39,7 +41,7 @@ pub fn calculate_flyover_mac(
     res_start_offset: u16,
     millis_timestamp: u16,
     counter: u32,
-    key: &FlyoverKey,
+    key: &HbirdAuthKey,
 ) -> [u8; 6] {
     use cmac::Mac;
 
@@ -78,24 +80,25 @@ pub fn calculate_flyover_mac(
     result
 }
 
-/// Derives the flyover key for a reservation from the reservation key and
-/// reservation parameters.
+/// Derives the Hummingbird auth key for a reservation from the reservation key 
+/// and reservation parameters.
 ///
-/// Note: Some fields are not as wide as the types in the function signature suggest:
+/// Note: Some fields are not as wide as the types in the function signature 
+/// suggest:
 /// - `res_id` is only 22 bits wide, and
 /// - `bw` is only 10 bits wide.
 ///
 /// These fields will be truncated to the appropriate width before being used in
 /// the key derivation.
-pub fn calculate_flyover_key(
+pub fn calculate_hbird_auth_key(
     cons_ingress: u16,
     cons_egress: u16,
     res_id: u32,
     bw: Bandwidth,
     res_start: u32,
     res_duration: u16,
-    key: &ReservationKey,
-) -> FlyoverKey {
+    key: &HbirdKey,
+) -> HbirdAuthKey {
     use aes::cipher::KeyInit;
 
     // Input data format (all fields are BE):
