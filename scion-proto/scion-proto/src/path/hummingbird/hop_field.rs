@@ -15,6 +15,7 @@ use crate::{
 };
 
 /// A HopField when Hummingbird is used.
+#[derive(Debug, Clone)]
 pub enum HummingbirdHopField {
     /// Regular hop field when a flyover is not reserved.
     Standard(StandardHopField),
@@ -54,6 +55,13 @@ impl HopField for HummingbirdHopField {
     }
 }
 
+impl HummingbirdHopField {
+    /// Checks whether the hop field is a flyover hop field.
+    pub fn is_flyover(&self) -> bool {
+        matches!(self, Self::Flyover(_))
+    }
+}
+
 impl WireDecode<Bytes> for HummingbirdHopField {
     type Error = DecodeError;
 
@@ -89,6 +97,18 @@ impl WireEncode for HummingbirdHopField {
             Self::Standard(hop_field) => hop_field.encode_to_unchecked(buffer),
             Self::Flyover(flyover_hop_field) => flyover_hop_field.encode_to_unchecked(buffer),
         }
+    }
+}
+
+impl From<StandardHopField> for HummingbirdHopField {
+    fn from(value: StandardHopField) -> Self {
+        Self::Standard(value)
+    }
+}
+
+impl From<FlyoverHopField> for HummingbirdHopField {
+    fn from(value: FlyoverHopField) -> Self {
+        Self::Flyover(value)
     }
 }
 

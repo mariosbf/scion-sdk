@@ -2,10 +2,6 @@
 //!
 //! See also [path::hummingbird].
 
-use std::time::Duration;
-
-use chrono::{DateTime, Utc};
-
 use crate::{address::IsdAsn, path::hummingbird::ReservationKey};
 
 /// Bandwidth for Hummingbird reservations.  

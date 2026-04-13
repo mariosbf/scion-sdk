@@ -8,6 +8,11 @@
 
 use aes::cipher::{BlockEncrypt, consts::U16, generic_array::GenericArray};
 
+use crate::{
+    address::{Asn, Isd},
+    hummingbird::Bandwidth,
+};
+
 /// 16-byte key from which the flyover keys are derived.
 /// [`calculate_flyover_key`] derives flyover keys from this key.
 pub type ReservationKey = GenericArray<u8, U16>;
@@ -28,8 +33,8 @@ pub type FlyoverKey = GenericArray<u8, U16>;
 /// These fields will be truncated to the appropriate width before being used in
 /// the MAC.
 pub fn calculate_flyover_mac(
-    dst_isd: u16,
-    dst_as: u64,
+    dst_isd: Isd,
+    dst_as: Asn,
     pkt_len: u16,
     res_start_offset: u16,
     millis_timestamp: u16,
@@ -52,7 +57,7 @@ pub fn calculate_flyover_mac(
     //	|  MillisTimestamp  |                  Counter                  |
     //	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
-    let destination_address = ((dst_isd as u64) << 48) | (dst_as & 0xFFFFFFFFFFFF);
+    let destination_address = ((dst_isd.0 as u64) << 48) | (dst_as.0 & 0xFFFFFFFFFFFF);
     let millis_and_counter = (((millis_timestamp & 0x3FF) as u32) << 22) | (counter & 0x3FFFFF);
 
     let mut mac_input_data = [0u8; 16];
@@ -86,7 +91,7 @@ pub fn calculate_flyover_key(
     cons_ingress: u16,
     cons_egress: u16,
     res_id: u32,
-    bw: u16,
+    bw: Bandwidth,
     res_start: u32,
     res_duration: u16,
     key: &ReservationKey,
@@ -107,7 +112,7 @@ pub fn calculate_flyover_key(
     //  |          ResDuration          |               0               |
     //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
-    let res_id_and_bw = ((res_id & 0x3FFFFF) << 10) | ((bw & 0x3FF) as u32);
+    let res_id_and_bw = ((res_id & 0x3FFFFF) << 10) | ((bw.encode() & 0x3FF) as u32);
 
     let mut key_input_data = [0u8; 16];
     key_input_data[0..2].copy_from_slice(&cons_ingress.to_be_bytes());
@@ -123,4 +128,12 @@ pub fn calculate_flyover_key(
     cipher.encrypt_block(&mut flyover_key);
 
     flyover_key
+}
+
+pub fn xor_in_place(a: &mut [u8], b: &[u8]) {
+    a.iter_mut().zip(b.iter()).for_each(|(x, y)| *x ^= y);
+}
+
+pub fn xor(a: &[u8], b: &[u8]) -> impl Iterator<Item = u8> {
+    a.iter().zip(b.iter()).map(|(x, y)| x ^ y)
 }

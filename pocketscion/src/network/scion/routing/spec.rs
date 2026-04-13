@@ -19,10 +19,12 @@ use bytes::Bytes;
 use scion_proto::{
     address::IsdAsn,
     packet::{
-        layout::{BitOffset, ScionPacketOffset}, ScionHeaders, ScionPacketRaw
+        ScionHeaders, ScionPacketRaw,
+        layout::{BitOffset, ScionPacketOffset},
     },
     path::{
-        crypto::ForwardingKey, DataPlanePath, HopField, HopFieldIndex, InfoField, InfoFieldIndex, MetaHeader, StandardHopField, StandardPath
+        DataPlanePath, HopField, HopFieldIndex, InfoField, InfoFieldIndex, MetaHeader,
+        StandardHopField, StandardPath, crypto::ForwardingKey,
     },
     scmp::{
         ParameterProblemCode, ScmpErrorMessage, ScmpExternalInterfaceDown, ScmpParameterProblem,
@@ -89,6 +91,15 @@ impl RoutingLogic for SpecRoutingLogic {
                         })?;
 
                     Ok(LocalAsRoutingAction::ForwardLocal { target_address }.into())
+                }
+                DataPlanePath::Hummingbird(_) => {
+                    // TODO: Add Hummingbird support
+                    tracing::warn!("Received unsupported Hummingbird path");
+                    Err(scmp_parameter_problem(
+                        scion_packet,
+                        ParameterProblemCode::UnknownPathType,
+                        |_| ScionPacketOffset::common_header().path_type(),
+                    ))
                 }
                 DataPlanePath::Unsupported {
                     path_type,
@@ -222,22 +233,18 @@ impl SpecRoutingLogic {
 
             let packet = scion_packet.encode_to_bytes_vec().concat();
             let (code, pointer) = match is_construction_dir {
-                true => {
-                    (
-                        ParameterProblemCode::UnknownHopFieldConsIngressInterface,
-                        ScionPacketOffset::std_path(&packet)
-                            .hop_field(current_hop_index as u8)
-                            .cons_ingress(),
-                    )
-                }
-                false => {
-                    (
-                        ParameterProblemCode::UnknownHopFieldConsEgressInterface,
-                        ScionPacketOffset::std_path(&packet)
-                            .hop_field(current_hop_index as u8)
-                            .cons_egress(),
-                    )
-                }
+                true => (
+                    ParameterProblemCode::UnknownHopFieldConsIngressInterface,
+                    ScionPacketOffset::std_path(&packet)
+                        .hop_field(current_hop_index as u8)
+                        .cons_ingress(),
+                ),
+                false => (
+                    ParameterProblemCode::UnknownHopFieldConsEgressInterface,
+                    ScionPacketOffset::std_path(&packet)
+                        .hop_field(current_hop_index as u8)
+                        .cons_egress(),
+                ),
             };
 
             return Err(ScmpParameterProblem::new(code, pointer.bytes(), packet.into()).into());
@@ -698,42 +705,36 @@ fn get_interface_type(
                 |p| calc_offset(p, hop_field_index, egress == cons_dir),
             ))
         }
-        _ => {
-            match interface_link_type_lookup(interface_id) {
-                Some(link_type) => Ok(link_type.link_type),
-                None => {
-                    tracing::warn!(
-                        hop = hop_field_index,
-                        if_id = interface_id,
-                        "Unknown interface id"
-                    );
+        _ => match interface_link_type_lookup(interface_id) {
+            Some(link_type) => Ok(link_type.link_type),
+            None => {
+                tracing::warn!(
+                    hop = hop_field_index,
+                    if_id = interface_id,
+                    "Unknown interface id"
+                );
 
-                    let cons_egress = egress == cons_dir;
-                    let code = match cons_egress {
-                        true => ParameterProblemCode::UnknownHopFieldConsEgressInterface,
-                        false => ParameterProblemCode::UnknownHopFieldConsIngressInterface,
-                    };
+                let cons_egress = egress == cons_dir;
+                let code = match cons_egress {
+                    true => ParameterProblemCode::UnknownHopFieldConsEgressInterface,
+                    false => ParameterProblemCode::UnknownHopFieldConsIngressInterface,
+                };
 
-                    Err(scmp_parameter_problem(scion_packet, code, |p| {
-                        calc_offset(p, hop_field_index, cons_egress)
-                    }))
-                }
+                Err(scmp_parameter_problem(scion_packet, code, |p| {
+                    calc_offset(p, hop_field_index, cons_egress)
+                }))
             }
-        }
+        },
     };
 
     fn calc_offset(scion_packet: &[u8], hop_field_index: usize, cons_egress: bool) -> BitOffset {
         match cons_egress {
-            true => {
-                ScionPacketOffset::std_path(scion_packet)
-                    .hop_field(hop_field_index as u8)
-                    .cons_egress()
-            }
-            false => {
-                ScionPacketOffset::std_path(scion_packet)
-                    .hop_field(hop_field_index as u8)
-                    .cons_ingress()
-            }
+            true => ScionPacketOffset::std_path(scion_packet)
+                .hop_field(hop_field_index as u8)
+                .cons_egress(),
+            false => ScionPacketOffset::std_path(scion_packet)
+                .hop_field(hop_field_index as u8)
+                .cons_ingress(),
         }
     }
 }
@@ -845,28 +846,24 @@ fn ensure_interface_up(
             tracing::warn!("Unknown interface id: {interface_id}");
 
             match cons_egress {
-                true => {
-                    Err(scmp_parameter_problem(
-                        scion_packet,
-                        ParameterProblemCode::UnknownHopFieldConsEgressInterface,
-                        |p| {
-                            ScionPacketOffset::std_path(p)
-                                .hop_field(hop_field_index as u8)
-                                .cons_egress()
-                        },
-                    ))
-                }
-                false => {
-                    Err(scmp_parameter_problem(
-                        scion_packet,
-                        ParameterProblemCode::UnknownHopFieldConsIngressInterface,
-                        |p| {
-                            ScionPacketOffset::std_path(p)
-                                .hop_field(hop_field_index as u8)
-                                .cons_ingress()
-                        },
-                    ))
-                }
+                true => Err(scmp_parameter_problem(
+                    scion_packet,
+                    ParameterProblemCode::UnknownHopFieldConsEgressInterface,
+                    |p| {
+                        ScionPacketOffset::std_path(p)
+                            .hop_field(hop_field_index as u8)
+                            .cons_egress()
+                    },
+                )),
+                false => Err(scmp_parameter_problem(
+                    scion_packet,
+                    ParameterProblemCode::UnknownHopFieldConsIngressInterface,
+                    |p| {
+                        ScionPacketOffset::std_path(p)
+                            .hop_field(hop_field_index as u8)
+                            .cons_ingress()
+                    },
+                )),
             }
         }
     }
@@ -879,29 +876,21 @@ fn create_path_decode_error(
     let packet: Bytes = scion_packet.encode_to_bytes_vec().concat().into();
     let path_offset = ScionPacketOffset::std_path(&packet);
     let (code, pointer) = match e {
-        scion_proto::packet::DecodeError::InvalidPath(kind) => {
-            match kind {
-                scion_proto::path::DataPlanePathErrorKind::InvalidSegmentLengths => {
-                    (
-                        ParameterProblemCode::InvalidPath,
-                        path_offset.path_meta_header().seg_len_0(),
-                    )
-                }
-                scion_proto::path::DataPlanePathErrorKind::InfoFieldOutOfRange => {
-                    (
-                        ParameterProblemCode::InvalidPath,
-                        path_offset.path_meta_header().current_info_field(),
-                    )
-                }
-                scion_proto::path::DataPlanePathErrorKind::HopFieldOutOfRange => {
-                    (
-                        ParameterProblemCode::InvalidPath,
-                        path_offset.path_meta_header().current_hop_field(),
-                    )
-                }
-                _ => (ParameterProblemCode::InvalidPath, path_offset.base()),
-            }
-        }
+        scion_proto::packet::DecodeError::InvalidPath(kind) => match kind {
+            scion_proto::path::DataPlanePathErrorKind::InvalidSegmentLengths => (
+                ParameterProblemCode::InvalidPath,
+                path_offset.path_meta_header().seg_len_0(),
+            ),
+            scion_proto::path::DataPlanePathErrorKind::InfoFieldOutOfRange => (
+                ParameterProblemCode::InvalidPath,
+                path_offset.path_meta_header().current_info_field(),
+            ),
+            scion_proto::path::DataPlanePathErrorKind::HopFieldOutOfRange => (
+                ParameterProblemCode::InvalidPath,
+                path_offset.path_meta_header().current_hop_field(),
+            ),
+            _ => (ParameterProblemCode::InvalidPath, path_offset.base()),
+        },
         _ => (ParameterProblemCode::InvalidPath, path_offset.base()),
     };
     ScmpParameterProblem::new(code, pointer.bytes(), packet).into()
@@ -1461,19 +1450,15 @@ mod tests {
 
                 match interface_id {
                     val if current.ingress_if == val => {
-                        return current.ingress_link_type.map(|l| {
-                            AsRoutingInterfaceState {
-                                link_type: l.into(),
-                                is_up: !current.egress_interface_down,
-                            }
+                        return current.ingress_link_type.map(|l| AsRoutingInterfaceState {
+                            link_type: l.into(),
+                            is_up: !current.egress_interface_down,
                         });
                     }
                     val if current.egress_if == val => {
-                        return current.egress_link_type.map(|l| {
-                            AsRoutingInterfaceState {
-                                link_type: l.into(),
-                                is_up: !current.egress_interface_down,
-                            }
+                        return current.egress_link_type.map(|l| AsRoutingInterfaceState {
+                            link_type: l.into(),
+                            is_up: !current.egress_interface_down,
                         });
                     }
                     _ => {}
@@ -1488,19 +1473,15 @@ mod tests {
 
                 match interface_id {
                     val if next.ingress_if == val => {
-                        return next.ingress_link_type.map(|l| {
-                            AsRoutingInterfaceState {
-                                link_type: l.into(),
-                                is_up: !current.egress_interface_down,
-                            }
+                        return next.ingress_link_type.map(|l| AsRoutingInterfaceState {
+                            link_type: l.into(),
+                            is_up: !current.egress_interface_down,
                         });
                     }
                     val if next.egress_if == val => {
-                        return next.egress_link_type.map(|l| {
-                            AsRoutingInterfaceState {
-                                link_type: l.into(),
-                                is_up: !current.egress_interface_down,
-                            }
+                        return next.egress_link_type.map(|l| AsRoutingInterfaceState {
+                            link_type: l.into(),
+                            is_up: !current.egress_interface_down,
                         });
                     }
                     _ => {}
