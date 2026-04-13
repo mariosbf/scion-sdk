@@ -243,6 +243,20 @@ wire_encoding::bounded_uint! {
 /// for HummingbirdMetaHeader. This is primarily because the Hummingbird path
 /// encoding diffuses the relationship between segment length and number of hop
 /// fields.
+///
+/// Wire format of the first 32-bit word (bit 0 = LSB):
+///
+/// ```text
+///  0                   1                   2                   3
+///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |CI |    CurrHF     |R|   Seg0Len   |   Seg1Len   |   Seg2Len   |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// ```
+///
+/// Where `CI` = `CurrINF` (2 bits), `CurrHF` (8 bits), `R` = reserved (1 bit),
+/// each `SegNLen` (7 bits). `SegNLen` encodes the byte length of segment N divided
+/// by 4.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Copy)]
 pub struct HummingbirdMetaHeader {
     /// An index to the current info field for the packet on its way through the
