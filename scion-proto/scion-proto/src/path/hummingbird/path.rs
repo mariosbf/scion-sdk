@@ -865,12 +865,12 @@ mod tests {
         millis: u16,
         counter: u32,
     ) -> [u8; 12] {
-        let f1 = (info as u32)
-            | ((hop as u32) << 2)
-            | ((seg0 as u32) << 11)
-            | ((seg1 as u32) << 18)
-            | ((seg2 as u32) << 25);
-        let f3 = (millis as u32) | (counter << 10);
+        let f1 = ((info as u32) << 30)
+            | ((hop as u32) << 22)
+            | ((seg0 as u32) << 14)
+            | ((seg1 as u32) << 7)
+            | (seg2 as u32);
+        let f3 = ((millis as u32) << 22) | (counter as u32);
         let mut b = [0u8; 12];
         b[0..4].copy_from_slice(&f1.to_be_bytes());
         b[4..8].copy_from_slice(&base_ts.to_be_bytes());
