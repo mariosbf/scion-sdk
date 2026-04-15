@@ -221,13 +221,13 @@ impl From<Duration> for HummingbirdMillisTimestamp {
 }
 
 wire_encoding::bounded_uint! {
-    /// An 8-bit counter for each packet that is sent by the source to ensure that
+    /// A 22-bit counter for each packet that is sent by the source to ensure that
     /// the tuple consisting of ([`HummingbirdBaseTimestamp`],
     /// [`HummingbirdMillisTimestamp`], [`HummingbirdCounter`]) is unique
     /// for each packet.
     /// Used for the (optional) duplicate suppression.
     #[derive(Default)]
-    pub struct HummingbirdCounter(u32 : 26);
+    pub struct HummingbirdCounter(u32 : 22);
 }
 
 wire_encoding::bounded_uint! {
@@ -239,12 +239,12 @@ wire_encoding::bounded_uint! {
 /// Meta information about the Hummingbird SCION path contained in a
 /// [`HummingbirdPath`].
 ///
-/// Note: Some of the functionality availalble in [MetaHeader] is not implemented
+/// Note: Some of the functionality available in [MetaHeader] is not implemented
 /// for HummingbirdMetaHeader. This is primarily because the Hummingbird path
 /// encoding diffuses the relationship between segment length and number of hop
 /// fields.
 ///
-/// Wire format of the first 32-bit word (bit 0 = LSB):
+/// Wire format of the Hummingbird meta header:
 ///
 /// ```text
 ///  0                   1                   2                   3
@@ -252,11 +252,20 @@ wire_encoding::bounded_uint! {
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// |CI |    CurrHF     |R|   Seg0Len   |   Seg1Len   |   Seg2Len   |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                        BaseTimestamp                          |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |  MillisTimestamp  |                 Counter                   |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// ```
 ///
-/// Where `CI` = `CurrINF` (2 bits), `CurrHF` (8 bits), `R` = reserved (1 bit),
-/// each `SegNLen` (7 bits). `SegNLen` encodes the byte length of segment N divided
-/// by 4.
+/// Where:
+/// - `CI` = `CurrINF` (2 bits): index to the current info field
+/// - `CurrHF` (8 bits): byte offset to the current hop field, in 4-byte units
+/// - `R` = reserved (1 bit)
+/// - `SegNLen` (7 bits each): byte length of segment N divided by 4
+/// - `BaseTimestamp` (32 bits): Unix timestamp with 1-second granularity
+/// - `MillisTimestamp` (10 bits): millisecond offset from `BaseTimestamp`
+/// - `Counter` (22 bits): per-packet counter for duplicate suppression
 #[derive(Debug, Default, Clone, PartialEq, Eq, Copy)]
 pub struct HummingbirdMetaHeader {
     /// An index to the current info field for the packet on its way through the
@@ -405,14 +414,15 @@ impl WireEncode for HummingbirdMetaHeader {
 
     #[inline]
     fn encode_to_unchecked<T: BufMut>(&self, buffer: &mut T) {
-        let fields1: u32 = (self.current_info_field.get() as u32)
-            | ((self.current_hop_field.encode() as u32) << 2)
-            | ((self.reserved.get() as u32) << 10)
-            | ((self.segment_lengths[0].encode() as u32) << 11)
-            | ((self.segment_lengths[1].encode() as u32) << 18)
-            | ((self.segment_lengths[2].encode() as u32) << 25);
+        let fields1: u32 = ((self.current_info_field.get() as u32) << 30)
+            | ((self.current_hop_field.encode() as u32) << 22)
+            | ((self.reserved.get() as u32) << 21)
+            | ((self.segment_lengths[0].encode() as u32) << 14)
+            | ((self.segment_lengths[1].encode() as u32) << 7)
+            | (self.segment_lengths[2].encode() as u32);
         let fields2: u32 = self.base_timestamp.get();
-        let fields3: u32 = (self.millis_timestamp.get() as u32) | (self.counter.get() << 10);
+        let fields3: u32 =
+            ((self.millis_timestamp.get() as u32) << 22) | self.counter.get();
         buffer.put_u32(fields1);
         buffer.put_u32(fields2);
         buffer.put_u32(fields3);
@@ -423,7 +433,7 @@ impl<T: Buf> WireDecode<T> for HummingbirdMetaHeader {
     type Error = DecodeError;
 
     fn decode(data: &mut T) -> Result<Self, Self::Error> {
-        if data.remaining() < mem::size_of::<u32>() {
+        if data.remaining() < 3 * mem::size_of::<u32>() {
             return Err(Self::Error::PacketEmptyOrTruncated);
         }
         let fields1 = data.get_u32();
@@ -431,17 +441,17 @@ impl<T: Buf> WireDecode<T> for HummingbirdMetaHeader {
         let fields3 = data.get_u32();
 
         let meta = Self {
-            current_info_field: HummingbirdInfoFieldIndex(field::<0, 2>(fields1) as u8),
-            current_hop_field: HummingbirdHopfieldIndex::decode(field::<2, 10>(fields1) as u8),
-            reserved: HummingbirdMetaReserved(field::<10, 11>(fields1) as u8),
+            current_info_field: HummingbirdInfoFieldIndex(field::<30, 32>(fields1) as u8),
+            current_hop_field: HummingbirdHopfieldIndex::decode(field::<22, 30>(fields1) as u8),
+            reserved: HummingbirdMetaReserved(field::<21, 22>(fields1) as u8),
             segment_lengths: [
-                HummingbirdSegmentLength::decode(field::<11, 18>(fields1) as u8),
-                HummingbirdSegmentLength::decode(field::<18, 25>(fields1) as u8),
-                HummingbirdSegmentLength::decode(field::<25, 32>(fields1) as u8),
+                HummingbirdSegmentLength::decode(field::<14, 21>(fields1) as u8),
+                HummingbirdSegmentLength::decode(field::<7, 14>(fields1) as u8),
+                HummingbirdSegmentLength::decode(field::<0, 7>(fields1) as u8),
             ],
             base_timestamp: HummingbirdBaseTimestamp(fields2),
-            millis_timestamp: HummingbirdMillisTimestamp(field::<0, 10>(fields3) as u16),
-            counter: HummingbirdCounter(field::<10, 32>(fields3)),
+            millis_timestamp: HummingbirdMillisTimestamp(field::<22, 32>(fields3) as u16),
+            counter: HummingbirdCounter(field::<0, 22>(fields3)),
         };
 
         if meta.segment_lengths[2].encode() > 0 && meta.segment_lengths[1].encode() == 0
@@ -487,13 +497,13 @@ mod tests {
         data
     }
 
-    /// Encode the fields1 word from its component parts.
+    /// Encode the fields1 word from its component parts (MSB-first).
     fn fields1(info: u8, hop: u8, seg0: u8, seg1: u8, seg2: u8) -> u32 {
-        (info as u32)
-            | ((hop as u32) << 2)
-            | ((seg0 as u32) << 11)
-            | ((seg1 as u32) << 18)
-            | ((seg2 as u32) << 25)
+        ((info as u32) << 30)
+            | ((hop as u32) << 22)
+            | ((seg0 as u32) << 14)
+            | ((seg1 as u32) << 7)
+            | (seg2 as u32)
     }
 
     // ---------------------------------------------------------------------------
@@ -721,7 +731,7 @@ mod tests {
     #[test]
     fn decode_with_nonzero_timestamps_and_counter() {
         // seg_len[0]=12 → length=48, max_hop_fields=3, hop=2 valid.
-        let f3 = 500_u32 | (1234_u32 << 10); // millis=500, counter=1234
+        let f3 = (500_u32 << 22) | 1234_u32; // millis=500, counter=1234
         let data = encode_fields(fields1(0, 2, 12, 0, 0), 1_000_000, f3);
         let header = HummingbirdMetaHeader::decode(&mut data.as_slice()).expect("valid decode");
 
