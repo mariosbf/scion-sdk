@@ -101,6 +101,15 @@ impl ScionPacketOffset {
         let info_field_count = PathMetaHeaderLayout::info_field_count(offset, encoded_packet);
         StandardPathLayout::new(offset, info_field_count)
     }
+
+    /// Returns the offsets for the Hummingbird path fields.
+    ///
+    /// If packet is malformed, this will return invalid offsets.
+    pub fn hbird_path(encoded_packet: &[u8]) -> HummingbirdPathLayout {
+        let offset = AddressHeaderLayout::end(encoded_packet);
+        let info_field_count = HbirdMetaHeaderLayout::info_field_count(offset, encoded_packet);
+        HummingbirdPathLayout::new(offset, info_field_count)
+    }
 }
 
 /// Common header layout.
@@ -268,16 +277,107 @@ impl StandardPathLayout {
     }
 }
 
+///
+/// Hummingbird Path Offsets
+pub struct HummingbirdPathLayout {
+    base_offset: u16,
+    info_field_count: u8,
+}
+impl HummingbirdPathLayout {
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    // |                          PathMetaHdr                          |
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    // |                           InfoField                           |
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    // |                              ...                              |
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    // |                           InfoField                           |
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    // |                           HopField                            |
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    // |                           HopField                            |
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    // |                              ...                              |
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+`
+
+    fn new(base_offset: u16, info_field_count: u8) -> Self {
+        Self {
+            base_offset,
+            info_field_count,
+        }
+    }
+
+    /// Returns the base offset.
+    pub fn base(&self) -> BitOffset {
+        BitOffset(self.base_offset)
+    }
+
+    /// Return the path meta header offset.
+    pub fn path_meta_header(&self) -> HbirdMetaHeaderLayout {
+        HbirdMetaHeaderLayout {
+            base_offset: self.base_offset,
+        }
+    }
+
+    /// Get the offset for the info field at the given index.
+    pub fn info_field(&self, index: u8) -> InfoFieldLayout {
+        let base_offset = self.base_offset
+            + HbirdMetaHeaderLayout::META_HEADER_SIZE
+            + InfoFieldLayout::INFO_FIELD_SIZE * index as u16;
+        InfoFieldLayout { base_offset }
+    }
+
+    fn hop_field_base_offset(&self, byte_offset: u8) -> u16 {
+        self.base_offset
+            + HbirdMetaHeaderLayout::META_HEADER_SIZE
+            + InfoFieldLayout::INFO_FIELD_SIZE * self.info_field_count as u16
+            + byte_offset as u16 * 8
+    }
+
+    /// Get the offset for the Hummingbird hop field (standard or flyover) at the
+    /// given byte offset.
+    pub fn hop_field(&self, byte_offset: u8, is_flyover: bool) -> HbirdHopFieldLayout {
+        // Add info field size to the base offset
+        let base_offset = self.hop_field_base_offset(byte_offset);
+
+        if is_flyover {
+            HbirdHopFieldLayout::Flyover(FlyoverHopFieldLayout { base_offset })
+        } else {
+            HbirdHopFieldLayout::Standard(HopFieldLayout { base_offset })
+        }
+    }
+
+    /// Get the offset for the flyover hop field at the given byte offset.
+    pub fn flyover_hop_field(&self, byte_offset: u8) -> FlyoverHopFieldLayout {
+        // Add info field size to the base offset
+        let base_offset = self.hop_field_base_offset(byte_offset);
+
+        FlyoverHopFieldLayout { base_offset }
+    }
+
+    /// Get the offset for the standard hop field at the given byte offset.
+    pub fn standard_hop_field(&self, byte_offset: u8) -> HopFieldLayout {
+        // Add info field size to the base offset
+        let base_offset = self.hop_field_base_offset(byte_offset);
+
+        HopFieldLayout { base_offset }
+    }
+}
+
 /// Path meta header layout
 pub struct PathMetaHeaderLayout {
     base_offset: u16,
 }
 impl PathMetaHeaderLayout {
-    //  0                   1                   2                   3
-    //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-    // | C |  CurrHF   |    RSV    |  Seg0Len  |  Seg1Len  |  Seg2Len  |
-    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    ///  0                   1                   2                   3
+    ///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+    /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    /// |CI |    CurrHF     |R|   Seg0Len   |   Seg1Len   |   Seg2Len   |
+    /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    /// |                        BaseTimestamp                          |
+    /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    /// |  MillisTimestamp  |                 Counter                   |
+    /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
     const META_HEADER_SIZE: u16 = 32;
 
     /// Returns the count of info fields in the path meta header.
@@ -320,6 +420,67 @@ impl PathMetaHeaderLayout {
         (14, seg_len_0),
         (20, seg_len_1),
         (26, seg_len_2)
+    );
+}
+
+/// Hummingbird path meta header layout
+pub struct HbirdMetaHeaderLayout {
+    base_offset: u16,
+}
+impl HbirdMetaHeaderLayout {
+    //  Wire format of the Hummingbird meta header:
+    //  0                   1                   2                   3
+    //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    // |CI |    CurrHF     |R|   Seg0Len   |   Seg1Len   |   Seg2Len   |
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+    /// Size of the meta header in bits
+    const META_HEADER_SIZE: u16 = 96;
+
+    /// Returns the count of info fields in the path meta header.
+    fn info_field_count(base_offset: u16, encoded_packet: &[u8]) -> u8 {
+        debug_assert!(
+            base_offset.is_multiple_of(8),
+            "Path meta header base offset must be a multiple of 8 bits but got {base_offset}"
+        );
+
+        let offset = (base_offset / 8) as usize;
+        let min_length = offset + (Self::META_HEADER_SIZE / 8) as usize;
+        if encoded_packet.len() < min_length {
+            return 0;
+        }
+
+        let line_1 = u32::from_be_bytes([
+            encoded_packet[offset],
+            encoded_packet[offset + 1],
+            encoded_packet[offset + 2],
+            encoded_packet[offset + 3],
+        ]);
+
+        // 7 bits for each segment length
+        const SEG2_MASK: u32 = 0b111_1111;
+        const SEG1_MASK: u32 = SEG2_MASK << 7;
+        const SEG0_MASK: u32 = SEG2_MASK << 14;
+
+        let seg0 = (line_1 & SEG0_MASK) > 0;
+        let seg1 = (line_1 & SEG1_MASK) > 0;
+        let seg2 = (line_1 & SEG2_MASK) > 0;
+
+        seg0 as u8 + seg1 as u8 + seg2 as u8
+    }
+
+    gen_variable_field_offset!(
+        (0, base),
+        (0, current_info_field),
+        (2, current_hop_field),
+        (10, reserved),
+        (11, seg_len_0),
+        (18, seg_len_1),
+        (25, seg_len_2),
+        (32, base_timestamp),
+        (64, millis_timestamp),
+        (74, counter),
     );
 }
 
@@ -412,6 +573,127 @@ impl HopFieldLayout {
     }
 }
 
+#[doc(hidden)]
+pub enum HbirdHopFieldLayout {
+    Standard(HopFieldLayout),
+    Flyover(FlyoverHopFieldLayout),
+}
+
+macro_rules! dispatch_to_correct_layout {
+    (
+        $(#[$outer:meta])*
+        $vis:vis fn $method_name:ident(
+            &self $(, $arg_name:ident : $arg_type:ty)*
+        ) $(-> $return_type:ty)?
+    ) => {
+        $(#[$outer])*
+        $vis fn $method_name(&self $(, $arg_name : $arg_type)*) $(-> $return_type)? {
+            match self {
+                HbirdHopFieldLayout::Standard(hf_l) => hf_l.$method_name($($arg_name),*),
+                HbirdHopFieldLayout::Flyover(hf_l) => hf_l.$method_name($($arg_name),*)
+            }
+        }
+    };
+}
+
+impl HbirdHopFieldLayout {
+    dispatch_to_correct_layout!(
+        /// Returns the offset to the normalized ingress router alert bit.
+        pub fn travel_ingress_router_alert(&self, is_construction_dir: bool) -> BitOffset
+    );
+
+    dispatch_to_correct_layout!(
+        /// Returns the offset to the normalized egress router alert bit.
+        pub fn travel_egress_router_alert(&self, is_construction_dir: bool) -> BitOffset
+    );
+
+    dispatch_to_correct_layout!(
+        /// Returns the offset to the normalized ingress.
+        pub fn travel_ingress(&self, is_construction_dir: bool) -> BitOffset
+    );
+
+    dispatch_to_correct_layout!(
+        /// Returns the offset to the normalized egress.
+        pub fn travel_egress(&self, is_construction_dir: bool) -> BitOffset
+    );
+}
+
+#[doc(hidden)]
+pub struct FlyoverHopFieldLayout {
+    base_offset: u16,
+}
+
+impl FlyoverHopFieldLayout {
+    //  0                   1                   2                   3
+    //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    // |r r r r r r I E|    ExpTime    |           ConsIngress         |
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    // |        ConsEgress             |                               |
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
+    // |                              MAC                              |
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    // |                   ResID                   |        BW         |
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+    // |        ResStartOffset         |         ResDuration           |
+    // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+    // Size of the flyover hop field in bits.
+    #[allow(unused)]
+    const FLYOVER_HOP_FIELD_SIZE: u16 = 160;
+
+    gen_variable_field_offset! {
+        (0, base),
+        (0, flags),
+        (6, ingress_router_alert),
+        (7, egress_router_alert),
+        (8, exp_time),
+        (16, cons_ingress),
+        (32, cons_egress),
+        (48, mac),
+        (64, res_id),
+        (86, bw),
+        (96, res_start_offset),
+        (112, res_duration)
+    }
+
+    /// Returns the offset to the normalized ingress router alert bit.
+    pub fn travel_ingress_router_alert(&self, is_construction_dir: bool) -> BitOffset {
+        if is_construction_dir {
+            self.ingress_router_alert()
+        } else {
+            self.egress_router_alert()
+        }
+    }
+
+    /// Returns the offset to the normalized egress router alert bit.
+    pub fn travel_egress_router_alert(&self, is_construction_dir: bool) -> BitOffset {
+        if is_construction_dir {
+            self.egress_router_alert()
+        } else {
+            self.ingress_router_alert()
+        }
+    }
+
+    /// Returns the offset to the normalized ingress.
+    pub fn travel_ingress(&self, is_construction_dir: bool) -> BitOffset {
+        if is_construction_dir {
+            self.cons_ingress()
+        } else {
+            self.cons_egress()
+        }
+    }
+
+    /// Returns the offset to the normalized egress.
+    pub fn travel_egress(&self, is_construction_dir: bool) -> BitOffset {
+        if is_construction_dir {
+            self.cons_egress()
+        } else {
+            self.cons_ingress()
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
 
@@ -423,7 +705,7 @@ mod test {
     use crate::{
         address::{ScionAddr, ScionAddrV4, ScionAddrV6},
         packet::{ByEndpoint, FlowId, ScionPacketRaw},
-        path::{DataPlanePath, StandardHopField, InfoField, StandardPath},
+        path::{DataPlanePath, InfoField, StandardHopField, StandardPath},
         wire_encoding::WireEncodeVec,
     };
 
