@@ -17,8 +17,7 @@
 use crate::{
     core::encode::{InvalidStructureError, WireEncode},
     path::{
-        layout::ScionHeaderPathLayout, onehop::model::OneHopPath, standard::model::StandardPath,
-        types::PathType, view::ScionPathView,
+        hbird::model::HummingbirdPath, layout::ScionHeaderPathLayout, onehop::model::OneHopPath, standard::model::StandardPath, types::PathType, view::ScionPathView
     },
 };
 
@@ -30,6 +29,8 @@ pub enum Path {
     Standard(StandardPath),
     /// One-hop SCION path
     OneHop(OneHopPath),
+    /// Hummingbird SCION path
+    Hummingbird(HummingbirdPath),
     /// Empty path
     Empty,
     /// Unsupported path type with raw data
@@ -48,6 +49,9 @@ impl Path {
                 Path::Standard(StandardPath::from_view(standard_view))
             }
             ScionPathView::OneHop(onehop_view) => Path::OneHop(OneHopPath::from_view(onehop_view)),
+            ScionPathView::Hummingbird(hb_view) => {
+                Path::Hummingbird(HummingbirdPath::from_view(hb_view))
+            }
             ScionPathView::Empty => Path::Empty,
             ScionPathView::Unsupported {
                 path_type,
@@ -65,6 +69,7 @@ impl Path {
         match self {
             Path::Standard(_) => PathType::Scion,
             Path::OneHop(_) => PathType::OneHop,
+            Path::Hummingbird(_) => PathType::Hummingbird,
             Path::Empty => PathType::Empty,
             Path::Unsupported { path_type, .. } => PathType::Other((*path_type).into()),
         }
@@ -77,6 +82,14 @@ impl Path {
             _ => None,
         }
     }
+
+    /// Returns a reference to the hummingbird path if it is of that type
+    pub fn hummingbird(&self) -> Option<&HummingbirdPath> {
+        match self {
+            Path::Hummingbird(path) => Some(path),
+            _ => None,
+        }
+    }
 }
 
 impl WireEncode for Path {
@@ -84,6 +97,7 @@ impl WireEncode for Path {
         match self {
             Path::Standard(path) => path.required_size(),
             Path::OneHop(path) => path.required_size(),
+            Path::Hummingbird(path) => path.required_size(),
             Path::Unsupported { data, .. } => data.len(),
             Path::Empty => 0,
         }
@@ -97,6 +111,7 @@ impl WireEncode for Path {
         match self {
             Self::Standard(standard_path) => standard_path.wire_valid()?,
             Self::OneHop(onehop_path) => onehop_path.wire_valid()?,
+            Self::Hummingbird(hb_path) => hb_path.wire_valid()?,
             Self::Empty => {}
             Self::Unsupported { path_type: _, data } => {
                 if !data.len().is_multiple_of(4) {
@@ -113,6 +128,7 @@ impl WireEncode for Path {
             Path::Standard(path) => unsafe { path.encode_unchecked(buf) },
             Path::OneHop(path) => unsafe { path.encode_unchecked(buf) },
             Path::Empty => 0,
+            Path::Hummingbird(path) => unsafe { path.encode_unchecked(buf) },
             Path::Unsupported { data, .. } => {
                 let len = data.len();
 
@@ -132,7 +148,7 @@ pub mod ptest {
     use ::proptest::prelude::*;
 
     use super::*;
-    use crate::path::{model::Path, types::PathType};
+    use crate::path::{hbird::model::HummingbirdPath, model::Path, types::PathType};
 
     /// Configuration for generating arbitrary [`Path`] values.
     ///
@@ -156,6 +172,8 @@ pub mod ptest {
         pub standard_params: <StandardPath as Arbitrary>::Parameters,
         /// Parameters for generating one-hop paths.
         pub one_hop_params: <OneHopPath as Arbitrary>::Parameters,
+        /// Parameters for generating Hummingbird paths.
+        pub hbird_params: <HummingbirdPath as Arbitrary>::Parameters,
     }
     impl Default for ArbitraryPathParams {
         fn default() -> Self {
@@ -167,6 +185,7 @@ pub mod ptest {
                 unsupported: 1,
                 standard_params: Default::default(),
                 one_hop_params: Default::default(),
+                hbird_params: Default::default(),
             }
         }
     }
@@ -182,6 +201,8 @@ pub mod ptest {
                 params.one_hop => OneHopPath::arbitrary_with(params.one_hop_params)
                     .prop_map(Path::OneHop),
                 params.empty => Just(Path::Empty),
+                params.hbird => HummingbirdPath::arbitrary_with(params.hbird_params)
+                    .prop_map(Path::Hummingbird),
                 params.unsupported => (
                     any::<PathType>(),
                     ::proptest::collection::vec(any::<u8>(), 0..512),

@@ -9,7 +9,7 @@ use crate::{
         view::{View, ViewConversionError},
     },
     path::{
-        hbird::view::HummingbirdPathView,
+        hbird::view::HbirdPathView,
         standard::layout::{HopFieldLayout, InfoFieldLayout},
     },
 };
@@ -40,7 +40,7 @@ impl HbirdPathLayout {
             }
         })?;
 
-        let meta_view = unsafe { HummingbirdPathView::from_slice_unchecked(meta_buf) };
+        let meta_view = unsafe { HbirdPathView::from_slice_unchecked(meta_buf) };
         let seg0_len = meta_view.seg0_len() as usize * 4;
         let seg1_len = meta_view.seg1_len() as usize * 4;
         let seg2_len = meta_view.seg2_len() as usize * 4;

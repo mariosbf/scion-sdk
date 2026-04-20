@@ -22,18 +22,7 @@ use crate::{
         encode::WireEncode,
         layout::{BitRange, Layout, LayoutParseError, macros::gen_bitrange_const},
         view::{View, ViewConversionError},
-    },
-    header::{model::ScionPacketHeader, view::ScionHeaderView},
-    path::{
-        layout::ScionHeaderPathLayout,
-        model::Path,
-        onehop::layout::OneHopPathLayout,
-        standard::{
-            layout::{StdPathDataLayout, StdPathMetaLayout},
-            view::StandardPathView,
-        },
-        types::PathType,
-    },
+    }, header::{model::ScionPacketHeader, view::ScionHeaderView}, path::{hbird::{layout::{HbirdPathDataLayout, HbirdPathMetaLayout}, view::HbirdPathView}, layout::ScionHeaderPathLayout, model::Path, onehop::layout::OneHopPathLayout, standard::{layout::{StdPathDataLayout, StdPathMetaLayout}, view::StandardPathView}, types::PathType}
 };
 
 /// Metadata about the SCION header layout
@@ -105,13 +94,14 @@ impl ScionHeaderLayout {
 
         let len = buf.len();
         let common = CommonHeaderLayout;
-        let (common_buf, _rest) = common.split_off_checked(buf).ok_or_else(|| {
-            LayoutParseError::BufferTooSmall {
-                at: "CommonHeader",
-                required: common.size_bytes(),
-                actual: buf.len(),
-            }
-        })?;
+        let (common_buf, _rest) =
+            common
+                .split_off_checked(buf)
+                .ok_or_else(|| LayoutParseError::BufferTooSmall {
+                    at: "CommonHeader",
+                    required: common.size_bytes(),
+                    actual: buf.len(),
+                })?;
 
         // Safety: Only fields in the common header are accessed below.
         // Fields past the common header are not accessed until after size checks.
@@ -144,12 +134,10 @@ impl ScionHeaderLayout {
             PathType::Scion => {
                 let (path_meta_buf, _rest) = StdPathMetaLayout
                     .split_off_checked(&buf[addr_header_end..])
-                    .ok_or_else(|| {
-                        LayoutParseError::BufferTooSmall {
-                            at: "PathMeta",
-                            required: StdPathMetaLayout.size_bytes(),
-                            actual: buf.len() - addr_header_end,
-                        }
+                    .ok_or_else(|| LayoutParseError::BufferTooSmall {
+                        at: "PathMeta",
+                        required: StdPathMetaLayout.size_bytes(),
+                        actual: buf.len() - addr_header_end,
                     })?;
 
                 // Safety: path_meta_buf is guaranteed to be of sufficient length by
@@ -166,6 +154,31 @@ impl ScionHeaderLayout {
                 ScionHeaderPathLayout::Standard(StdPathMetaLayout, path_data_layout)
             }
             PathType::OneHop => ScionHeaderPathLayout::OneHop(OneHopPathLayout),
+            PathType::Hummingbird => {
+                let (path_meta_buf, _rest) = HbirdPathMetaLayout
+                    .split_off_checked(&buf[addr_header_end..])
+                    .ok_or_else(|| LayoutParseError::BufferTooSmall {
+                        at: "HummingbirdPathMeta",
+                        required: HbirdPathMetaLayout.size_bytes(),
+                        actual: buf.len() - addr_header_end,
+                    })?;
+
+                // Safety: path_meta_buf is guaranteed to be of sufficient length by
+                // split_off_checked
+                let path_meta_view = unsafe { HbirdPathView::from_slice_unchecked(path_meta_buf) };
+
+                let seg0_len = path_meta_view.seg0_len();
+                let seg1_len = path_meta_view.seg1_len();
+                let seg2_len = path_meta_view.seg2_len();
+
+                let path_data_layout = HbirdPathDataLayout::new(
+                    seg0_len as usize * 4,
+                    seg1_len as usize * 4,
+                    seg2_len as usize * 4,
+                );
+
+                ScionHeaderPathLayout::Hummingbird(HbirdPathMetaLayout, path_data_layout)
+            }
             PathType::Empty => ScionHeaderPathLayout::Empty,
             path_type => {
                 // For unknown path types, we assume the rest of the header is path data
@@ -238,6 +251,18 @@ impl ScionHeaderLayout {
                 )
             }
             Path::OneHop(_) => ScionHeaderPathLayout::OneHop(OneHopPathLayout),
+            Path::Hummingbird(hbird_path) => {
+                let (seg0, seg1, seg2) = hbird_path.segment_lengths();
+
+                ScionHeaderPathLayout::Hummingbird(
+                    HbirdPathMetaLayout,
+                    HbirdPathDataLayout::new(
+                        seg0 as usize * 4,
+                        seg1 as usize * 4,
+                        seg2 as usize * 4,
+                    ),
+                )
+            }
             Path::Empty => ScionHeaderPathLayout::Empty,
             Path::Unsupported { path_type, data } => {
                 let addr_end = common.size_bytes() + address.size_bytes();

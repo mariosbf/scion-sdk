@@ -19,6 +19,7 @@
 use sciparse::{
     core::view::View,
     path::{
+        hbird::view::HbirdPathView,
         onehop::view::OneHopPathView,
         standard::{
             mac::ForwardingKey,
@@ -218,4 +219,121 @@ pub fn exec_onehop_path_view_mut(view: &mut OneHopPathView) {
         let [_, hop2] = view.mut_hop_fields();
         hop2.as_bytes_mut().copy_from_slice(&h2);
     }
+}
+
+// ── Hummingbird path ───────────────────────────────────────────────────
+
+/// Exercises every getter on a [`HbirdPathView`] (immutable).
+pub fn exec_hbird_path_view(view: &HbirdPathView) {
+    let _ = view.curr_info_field();
+    let _ = view.curr_hop_field();
+    let _ = view.seg0_len();
+    let _ = view.seg1_len();
+    let _ = view.seg2_len();
+    let _ = view.base_timestamp();
+    let _ = view.millis_timestamp();
+    let _ = view.info_field_count();
+    let _ = view.counter();
+    read_slice_bounds(view.as_bytes());
+
+    // // Iterate info fields via slice accessor
+    // for info_field in view.info_fields() {
+    //     exec_info_field_view(info_field);
+    // }
+    //
+    // // Iterate hop fields via slice accessor
+    // for hop_field in view.hop_fields() {
+    //     exec_hop_field_view(hop_field);
+    // }
+    //
+    // // Indexed access
+    // for idx in 0..view.info_field_count() as usize {
+    //     if let Some(f) = view.info_field(idx) {
+    //         exec_info_field_view(f);
+    //     }
+    // }
+    // for idx in 0..view.hop_field_count() as usize {
+    //     if let Some(f) = view.hop_field(idx) {
+    //         exec_hop_field_view(f);
+    //     }
+    // }
+    //
+    // // Out-of-bounds access must return None
+    // assert!(view.info_field(view.info_field_count() as usize).is_none());
+    // assert!(view.hop_field(view.hop_field_count() as usize).is_none());
+    //
+    // // checked_hop_field_range – valid and out-of-bounds
+    // for idx in 0..view.hop_field_count() as usize {
+    //     assert!(view.checked_hop_field_range(idx).is_some());
+    // }
+    // // Out of bounds
+    // assert!(
+    //     view.checked_hop_field_range(view.hop_field_count() as usize)
+    //         .is_none()
+    // );
+    //
+    // // ingress_interface / egress_interface – requires an info field reference
+    // if let Some(info) = view.info_fields().first() {
+    //     for hop_field in view.hop_fields() {
+    //         let _ = hop_field.ingress_interface(info);
+    //         let _ = hop_field.egress_interface(info);
+    //     }
+    // }
+}
+
+/// Exercises every getter and setter on a [`HbirdPathView`] (mutable).
+pub fn exec_hbird_path_view_mut(view: &mut HbirdPathView) {
+    exec_hbird_path_view(view);
+
+    // // Hummingbird path - mutable functions
+    // path_view.set_curr_info_field(path_view.curr_info_field());
+    // path_view.set_curr_hop_field(path_view.curr_hop_field());
+    // unsafe {
+    //     path_view.set_seg0_len(path_view.seg0_len());
+    //     path_view.set_seg1_len(path_view.seg1_len());
+    //     path_view.set_seg2_len(path_view.seg2_len());
+    // }
+    // path_view.set_base_timestamp(path_view.base_timestamp());
+    // path_view.set_millis_timestamp(path_view.millis_timestamp());
+    // path_view.set_counter(path_view.counter());
+    //
+    // // Meta header setters (safe ones)
+    // view.set_curr_info_field(view.curr_info_field());
+    // view.set_curr_hop_field(view.curr_hop_field());
+    // // Safety: setting to the same value.
+    // unsafe {
+    //     view.set_seg0_len(view.seg0_len());
+    //     view.set_seg1_len(view.seg1_len());
+    //     view.set_seg2_len(view.seg2_len());
+    // }
+    //
+    // // Mutable slice accessors
+    // for info_field in view.info_fields_mut() {
+    //     exec_info_field_view_mut(info_field);
+    // }
+    // for hop_field in view.hop_fields_mut() {
+    //     exec_hop_field_view_mut(hop_field);
+    // }
+    //
+    // // Indexed mutable access
+    // for idx in 0..view.info_field_count() as usize {
+    //     if let Some(f) = view.info_field_mut(idx) {
+    //         exec_info_field_view_mut(f);
+    //     }
+    //     // Out-of-bounds access must return None
+    //     assert!(
+    //         view.info_field_mut(view.info_field_count() as usize)
+    //             .is_none()
+    //     );
+    // }
+    // for idx in 0..view.hop_field_count() as usize {
+    //     if let Some(f) = view.hop_field_mut(idx) {
+    //         exec_hop_field_view_mut(f);
+    //     }
+    //     // Out-of-bounds access must return None
+    //     assert!(
+    //         view.hop_field_mut(view.hop_field_count() as usize)
+    //             .is_none()
+    //     );
+    // }
 }

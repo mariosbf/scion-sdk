@@ -1,19 +1,19 @@
 //! Hummingbird SCION path types and related structures.
 
-use std::{fmt::Debug};
+use std::fmt::Debug;
 
 use crate::path::standard::types::StdHopFieldFlags;
 
 // HopFieldFlags
 bitflags::bitflags! {
     /// HopField flags.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
     pub struct HbirdHopFieldFlags: u8 {
         /// If ConsIngress Router Alert is set, the ingress router in construction direction will process the L4 payload in the packet.
         const CONS_INGRESS_ROUTER_ALERT = 0b0000_0001;
         /// If ConsEgress Router Alert is set, the egress router in construction direction will process the L4 payload in the packet.
         const CONS_EGRESS_ROUTER_ALERT = 0b0000_0010;
-        /// Flag that indicates whether this HopField is using a reservation 
+        /// Flag that indicates whether this HopField is using a reservation
         const FLYOVER = 0b1000_0000;
 
         // Other bits are reserved.
@@ -84,5 +84,24 @@ impl From<StdHopFieldFlags> for HbirdHopFieldFlags {
             hbird_flags |= HbirdHopFieldFlags::CONS_EGRESS_ROUTER_ALERT;
         }
         hbird_flags
+    }
+}
+
+/// Support for [`proptest::arbitrary`].
+#[cfg(feature = "proptest")]
+pub mod ptest {
+    use ::proptest::prelude::*;
+
+    use super::*;
+
+    impl Arbitrary for HbirdHopFieldFlags {
+        type Parameters = ();
+        type Strategy = BoxedStrategy<Self>;
+
+        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+            any::<u8>()
+                .prop_map(HbirdHopFieldFlags::from_bits_retain)
+                .boxed()
+        }
     }
 }

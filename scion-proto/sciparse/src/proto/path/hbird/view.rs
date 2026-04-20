@@ -34,11 +34,11 @@ use crate::{
 
 /// A view over a Hummingbird SCION path, including meta header and data
 #[repr(transparent)]
-pub struct HummingbirdPathView([u8]);
-gen_view_impl!(HummingbirdPathView, HbirdPathLayout);
+pub struct HbirdPathView([u8]);
+gen_view_impl!(HbirdPathView, HbirdPathLayout);
 
 // Meta header
-impl HummingbirdPathView {
+impl HbirdPathView {
     gen_field_read!(
         curr_info_field,
         HbirdPathMetaLayout::CURR_INFO_FIELD_RNG,
@@ -88,7 +88,7 @@ impl HummingbirdPathView {
 }
 
 // Meta header mut
-impl HummingbirdPathView {
+impl HbirdPathView {
     gen_field_write!(
         set_curr_info_field,
         HbirdPathMetaLayout::CURR_INFO_FIELD_RNG,
@@ -116,7 +116,7 @@ impl HummingbirdPathView {
 }
 
 // Data Helpers
-impl HummingbirdPathView {
+impl HbirdPathView {
     /// Returns the byte range for the info field at the given index, or None if
     /// the index is out of bounds
     #[inline]
@@ -188,7 +188,7 @@ impl HummingbirdPathView {
 }
 
 // Data
-impl HummingbirdPathView {
+impl HbirdPathView {
     /// Returns a view over the info field at the given index, or None if the index is out of bounds
     #[inline]
     pub fn info_field(&self, index: usize) -> Option<&InfoFieldView> {
@@ -308,7 +308,7 @@ impl HummingbirdPathView {
     }
 }
 // Data mut
-impl HummingbirdPathView {
+impl HbirdPathView {
     /// Returns a view over the info field at the given index, or None if the index is out of bounds
     #[inline]
     pub fn info_field_mut(&mut self, index: usize) -> Option<&mut InfoFieldView> {
@@ -379,7 +379,7 @@ impl HummingbirdPathView {
     }
 }
 
-impl Debug for HummingbirdPathView {
+impl Debug for HbirdPathView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let hop_fields = self.hop_fields();
         let info_fields = self.info_fields();
@@ -402,9 +402,9 @@ where
     HopFieldViewRef: Deref<Target = HopFieldView>,
     FlyoverHopFieldViewRef: Deref<Target = FlyoverHopFieldView>,
 {
-    /// A standard hop field view
+    /// A standard hop field.
     Standard(HopFieldViewRef),
-    /// A flyover hop field view
+    /// A flyover hop field.
     Flyover(FlyoverHopFieldViewRef),
 }
 
@@ -413,6 +413,14 @@ where
     HFR: Deref<Target = HopFieldView>,
     FHFR: Deref<Target = FlyoverHopFieldView>,
 {
+    /// Returns whether this is a flyover hop field.
+    pub fn is_flyover(&self) -> bool {
+        match self {
+            HbirdHopFieldView::Standard(_) => false,
+            HbirdHopFieldView::Flyover(_) => true,
+        }
+    }
+
     /// Converts a standard hop field view to a Hummingbird hop field view.
     #[inline]
     pub fn from_standard(view: HFR) -> Self {

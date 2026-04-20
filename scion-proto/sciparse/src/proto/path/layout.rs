@@ -23,9 +23,7 @@ use crate::{
     },
     header::layout::{AddressHeaderLayout, CommonHeaderLayout, ScionHeaderLayout},
     path::{
-        onehop::layout::OneHopPathLayout,
-        standard::layout::{StdPathDataLayout, StdPathMetaLayout},
-        types::PathType,
+        hbird::layout::{HbirdPathDataLayout, HbirdPathMetaLayout}, onehop::layout::OneHopPathLayout, standard::layout::{StdPathDataLayout, StdPathMetaLayout}, types::PathType
     },
 };
 
@@ -35,6 +33,8 @@ pub enum ScionHeaderPathLayout {
     Standard(StdPathMetaLayout, StdPathDataLayout),
     /// Layout for a one-hop path
     OneHop(OneHopPathLayout),
+    /// Layout for a Hummingbird SCION path
+    Hummingbird(HbirdPathMetaLayout, HbirdPathDataLayout),
     /// Layout for an empty path
     Empty,
     /// Layout for an unknown path type
@@ -58,6 +58,7 @@ impl ScionHeaderPathLayout {
             ScionHeaderPathLayout::Standard(..) => PathType::Scion,
             ScionHeaderPathLayout::OneHop(_) => PathType::OneHop,
             ScionHeaderPathLayout::Empty => PathType::Empty,
+            ScionHeaderPathLayout::Hummingbird(..) => PathType::Hummingbird,
             ScionHeaderPathLayout::Unknown { path_type, .. } => *path_type,
         }
     }
@@ -72,6 +73,10 @@ impl ScionHeaderPathLayout {
             }
             ScionHeaderPathLayout::OneHop(layout) => {
                 annotations.extend(layout.annotations());
+            }
+            ScionHeaderPathLayout::Hummingbird(_, data_layout) => {
+                annotations.extend(HbirdPathMetaLayout.annotations());
+                annotations.extend(data_layout.annotations());
             }
             ScionHeaderPathLayout::Empty => {}
             ScionHeaderPathLayout::Unknown { range, .. } => {
@@ -90,6 +95,9 @@ impl Layout for ScionHeaderPathLayout {
                 meta.size_bytes() + data_layout.size_bytes()
             }
             ScionHeaderPathLayout::OneHop(onehop_layout) => onehop_layout.size_bytes(),
+            ScionHeaderPathLayout::Hummingbird(meta, data_layout) => {
+                meta.size_bytes() + data_layout.size_bytes()
+            }
             ScionHeaderPathLayout::Empty => 0,
             ScionHeaderPathLayout::Unknown { range, .. } => range.size_bytes(),
         }
@@ -98,5 +106,11 @@ impl Layout for ScionHeaderPathLayout {
 impl From<StdPathDataLayout> for ScionHeaderPathLayout {
     fn from(data_layout: StdPathDataLayout) -> Self {
         ScionHeaderPathLayout::Standard(StdPathMetaLayout, data_layout)
+    }
+}
+
+impl From<HbirdPathDataLayout> for ScionHeaderPathLayout {
+    fn from(data_layout: HbirdPathDataLayout) -> Self {
+        ScionHeaderPathLayout::Hummingbird(HbirdPathMetaLayout, data_layout)
     }
 }

@@ -34,9 +34,7 @@ use crate::{
     },
     header::layout::{AddressHeaderLayout, CommonHeaderLayout, ScionHeaderLayout},
     path::{
-        standard::view::StandardPathView,
-        types::PathType,
-        view::{ScionPathView, ScionPathViewMut},
+        hbird::view::HbirdPathView, standard::view::StandardPathView, types::PathType, view::{ScionPathView, ScionPathViewMut}
     },
     scion::{
         address::host_addr::{HostAddressSizeError, WireHostAddr, WireHostAddrType},
@@ -419,6 +417,13 @@ impl ScionHeaderView {
 
                 ScionPathView::OneHop(path)
             }
+            PathType::Hummingbird => {
+                // SAFETY: buffer size is checked on construction
+                let path_buf = unsafe { self.0.get_unchecked(path_offset..len) };
+                let path = unsafe { HbirdPathView::from_slice_unchecked(path_buf) };
+
+                ScionPathView::Hummingbird(path)
+            }
             pt => {
                 // SAFETY: min buffer size is checked on construction
                 let path_buf = unsafe { self.0.get_unchecked(path_offset..len) };
@@ -460,6 +465,13 @@ impl ScionHeaderView {
                 };
 
                 ScionPathViewMut::OneHop(path)
+            }
+            PathType::Hummingbird => {
+                // SAFETY: size is checked on construction of ScionHeaderView
+                let path_buf = unsafe { self.0.get_unchecked_mut(path_offset..len) };
+                let path = unsafe { HbirdPathView::from_mut_slice_unchecked(path_buf) };
+
+                ScionPathViewMut::Hummingbird(path)
             }
             pt => {
                 // SAFETY: min size is checked on construction of ScionHeaderView

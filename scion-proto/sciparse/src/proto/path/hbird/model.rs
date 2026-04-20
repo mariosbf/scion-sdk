@@ -2,6 +2,8 @@
 
 use std::time::SystemTime;
 
+use tinyvec::TinyVec;
+
 use crate::{
     core::{
         encode::{InvalidStructureError, WireEncode},
@@ -11,24 +13,24 @@ use crate::{
         hbird::{
             layout::{FlyoverHopFieldLayout, HbirdPathDataLayout, HbirdPathMetaLayout},
             types::HbirdHopFieldFlags,
-            view::{FlyoverHopFieldView, HbirdHopFieldView, HummingbirdPathView},
+            view::{FlyoverHopFieldView, HbirdHopFieldView, HbirdPathView},
         },
         standard::{
             layout::InfoFieldLayout,
             model::{HopField, InfoField},
-            types::HopFieldMac,
+            types::{HopFieldMac, InfoFieldFlags},
             view::HopFieldView,
         },
     },
 };
 
 /// Represents a Hummingbird SCION path
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HummingbirdPath {
     /// The current info field index
     pub current_info_field: u8,
     /// The current hop field index
-    pub curr_hop_field: u8,
+    pub current_hop_field: u8,
     /// The segments of the path
     pub segments: Vec<HbirdSegment>,
     /// The base timestamp of the path.
@@ -44,7 +46,7 @@ pub struct HummingbirdPath {
 
 impl HummingbirdPath {
     /// Constructs a `HumingbirdPath` from a `HummingbirdPathView`
-    pub fn from_view(view: &HummingbirdPathView) -> Self {
+    pub fn from_view(view: &HbirdPathView) -> Self {
         let info_fields = view.info_fields();
         let mut hop_fields = view.hop_fields();
         let segment_sizes = [
@@ -56,7 +58,7 @@ impl HummingbirdPath {
         let mut segments = Vec::with_capacity(info_fields.len());
 
         for (info_field, segment_size) in info_fields.iter().zip(segment_sizes.iter()) {
-            let mut hop_fields_in_segment = vec![];
+            let mut hop_fields_in_segment = TinyVec::new();
 
             let mut hop_field_bytes_taken = 0;
             while hop_field_bytes_taken < *segment_size {
@@ -80,7 +82,7 @@ impl HummingbirdPath {
 
         HummingbirdPath {
             current_info_field: view.curr_info_field(),
-            curr_hop_field: view.curr_hop_field(),
+            current_hop_field: view.curr_hop_field(),
             base_timestamp: view.base_timestamp(),
             millis_timestamp: view.millis_timestamp(),
             counter: Some(view.counter()),
@@ -159,7 +161,8 @@ impl WireEncode for HummingbirdPath {
 
     fn wire_valid(&self) -> Result<(), InvalidStructureError> {
         // Current hop field index
-        if self.curr_hop_field != 0 && self.curr_hop_field as usize >= self.hop_field_count() {
+        if self.current_hop_field != 0 && self.current_hop_field as usize >= self.hop_field_count()
+        {
             return Err("curr_hop_field exceeds total number of hop fields".into());
         }
 
@@ -176,10 +179,10 @@ impl WireEncode for HummingbirdPath {
         }
 
         // Validate counter
-        if let Some(counter) = self.counter {
-            if counter > 4_194_303 {
-                return Err("counter exceeds maximum value of 4,194,303".into());
-            }
+        if let Some(counter) = self.counter
+            && counter > 4_194_303
+        {
+            return Err("counter exceeds maximum value of 4,194,303".into());
         }
 
         // Validate segments
@@ -235,7 +238,7 @@ impl WireEncode for HummingbirdPath {
         // Encode standard path meta information
         unsafe {
             unchecked_bit_range_be_write(buf, HML::CURR_INFO_FIELD_RNG, self.current_info_field);
-            unchecked_bit_range_be_write(buf, HML::CURR_HOP_FIELD_RNG, self.curr_hop_field);
+            unchecked_bit_range_be_write(buf, HML::CURR_HOP_FIELD_RNG, self.current_hop_field);
             unchecked_bit_range_be_write(buf, HML::SEG0_LEN_RNG, seg0);
             unchecked_bit_range_be_write(buf, HML::SEG1_LEN_RNG, seg1);
             unchecked_bit_range_be_write(buf, HML::SEG2_LEN_RNG, seg2);
@@ -281,12 +284,25 @@ impl WireEncode for HummingbirdPath {
 }
 
 /// Represents a segment in a standard SCION path
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HbirdSegment {
     /// Info field containing metadata about the segment
     pub info_field: InfoField,
     /// Hop fields representing the hops in the segment
-    pub hop_fields: Vec<HbirdHopField>,
+    pub hop_fields: TinyVec<[HbirdHopField; 12]>,
+}
+
+impl Default for HbirdSegment {
+    fn default() -> Self {
+        HbirdSegment {
+            info_field: InfoField {
+                flags: InfoFieldFlags::empty(),
+                segment_id: 0,
+                timestamp: 0,
+            },
+            hop_fields: TinyVec::new(),
+        }
+    }
 }
 
 /// Represents a hop field in a Hummingbird SCION path
@@ -294,12 +310,18 @@ pub struct HbirdSegment {
 /// Hummingbird paths can contain both standard hop fields and flyover hop fields.
 ///
 /// Hop fields contain information about individual hops in a SCION path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum HbirdHopField {
     /// A standard hop field.
     Standard(HopField),
-    /// A flyover hop field.
+    /// A Hummingbird flyover hop field.
     Flyover(FlyoverHopField),
+}
+
+impl Default for HbirdHopField {
+    fn default() -> Self {
+        HbirdHopField::Standard(HopField::default())
+    }
 }
 
 impl HbirdHopField {
@@ -353,7 +375,7 @@ impl WireEncode for HbirdHopField {
 /// Represents a hop field in a standard SCION path
 ///
 /// Hop fields contain information about individual hops in a SCION path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FlyoverHopField {
     /// Hop field flags
     pub flags: HbirdHopFieldFlags,
@@ -461,5 +483,175 @@ impl WireEncode for FlyoverHopField {
             unchecked_bit_range_be_write(buf, FHFL::RES_DURATION_RNG, self.res_duration);
         }
         self.required_size()
+    }
+}
+
+/// Support for [`proptest::arbitrary`].
+#[cfg(feature = "proptest")]
+pub mod ptest {
+    use ::proptest::prelude::*;
+    use tinyvec::TinyVec;
+
+    use super::*;
+
+    /// Configuration for generating arbitrary [`HummingbirdPath`] values.
+    #[derive(Debug, Clone, Default)]
+    pub struct ArbitraryHbirdPathContext {
+        /// Weight for generating flyover hop fields in the path.
+        pub flyover_hop_field: u32,
+        /// Weight for generating standard hop fields in the path.
+        pub standard_hop_field: u32,
+    }
+
+    impl Arbitrary for HummingbirdPath {
+        type Parameters = ArbitraryHbirdPathContext;
+        type Strategy = BoxedStrategy<Self>;
+
+        fn arbitrary_with(ctx: Self::Parameters) -> Self::Strategy {
+            (
+                any::<u8>(),
+                any::<u32>(),
+                any::<u16>(),
+                any::<Option<u32>>(),
+                prop::collection::vec(HbirdSegment::arbitrary_with(ctx), 1..=3),
+            )
+                .prop_map(
+                    |(curr_hop, base_timestamp, millis_timestamp, counter, segments): (
+                        u8,
+                        u32,
+                        u16,
+                        Option<u32>,
+                        Vec<HbirdSegment>,
+                    )| {
+                        // A Hummingbird path can have at most 80 segments
+                        // The HdrLen field in the common header allows for a packet
+                        // length of up to 1020 bytes. That includes the common header (12 bytes),
+                        // the address header (16 bytes plus 8 bytes for IPv4),
+                        // the path meta header (12 bytes for Hummingbird) and
+                        // at least one info field (8 bytes). That leaves 964 bytes
+                        // for the hop fields (assuming IPv4 addresses in the address
+                        // header). If we assume that only regular hop fields are used,
+                        // then we get at most floor(964 / 12) = 80 hops.
+                        let max_total_hops = 80;
+
+                        // ensure the total number of hops does not exceed the maximum allowed for the
+                        // number of segments
+                        let total_hops: usize = segments.iter().map(|s| s.hop_fields.len()).sum();
+                        let mut segments = segments;
+                        if total_hops > max_total_hops {
+                            let n = segments.len();
+                            let base = max_total_hops / n;
+                            let extra = max_total_hops % n;
+                            for (i, seg) in segments.iter_mut().enumerate() {
+                                let limit = base + if i < extra { 1 } else { 0 };
+                                seg.hop_fields.truncate(limit.max(1));
+                            }
+                        }
+
+                        // current_hop must be in range of total hops
+                        let total_hops: usize = segments.iter().map(|s| s.hop_fields.len()).sum();
+                        let curr_hop = match total_hops {
+                            0 => 0,
+                            _ => curr_hop % (total_hops as u8),
+                        };
+
+                        // current_info_field is defined by which segment the current_hop_field is in
+                        let mut hop_count = 0;
+                        let mut curr_info = 0;
+                        for (i, seg) in segments.iter().enumerate() {
+                            hop_count += seg.hop_fields.len();
+                            if (curr_hop as usize) < hop_count {
+                                curr_info = i as u8;
+                                break;
+                            }
+                        }
+
+                        let segments = segments.into_iter().collect();
+
+                        HummingbirdPath {
+                            current_info_field: curr_info,
+                            current_hop_field: curr_hop,
+                            segments,
+                            base_timestamp,
+                            millis_timestamp: millis_timestamp & 0x3FF,
+                            counter: counter.map(|c| c & 0x3F_FF_FF),
+                        }
+                    },
+                )
+                .boxed()
+        }
+    }
+
+    impl Arbitrary for HbirdSegment {
+        type Parameters = ArbitraryHbirdPathContext;
+        type Strategy = BoxedStrategy<Self>;
+
+        fn arbitrary_with(_ctx: Self::Parameters) -> Self::Strategy {
+            (
+                any::<InfoField>(),
+                prop::collection::vec(any::<HbirdHopField>(), 1..=42),
+            )
+                .prop_map(|(info_field, hop_fields)| HbirdSegment {
+                    info_field,
+                    hop_fields: TinyVec::Heap(hop_fields),
+                })
+                .boxed()
+        }
+    }
+
+    impl Arbitrary for HbirdHopField {
+        type Parameters = ();
+        type Strategy = BoxedStrategy<Self>;
+
+        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+            prop_oneof![
+                any::<HopField>().prop_map(HbirdHopField::Standard),
+                any::<FlyoverHopField>().prop_map(HbirdHopField::Flyover),
+            ]
+            .boxed()
+        }
+    }
+
+    impl Arbitrary for FlyoverHopField {
+        type Parameters = ();
+        type Strategy = BoxedStrategy<Self>;
+
+        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+            (
+                any::<HbirdHopFieldFlags>(),
+                any::<u8>(),
+                any::<u16>(),
+                any::<u16>(),
+                any::<[u8; 6]>(),
+                any::<u32>(),
+                any::<u16>(),
+                any::<u16>(),
+                any::<u16>(),
+            )
+                .prop_map(
+                    |(
+                        flags,
+                        expiration_units,
+                        cons_ingress,
+                        cons_egress,
+                        mac_bytes,
+                        res_id,
+                        bw,
+                        res_start_offset,
+                        res_duration,
+                    )| FlyoverHopField {
+                        flags,
+                        expiration_units,
+                        cons_ingress,
+                        cons_egress,
+                        mac: HopFieldMac(mac_bytes),
+                        res_id,
+                        bw,
+                        res_start_offset,
+                        res_duration,
+                    },
+                )
+                .boxed()
+        }
     }
 }

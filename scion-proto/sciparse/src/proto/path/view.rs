@@ -17,7 +17,7 @@
 //! See [`View`](crate::core::view) for more information about views in general.
 
 use crate::path::{
-    onehop::view::OneHopPathView, standard::view::StandardPathView, types::PathType,
+    hbird::view::HbirdPathView, onehop::view::OneHopPathView, standard::view::StandardPathView, types::PathType
 };
 
 /// View over different path types
@@ -27,6 +27,8 @@ pub enum ScionPathView<'a> {
     Standard(&'a StandardPathView),
     /// View over a one-hop SCION path
     OneHop(&'a OneHopPathView),
+    /// View over a Hummingbird SCION path
+    Hummingbird(&'a HbirdPathView),
     /// View over an unsupported path type
     Unsupported {
         /// The unsupported path type
@@ -45,6 +47,8 @@ pub enum ScionPathViewMut<'a> {
     Standard(&'a mut StandardPathView),
     /// Mutable view over a one-hop SCION path
     OneHop(&'a mut OneHopPathView),
+    /// Mutable view over a Hummingbird SCION path
+    Hummingbird(&'a mut HbirdPathView),
     /// Mutable view over an unsupported path type
     Unsupported {
         /// The unsupported path type
