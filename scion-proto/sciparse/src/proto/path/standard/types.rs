@@ -14,9 +14,8 @@
 
 //! Standard SCION path types and related structures.
 
-use std::{fmt::Debug, ops::Deref, time::Duration};
-
 use serde::{Deserialize, Serialize};
+use std::{fmt::Debug, ops::Deref, time::Duration};
 
 /// MAC (Message Authentication Code) used in HopFields.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -88,7 +87,7 @@ bitflags::bitflags! {
 bitflags::bitflags! {
     /// HopField flags.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
-    pub struct HopFieldFlags: u8 {
+    pub struct StdHopFieldFlags: u8 {
         /// If ConsEgress Router Alert is set, the egress router in construction direction will process the L4 payload in the packet.
         const CONS_EGRESS_ROUTER_ALERT = 0b0000_0001;
         /// If ConsIngress Router Alert is set, the ingress router in construction direction will process the L4 payload in the packet.
@@ -98,15 +97,16 @@ bitflags::bitflags! {
         const _ = !0;
     }
 }
-impl HopFieldFlags {
+
+impl StdHopFieldFlags {
     /// Returns true if the ConsIngress Router Alert flag is set.
     pub fn cons_ingress_router_alert(&self) -> bool {
-        self.contains(HopFieldFlags::CONS_INGRESS_ROUTER_ALERT)
+        self.contains(StdHopFieldFlags::CONS_INGRESS_ROUTER_ALERT)
     }
 
     /// Returns true if the ConsEgress Router Alert flag is set.
     pub fn cons_egress_router_alert(&self) -> bool {
-        self.contains(HopFieldFlags::CONS_EGRESS_ROUTER_ALERT)
+        self.contains(StdHopFieldFlags::CONS_EGRESS_ROUTER_ALERT)
     }
 
     /// Returns the normalized router alert flag based on the construction direction.
@@ -166,13 +166,13 @@ pub mod ptest {
         }
     }
 
-    impl Arbitrary for HopFieldFlags {
+    impl Arbitrary for StdHopFieldFlags {
         type Parameters = ();
         type Strategy = BoxedStrategy<Self>;
 
         fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
             any::<u8>()
-                .prop_map(HopFieldFlags::from_bits_retain)
+                .prop_map(StdHopFieldFlags::from_bits_retain)
                 .boxed()
         }
     }

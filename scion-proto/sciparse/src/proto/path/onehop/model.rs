@@ -23,7 +23,7 @@ use crate::{
         standard::{
             mac::{ForwardingKey, algo::mac_beta_step},
             model::{HopField, InfoField, Segment, StandardPath},
-            types::{HopFieldFlags, HopFieldMac, InfoFieldFlags},
+            types::{StdHopFieldFlags, HopFieldMac, InfoFieldFlags},
         },
     },
 };
@@ -59,7 +59,7 @@ impl OneHopPath {
         };
 
         let hop1 = HopField {
-            flags: HopFieldFlags::empty(),
+            flags: StdHopFieldFlags::empty(),
             cons_ingress: 0,
             cons_egress: egress_interface,
             expiration_units,
@@ -98,7 +98,7 @@ impl OneHopPath {
         };
 
         self.hops[1] = HopField {
-            flags: HopFieldFlags::empty(),
+            flags: StdHopFieldFlags::empty(),
             cons_ingress: ingress_interface,
             cons_egress: 0,
             expiration_units: 0,

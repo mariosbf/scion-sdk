@@ -32,7 +32,7 @@ use crate::{
             HopFieldLayout, InfoFieldLayout, StdPathDataLayout, StdPathLayout, StdPathMetaLayout,
         },
         mac::{HopMacInput, HopMacInputSource},
-        types::{HopFieldFlags, HopFieldMac, InfoFieldFlags},
+        types::{StdHopFieldFlags, HopFieldMac, InfoFieldFlags},
     },
 };
 
@@ -61,6 +61,7 @@ impl StandardPathView {
         self.seg0_len() + self.seg1_len() + self.seg2_len()
     }
 }
+
 // Meta header mut
 impl StandardPathView {
     gen_field_write!(
@@ -77,6 +78,7 @@ impl StandardPathView {
     gen_unsafe_field_write!(set_seg1_len, StdPathMetaLayout::SEG1_LEN_RNG, u8);
     gen_unsafe_field_write!(set_seg2_len, StdPathMetaLayout::SEG2_LEN_RNG, u8);
 }
+
 // Data Helpers
 impl StandardPathView {
     /// Returns the byte range for the info field at the given index, or None if the index is out of
@@ -448,11 +450,11 @@ impl View for HopFieldView {
 impl HopFieldView {
     /// Returns the flags of the hop field
     #[inline]
-    pub fn flags(&self) -> HopFieldFlags {
+    pub fn flags(&self) -> StdHopFieldFlags {
         // SAFETY: buffer size is checked on construction
         let value =
             unsafe { unchecked_bit_range_be_read::<u8>(&self.0, HopFieldLayout::FLAGS_RNG) };
-        HopFieldFlags::from_bits_retain(value)
+        StdHopFieldFlags::from_bits_retain(value)
     }
 
     gen_field_read!(exp_time, HopFieldLayout::EXP_TIME_RNG, u8);
@@ -503,7 +505,7 @@ impl HopFieldView {
 impl HopFieldView {
     /// Sets the flags of the hop field
     #[inline]
-    pub fn set_flags(&mut self, flags: HopFieldFlags) {
+    pub fn set_flags(&mut self, flags: StdHopFieldFlags) {
         // SAFETY: buffer size is checked on construction
         let value = flags.bits();
         unsafe { unchecked_bit_range_be_write::<u8>(&mut self.0, HopFieldLayout::FLAGS_RNG, value) }

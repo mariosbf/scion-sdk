@@ -27,7 +27,7 @@ use crate::{
         standard::{
             layout::{HopFieldLayout, InfoFieldLayout, StdPathDataLayout, StdPathMetaLayout},
             mac::{ForwardingKey, HopMacCalculate, HopMacInput, HopMacInputSource},
-            types::{HopFieldFlags, HopFieldMac, InfoFieldFlags},
+            types::{StdHopFieldFlags, HopFieldMac, InfoFieldFlags},
             view::{HopFieldView, InfoFieldView, StandardPathView},
         },
     },
@@ -283,7 +283,7 @@ impl WireEncode for InfoField {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct HopField {
     /// Hop field flags
-    pub flags: HopFieldFlags,
+    pub flags: StdHopFieldFlags,
     /// Hop field expiration units
     ///
     /// The expiration time of a hop field is determined by multiplying the value in this field
@@ -323,7 +323,7 @@ pub struct HopField {
 impl Default for HopField {
     fn default() -> Self {
         Self {
-            flags: HopFieldFlags::empty(),
+            flags: StdHopFieldFlags::empty(),
             expiration_units: 0,
             cons_ingress: 0,
             cons_egress: 0,
@@ -347,7 +347,7 @@ impl HopField {
     /// Creates an empty `HopField` with zeroed fields.
     pub fn empty() -> Self {
         Self {
-            flags: HopFieldFlags::empty(),
+            flags: StdHopFieldFlags::empty(),
             expiration_units: 0,
             cons_ingress: 0,
             cons_egress: 0,
@@ -520,7 +520,7 @@ pub mod ptest {
 
         fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
             (
-                any::<HopFieldFlags>(),
+                any::<StdHopFieldFlags>(),
                 any::<u8>(),
                 any::<u16>(),
                 any::<u16>(),

@@ -52,12 +52,10 @@ impl Path {
             ScionPathView::Unsupported {
                 path_type,
                 data: buf,
-            } => {
-                Path::Unsupported {
-                    path_type,
-                    data: buf.to_vec(),
-                }
-            }
+            } => Path::Unsupported {
+                path_type,
+                data: buf.to_vec(),
+            },
         }
     }
 }
@@ -148,6 +146,8 @@ pub mod ptest {
         pub standard: u32,
         /// Weight for generating one-hop paths.
         pub one_hop: u32,
+        /// Weight for generating Hummingbird paths.
+        pub hbird: u32,
         /// Weight for generating empty paths.
         pub empty: u32,
         /// Weight for generating unsupported path types.
@@ -162,6 +162,7 @@ pub mod ptest {
             Self {
                 standard: 8,
                 one_hop: 2,
+                hbird: 2,
                 empty: 1,
                 unsupported: 1,
                 standard_params: Default::default(),
@@ -188,7 +189,7 @@ pub mod ptest {
                     .prop_map(|(path_type, data)| {
                         // Should not be a compatible path type
                         let path_type = match path_type {
-                            PathType::Scion|PathType::OneHop|PathType::Empty => {PathType::Other(123)}
+                            PathType::Scion|PathType::OneHop|PathType::Empty|PathType::Hummingbird => {PathType::Other(123)}
                             PathType::Epic | PathType::Colibri | PathType::Other(_) => path_type,
                         };
 

@@ -102,7 +102,7 @@ mod packet_manipulation {
             standard::{
                 layout::StdPathMetaLayout,
                 model::HopField,
-                types::{HopFieldFlags, HopFieldMac},
+                types::{StdHopFieldFlags, HopFieldMac},
             },
             types::PathType,
         },
@@ -223,7 +223,7 @@ mod packet_manipulation {
                                 segment.hop_fields.resize(
                                     target_hops,
                                     HopField {
-                                        flags: HopFieldFlags::empty(),
+                                        flags: StdHopFieldFlags::empty(),
                                         expiration_units: 0,
                                         cons_ingress: 0,
                                         cons_egress: 0,

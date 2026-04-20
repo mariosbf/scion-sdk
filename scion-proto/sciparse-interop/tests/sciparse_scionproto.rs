@@ -392,13 +392,13 @@ fn compare_standard_path(
         assert_eq!(
             sci_hop
                 .flags
-                .contains(sciparse::path::standard::types::HopFieldFlags::CONS_EGRESS_ROUTER_ALERT),
+                .contains(sciparse::path::standard::types::StdHopFieldFlags::CONS_EGRESS_ROUTER_ALERT),
             proto_hop.egress_router_alert,
             "hop_field[{i}].egress_router_alert mismatch"
         );
         assert_eq!(
             sci_hop.flags.contains(
-                sciparse::path::standard::types::HopFieldFlags::CONS_INGRESS_ROUTER_ALERT
+                sciparse::path::standard::types::StdHopFieldFlags::CONS_INGRESS_ROUTER_ALERT
             ),
             proto_hop.ingress_router_alert,
             "hop_field[{i}].ingress_router_alert mismatch"

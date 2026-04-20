@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 
 use bytes::{Buf as _, BufMut, Bytes};
 use chrono::{DateTime, Utc};
-use sciparse::path::standard::types::{HopFieldFlags, InfoFieldFlags};
+use sciparse::path::standard::types::{StdHopFieldFlags, InfoFieldFlags};
 
 use super::{HopFieldIndex, InfoFieldIndex, MetaHeader, MetaReserved, SegmentLength, encoded};
 use crate::{
@@ -108,8 +108,8 @@ impl StandardPath {
                 StandardHopField {
                     ingress_router_alert: f
                         .flags
-                        .contains(HopFieldFlags::CONS_INGRESS_ROUTER_ALERT),
-                    egress_router_alert: f.flags.contains(HopFieldFlags::CONS_EGRESS_ROUTER_ALERT),
+                        .contains(StdHopFieldFlags::CONS_INGRESS_ROUTER_ALERT),
+                    egress_router_alert: f.flags.contains(StdHopFieldFlags::CONS_EGRESS_ROUTER_ALERT),
                     exp_time: f.expiration_units,
                     cons_ingress: f.cons_ingress,
                     cons_egress: f.cons_egress,

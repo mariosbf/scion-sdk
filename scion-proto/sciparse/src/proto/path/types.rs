@@ -34,6 +34,8 @@ pub enum PathType {
     Epic = 3,
     /// Experimental Colibri path type.
     Colibri = 4,
+    /// Experimental Hummingbird path type.
+    Hummingbird = 5,
     /// Other, unrecognized path types.
     Other(u8),
 }
@@ -45,6 +47,7 @@ impl From<u8> for PathType {
             2 => PathType::OneHop,
             3 => PathType::Epic,
             4 => PathType::Colibri,
+            5 => PathType::Hummingbird,
             other => PathType::Other(other),
         }
     }
@@ -57,6 +60,7 @@ impl From<PathType> for u8 {
             PathType::OneHop => 2,
             PathType::Epic => 3,
             PathType::Colibri => 4,
+            PathType::Hummingbird => 5,
             PathType::Other(other) => other,
         }
     }
@@ -86,6 +90,8 @@ pub mod ptest {
         pub epic: u32,
         /// Weight for generating Colibri path type.
         pub colibri: u32,
+        /// Weight for generating Hummingbird path type.
+        pub hummingbird: u32,
         /// Weight for generating Other (unknown) path types.
         pub other: u32,
     }
@@ -97,6 +103,7 @@ pub mod ptest {
                 one_hop: 2,
                 epic: 1,
                 colibri: 1,
+                hummingbird: 1,
                 other: 1,
             }
         }
@@ -113,7 +120,8 @@ pub mod ptest {
                 params.one_hop => Just(PathType::OneHop),
                 params.epic => Just(PathType::Epic),
                 params.colibri => Just(PathType::Colibri),
-                params.other => (5u8..=255).prop_map(PathType::Other),
+                params.hummingbird => Just(PathType::Hummingbird),
+                params.other => (6u8..=255).prop_map(PathType::Other),
             ]
             .boxed()
         }

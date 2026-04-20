@@ -14,6 +14,7 @@
 
 pub mod onehop;
 pub mod standard;
+pub mod hbird;
 
 pub mod layout;
 pub mod model;
