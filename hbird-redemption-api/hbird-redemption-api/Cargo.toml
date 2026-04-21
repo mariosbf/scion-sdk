@@ -1,0 +1,29 @@
+[package]
+name = "hbird-redemption-api"
+version = "0.5.2"
+edition.workspace = true
+authors = ["Anapaya & contributors"]
+license = "Apache-2.0"
+description = "Hummingbird redemption API"
+repository = "https://github.com/anapaya/scion-sdk"
+keywords = ["SCION", "networking"]
+
+[dependencies]
+# Local Dependencies
+hbird-redemption-api-models = { workspace = true }
+hbird-redemption-api-protobuf = { workspace = true }
+scion-sdk-axum-connect-rpc = { workspace = true }
+scion-proto = { workspace = true }
+
+# Global Dependencies
+axum = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[package.metadata.cargo-shear]
+ignored = ["tokio", "async-trait"]
+
+[lints]
+workspace = true

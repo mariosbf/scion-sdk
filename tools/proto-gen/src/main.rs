@@ -90,6 +90,14 @@ fn main() -> anyhow::Result<()> {
             protoc_args: vec![],
             use_tonic: false,
         },
+        CompileConfig {
+            name: "hbird-redemption-api",
+            out_dir: "hbird-redemption-api/hbird-redemption-api-protobuf/src/proto",
+            proto_dirs: vec!["hbird-redemption-api/hbird-redemption-api-protobuf/protobuf"],
+            extern_includes: vec![],
+            protoc_args: vec![],
+            use_tonic: false,
+        },
     ];
 
     match cli.command {
