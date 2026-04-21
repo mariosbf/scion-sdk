@@ -41,7 +41,13 @@ use chrono::{DateTime, Utc};
 use scion_protobuf::daemon::v1 as daemon_grpc;
 use tracing::warn;
 
-use crate::{address::IsdAsn, packet::ByEndpoint, wire_encoding::WireDecode};
+use crate::{
+    address::IsdAsn,
+    hummingbird::Reservation,
+    packet::{ByEndpoint, DecodeError},
+    path::hummingbird::{HummingbirdCounter, HummingbirdPathBuilderError},
+    wire_encoding::WireDecode,
+};
 
 mod error;
 pub use error::{DataPlanePathErrorKind, PathParseError, PathParseErrorKind};
@@ -328,6 +334,79 @@ where
                 }
             }
         }
+    }
+}
+
+/// Error returned when applying reservations to a path fails.
+#[derive(thiserror::Error, Debug)]
+pub enum ApplyReservationError {
+    /// Path type is not supported for adding reservations.
+    #[error("no underlay available: {0}")]
+    UnsupportedPathType(#[from] UnsupportedPathType),
+    /// Failed to decode underlying data plan path.
+    #[error("failed to decode underlying data plane path")]
+    DecodeError(#[from] DecodeError),
+    /// Error in path Hummingbird path builder.
+    #[error("failed to add reservation to path: {0}")]
+    HummingbirdPathBuilderError(#[from] HummingbirdPathBuilderError),
+}
+
+impl Path<Bytes> {
+    /// Apply reservation to path.
+    ///
+    /// The behaviour of this function depends on the current underlying path
+    /// type.
+    /// - Empty paths: left unchanged.
+    /// - Standard paths: decoded, converted to Hummingbird paths, have the reservations applied,
+    ///   and then re-encoded as Hummingbird paths.
+    /// - Hummingbird paths: similar to standard paths, but the timestamp and counter
+    ///   of the original path are used in the new path to avoid invalidating existing
+    ///   flyover MACs.
+    ///
+    /// Parameters:
+    /// - `reservations`: the reservations to apply to the path.
+    /// - `timestamp`: the timestamp to use in the Hummingbird path meta header.
+    /// - `counter`: the counter to use in the Hummingbird path meta header, if desired.
+    /// - `pkt_len`: the length of the packet to be sent on the path (including headers).
+    ///   Used for flyover MAC calculations.
+    pub fn with_reservations_and_timestamp(
+        self,
+        reservations: impl IntoIterator<Item = Reservation>,
+        timestamp: DateTime<Utc>,
+        counter: Option<HummingbirdCounter>,
+        pkt_len: u16,
+    ) -> Result<Self, ApplyReservationError> {
+        let mut hbird_path = match self.data_plane_path {
+            DataPlanePath::EmptyPath => return Ok(self),
+            DataPlanePath::Standard(p) => {
+                // Decode path
+                let standard_path: StandardPath = p.try_into()?;
+
+                // Turn to hbird_path
+                standard_path.to_hummingbird_with_timestamp(timestamp, counter)
+            }
+            DataPlanePath::Hummingbird(p) => p.try_into()?,
+            DataPlanePath::Unsupported {
+                path_type,
+                bytes: _,
+            } => {
+                return Err(UnsupportedPathType(path_type.into()).into());
+            }
+        };
+
+        for r in reservations {
+            hbird_path.add_reservation(r)?;
+        }
+
+        let encoded_p = hbird_path.to_encoded(self.isd_asn.destination, pkt_len)?;
+        let data_plane_path = DataPlanePath::Hummingbird(encoded_p);
+
+        Ok(Self {
+            data_plane_path,
+            underlay_next_hop: self.underlay_next_hop,
+            isd_asn: self.isd_asn,
+            metadata: self.metadata,
+        })
     }
 }
 
