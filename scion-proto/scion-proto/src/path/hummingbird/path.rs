@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use crate::{
     address::IsdAsn,
     hummingbird::Reservation,
-    packet::DecodeError,
+    packet::{DecodeError, InadequateBufferSize},
     path::{
         EncodedHopField, EncodedInfoField, EncodedSegment, EncodedSegments,
         EncodedStandardHopField, EncodedStandardPath, HopField, HopFieldIndex, InfoField,
@@ -471,6 +471,21 @@ pub enum HummingbirdPathBuilderError {
     /// direction).
     #[error("Reservation is not applicable to any hop field in the path")]
     ReservationNotApplicable,
+
+    /// Current hop field index is not valid, i.e., either not divisible
+    /// by 4 or it the value is too large to fit in the allocated bits.
+    #[error("Current hop field index is not valid")]
+    InvalidHopFieldIndex,
+
+    /// Raised if the buffer does not have sufficient capacity for encoding the SCION headers.
+    #[error("The provided buffer did not have sufficient size")]
+    InadequateBufferSize,
+}
+
+impl From<InadequateBufferSize> for HummingbirdPathBuilderError {
+    fn from(_: InadequateBufferSize) -> Self {
+        HummingbirdPathBuilderError::InadequateBufferSize
+    }
 }
 
 /// A fully decoded Hummingbird data plane path. It can be used to build new paths
@@ -676,27 +691,16 @@ impl HummingbirdPath {
                 * (FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE)
     }
 
-    /// Encode the path to a byte buffer, applying any reservations that have been added to
-    /// the path. The reservations are applied by replacing regular hop fields with flyover hop
-    /// fields.
+    /// Apply reservations by turning applicable hop fields into flyover hop
+    /// fields, adjusting segment lengths and current hop field index.
     ///
-    /// Parameters:
-    /// - `destination`: The destination ISD-AS of the path, used for calculating the
-    ///   flyover hop field MACs.
-    /// - `pkt_len`: The length of the packet for which the path is being encoded
-    ///   (including the header) used for calculating the flyover hop field MACs.
-    ///
-    /// See [encoded_length][Self::encoded_length] for the length of the resulting encoding.
-    ///
-    /// # Panics
-    /// Panics if one of the segments (after applying reservations) exceeds the
-    /// maximum allowed length of 508 bytes.
-    pub fn encode_to_unchecked<T: BufMut>(
+    /// If `unchecked` is true, then this method will not return an error.
+    fn apply_reservations(
         &mut self,
         destination: IsdAsn,
         pkt_len: u16,
-        buffer: &mut T,
-    ) {
+        unchecked: bool,
+    ) -> Result<(), HummingbirdPathBuilderError> {
         let meta_header = self.path_meta;
         let mut curr_hf_index = meta_header.current_hop_field.byte_offset();
 
@@ -759,18 +763,84 @@ impl HummingbirdPath {
         });
 
         // Adjust segment lengths
-        self.segments.iter().enumerate().for_each(|(idx, segment)| {
+        for (idx, segment) in self.segments.iter().enumerate() {
             let seg_len = segment
                 .iter()
                 .map(WireEncode::encoded_length)
                 .sum::<usize>();
 
-            self.path_meta.segment_lengths[idx] =
-                HummingbirdSegmentLength::new(seg_len).unwrap();
-        });
+            if unchecked {
+                self.path_meta.segment_lengths[idx] =
+                    HummingbirdSegmentLength::new_unchecked(seg_len);
+            } else {
+                self.path_meta.segment_lengths[idx] = HummingbirdSegmentLength::new(seg_len)
+                    .ok_or(HummingbirdPathBuilderError::SegmentTooLong)?;
+            }
+        }
 
         // Adjust current hop field index in meta header.
-        self.path_meta.current_hop_field = HummingbirdHopfieldIndex::new_unchecked(curr_hf_index);
+        if unchecked {
+            self.path_meta.current_hop_field =
+                HummingbirdHopfieldIndex::new_unchecked(curr_hf_index);
+        } else {
+            self.path_meta.current_hop_field = HummingbirdHopfieldIndex::new(curr_hf_index)
+                .ok_or(HummingbirdPathBuilderError::InvalidHopFieldIndex)?;
+        }
+
+        Ok(())
+    }
+
+    /// Encode the path to a byte buffer, applying any reservations that have been added to
+    /// the path. The reservations are applied by replacing regular hop fields with flyover hop
+    /// fields.
+    ///
+    /// Parameters:
+    /// - `destination`: The destination ISD-AS of the path, used for calculating the
+    ///   flyover hop field MACs.
+    /// - `pkt_len`: The length of the packet for which the path is being encoded
+    ///   (including the header) used for calculating the flyover hop field MACs.
+    ///
+    /// See [encoded_length][Self::encoded_length] for the length of the resulting encoding.
+    pub fn encode_to<T: BufMut>(
+        &mut self,
+        destination: IsdAsn,
+        pkt_len: u16,
+        buffer: &mut T,
+    ) -> Result<(), HummingbirdPathBuilderError> {
+        self.apply_reservations(destination, pkt_len, false)?;
+
+        // Encode fields to buffer
+        self.path_meta.encode_to_unchecked(buffer);
+        for info in self.info_fields.iter() {
+            info.encode_to(buffer)?;
+        }
+        for hop_field in self.segments.iter().flat_map(|s| s.iter()) {
+            hop_field.encode_to(buffer)?;
+        }
+
+        Ok(())
+    }
+
+    /// Encode the path to a byte buffer, applying any reservations that have been added to
+    /// the path. The reservations are applied by replacing regular hop fields with flyover hop
+    /// fields. Does not perform any correctness checks, such as ensuring that
+    /// the hop fields are encoded correctly or that segments are not too long.
+    ///
+    /// Parameters:
+    /// - `destination`: The destination ISD-AS of the path, used for calculating the
+    ///   flyover hop field MACs.
+    /// - `pkt_len`: The length of the packet for which the path is being encoded
+    ///   (including the header) used for calculating the flyover hop field MACs.
+    ///
+    /// See [encoded_length][Self::encoded_length] for the length of the resulting encoding.
+    pub fn encode_to_unchecked<T: BufMut>(
+        &mut self,
+        destination: IsdAsn,
+        pkt_len: u16,
+        buffer: &mut T,
+    ) {
+        self.apply_reservations(destination, pkt_len, true)
+            .expect("applying reservations should succeed in unchecked mode");
 
         // Encode fields to buffer
         self.path_meta.encode_to_unchecked(buffer);
@@ -780,6 +850,27 @@ impl HummingbirdPath {
         for hop_field in self.segments.iter().flat_map(|s| s.iter()) {
             hop_field.encode_to_unchecked(buffer);
         }
+    }
+
+    /// Turn this path into an [EncodedHummingbirdPath].
+    ///
+    /// Parameters:
+    /// - `destination`: The destination ISD-AS of the path, used for calculating the
+    ///   flyover hop field MACs.
+    /// - `pkt_len`: The length of the packet for which the path is being encoded
+    ///   (including the header) used for calculating the flyover hop field MACs.
+    pub fn to_encoded(
+        &mut self,
+        destination: IsdAsn,
+        pkt_len: u16,
+    ) -> Result<EncodedHummingbirdPath<Bytes>, HummingbirdPathBuilderError> {
+        let mut buffer = vec![0u8; self.encoded_length()];
+        self.encode_to(destination, pkt_len, &mut buffer)?;
+
+        Ok(EncodedHummingbirdPath {
+            meta_header: self.path_meta,
+            encoded_path: buffer.into(),
+        })
     }
 }
 
