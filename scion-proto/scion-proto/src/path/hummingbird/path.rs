@@ -510,20 +510,17 @@ impl HummingbirdPath {
     /// Creates a new HummingbirdPath with the current system time as the base  
     /// timestamp, a default counter and no reservations.   
     pub fn new() -> HummingbirdPath {
-        Self::new_with_timestamp(SystemTime::now(), None)
+        Self::new_with_timestamp(DateTime::<Utc>::from(SystemTime::now()), None)
     }
 
     /// Creates a new HummingbirdPath with the specified base timestamp, an optional
     /// counter, and no reservations. If the counter is not provided, the default
     /// value is picked.
     pub fn new_with_timestamp(
-        timestamp: SystemTime,
+        timestamp: DateTime<Utc>,
         counter: Option<HummingbirdCounter>,
     ) -> HummingbirdPath {
-        let millis = timestamp
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("current time is after UNIX epoch")
-            .subsec_millis() as u16;
+        let millis = timestamp.timestamp_subsec_millis() as u16;
 
         let meta_header = HummingbirdMetaHeader {
             current_info_field: 0.into(),
@@ -934,6 +931,7 @@ mod tests {
     };
 
     use bytes::Bytes;
+    use chrono::TimeZone;
 
     use super::*;
     use crate::{
@@ -1459,8 +1457,10 @@ mod tests {
     // HummingbirdPath helpers
     // ---------------------------------------------------------------------------
 
-    fn epoch_plus(secs: u64) -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(secs)
+    fn epoch_plus(secs: u64) -> DateTime<Utc> {
+        Utc.timestamp_opt(secs as i64, 0)
+            .single()
+            .expect("valid timestamp")
     }
 
     fn make_info(cons_dir: bool, timestamp: u32) -> InfoField {
