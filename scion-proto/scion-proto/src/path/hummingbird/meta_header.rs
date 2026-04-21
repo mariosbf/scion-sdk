@@ -3,6 +3,7 @@
 use std::{mem, ops::Add, time::Duration};
 
 use bytes::{Buf, BufMut};
+use chrono::{DateTime, Utc};
 
 use crate::{
     packet::{DecodeError, InadequateBufferSize},
@@ -186,6 +187,22 @@ impl From<std::time::SystemTime> for HummingbirdBaseTimestamp {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time is before unix epoch");
         Self(duration_since_epoch.as_secs() as u32)
+    }
+}
+
+impl From<DateTime<Utc>> for HummingbirdBaseTimestamp {
+    /// Creates a new HummingbirdBaseTimestamp from the given DateTime<Utc> by
+    /// calculating the duration since the UNIX epoch and using its seconds as
+    /// the timestamp value.
+    ///
+    /// Does not check for overflows.
+    fn from(datetime: DateTime<Utc>) -> Self {
+        let timestamp = datetime.timestamp();
+        debug_assert!(
+            timestamp >= 0,
+            "datetime must be after unix epoch to be converted to HummingbirdBaseTimestamp"
+        );
+        Self(timestamp as u32)
     }
 }
 

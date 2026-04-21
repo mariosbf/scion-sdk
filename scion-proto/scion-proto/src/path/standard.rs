@@ -25,7 +25,7 @@ use crate::{
     packet::{DecodeError, InadequateBufferSize},
     path::hummingbird::{
         FlyoverHopField, HummingbirdCounter, HummingbirdHopField, HummingbirdMetaHeader,
-        HummingbirdPath, calculate_hbird_auth_key, calculate_flyover_mac, xor_in_place,
+        HummingbirdPath, calculate_flyover_mac, calculate_hbird_auth_key, xor_in_place,
     },
     wire_encoding::{WireDecode, WireEncode},
 };
@@ -86,7 +86,7 @@ impl StandardPath {
     /// Turns this path into a HummingbirdPath with the current timestamp and
     /// a default counter value.
     pub fn to_hummingbird(self) -> HummingbirdPath {
-        self.to_hummingbird_with_timestamp(SystemTime::now(), None)
+        self.to_hummingbird_with_timestamp(DateTime::<Utc>::from(SystemTime::now()), None)
     }
 
     /// Turns this path into a HummingbirdPath with the provided timestamp and
@@ -99,7 +99,7 @@ impl StandardPath {
     /// since the UNIX epoch.
     pub fn to_hummingbird_with_timestamp(
         self,
-        timestamp: SystemTime,
+        timestamp: DateTime<Utc>,
         counter: Option<HummingbirdCounter>,
     ) -> HummingbirdPath {
         let segments =
