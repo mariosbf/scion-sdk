@@ -170,6 +170,7 @@
 //!         &self,
 //!         src: IsdAsn,
 //!         _dst: IsdAsn,
+//!         _payload_len: Option<usize>,
 //!         _now: DateTime<Utc>,
 //!     ) -> impl ResFut<'_, Path<Bytes>, scion_stack::path::manager::traits::PathWaitError>
 //!     {

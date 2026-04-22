@@ -263,6 +263,7 @@ async fn test_scmp_with_port_is_received_scmp_impl(ps_handle: PocketScionHandle)
         .path_wait(
             sender.local_addr().isd_asn(),
             receiver_addr.isd_asn(),
+            Some(echo_data.len()),
             Utc::now(),
         )
         .await
@@ -351,6 +352,7 @@ async fn test_scmp_with_port_is_received_raw_impl(ps_handle: PocketScionHandle) 
         .path_wait(
             sender.local_addr().isd_asn(),
             receiver_addr.isd_asn(),
+            Some(echo_data.len()),
             Utc::now(),
         )
         .await

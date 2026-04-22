@@ -433,6 +433,7 @@ impl<F: PathFetcher> PathManager for MultiPathManager<F> {
         &self,
         src: IsdAsn,
         dst: IsdAsn,
+        _payload_len: Option<usize>,
         now: chrono::DateTime<chrono::Utc>,
     ) -> impl crate::types::ResFut<'_, Path<bytes::Bytes>, PathWaitError> {
         async move {

@@ -29,6 +29,7 @@ pub trait PathManager: SyncPathManager {
         &self,
         src: IsdAsn,
         dst: IsdAsn,
+        payload_len: Option<usize>,
         now: DateTime<Utc>,
     ) -> impl ResFut<'_, Path<Bytes>, PathWaitError>;
 
@@ -38,10 +39,11 @@ pub trait PathManager: SyncPathManager {
         &self,
         src: IsdAsn,
         dst: IsdAsn,
+        payload_len: Option<usize>,
         now: DateTime<Utc>,
         timeout: Duration,
     ) -> impl ResFut<'_, Path<Bytes>, PathWaitTimeoutError> {
-        let fut = self.path_wait(src, dst, now);
+        let fut = self.path_wait(src, dst, payload_len, now);
         async move {
             match tokio::time::timeout(timeout, fut).await {
                 Ok(result) => {

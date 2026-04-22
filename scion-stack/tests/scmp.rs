@@ -98,7 +98,7 @@ async fn should_receive_scmp_messages() -> anyhow::Result<()> {
         "[1-2,10.0.0.1]:12345".parse::<SocketAddr>().unwrap(),
     );
     let path = client_path_manager
-        .path_wait(src.isd_asn(), dst.isd_asn(), Utc::now())
+        .path_wait(src.isd_asn(), dst.isd_asn(), None, Utc::now())
         .await
         .expect("error getting path");
     let random_message = Bytes::from_static(b"test message");
