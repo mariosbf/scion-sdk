@@ -3,7 +3,7 @@
 //! We divide keys into two categories:
 //! - Hummingbird authentication keys: Used to authenticate attempts to use a reservation.
 //!   Denoted A_K in the Hummingbird paper.
-//! - Hummingbird keys: Used by ASes to derive authentication keys for 
+//! - Hummingbird keys: Used by ASes to derive authentication keys for
 //!   reservations. Denoted SV_K in the Hummingbird paper.
 
 use aes::cipher::{BlockEncrypt, consts::U16, generic_array::GenericArray};
@@ -11,6 +11,7 @@ use aes::cipher::{BlockEncrypt, consts::U16, generic_array::GenericArray};
 use crate::{
     address::{Asn, Isd},
     hummingbird::Bandwidth,
+    packet::CommonHeader,
 };
 
 /// 16-byte keys from which ASes derive Hummingbird authentication keys.
@@ -22,6 +23,12 @@ pub type HbirdKey = GenericArray<u8, U16>;
 /// flyover MACs).
 /// Denoted A_K in the Hummingbird paper.
 pub type HbirdAuthKey = GenericArray<u8, U16>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum FlyoverMacCalculationError {
+    #[error("packet length overflow")]
+    PacketLengthOverflow,
+}
 
 /// Calculates the flyover MAC for a flyover hop.
 /// Note: Only calculates the flyover MAC, not the aggregated MAC.
@@ -37,12 +44,12 @@ pub type HbirdAuthKey = GenericArray<u8, U16>;
 pub fn calculate_flyover_mac(
     dst_isd: Isd,
     dst_as: Asn,
-    pkt_len: u16,
+    payload_len: u16,
     res_start_offset: u16,
     millis_timestamp: u16,
     counter: u32,
     key: &HbirdAuthKey,
-) -> [u8; 6] {
+) -> Result<[u8; 6], FlyoverMacCalculationError> {
     use cmac::Mac;
 
     // Input data format (all fields are BE):
@@ -62,6 +69,9 @@ pub fn calculate_flyover_mac(
     let destination_address = ((dst_isd.0 as u64) << 48) | (dst_as.0 & 0xFFFFFFFFFFFF);
     let millis_and_counter = (((millis_timestamp & 0x3FF) as u32) << 22) | (counter & 0x3FFFFF);
 
+    let pkt_len = payload_len.checked_add(4 * CommonHeader::LENGTH as u16)
+        .ok_or(FlyoverMacCalculationError::PacketLengthOverflow)?;
+
     let mut mac_input_data = [0u8; 16];
     mac_input_data[0..8].copy_from_slice(&destination_address.to_be_bytes());
     mac_input_data[8..10].copy_from_slice(&pkt_len.to_be_bytes());
@@ -77,13 +87,13 @@ pub fn calculate_flyover_mac(
     let mut result = [0u8; 6];
     result.copy_from_slice(&mac[..6]);
 
-    result
+    Ok(result)
 }
 
-/// Derives the Hummingbird auth key for a reservation from the reservation key 
+/// Derives the Hummingbird auth key for a reservation from the reservation key
 /// and reservation parameters.
 ///
-/// Note: Some fields are not as wide as the types in the function signature 
+/// Note: Some fields are not as wide as the types in the function signature
 /// suggest:
 /// - `res_id` is only 22 bits wide, and
 /// - `bw` is only 10 bits wide.
