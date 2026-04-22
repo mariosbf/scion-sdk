@@ -1,4 +1,4 @@
-use std::{ops::Deref, time::SystemTime};
+use std::{collections::HashMap, ops::Deref, time::SystemTime};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use chrono::{DateTime, Utc};
@@ -493,9 +493,29 @@ impl From<InadequateBufferSize> for HummingbirdPathBuilderError {
     }
 }
 
+/// A pair of ingress and egress interfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReservationInterfaces {
+    ingress_interface: u16,
+    egress_interface: u16,
+}
+
 /// A fully decoded Hummingbird data plane path. It can be used to build new paths
 /// or to modify existing ones. If you only need to read information, use
 /// [EncodedHummingbirdPath] instead for better performance.
+///
+/// There are two main approaches to adding reservations.
+///
+/// The first approach is to add reservations as you build the path using the
+/// [HummingbirdPath::add_reservation] method. Calculation of the flyover  
+/// MACs is then deferred until the path is encoded, e.g. using [HummingbirdPath::encode_to].
+/// To facilitate this, the path stores the reservations to be applied.
+///
+/// The second approach is to go straight to encoding the path, by providing
+/// the `additional_reservations` parameter to the encoding method.
+/// These reservations will be applied only in this call to encoding the path.
+/// This should be used when storing a copy of the reservations inside the path
+/// leads to unnecessary overhead.
 #[derive(Debug, Clone)]
 pub struct HummingbirdPath {
     /// Path meta data.
@@ -508,7 +528,7 @@ pub struct HummingbirdPath {
     segments: Vec<Vec<HummingbirdHopField>>,
 
     /// Reservations to apply when encoding
-    reservations: Vec<Reservation>,
+    reservations: HashMap<ReservationInterfaces, Vec<Reservation>>,
 }
 
 impl HummingbirdPath {
@@ -541,7 +561,7 @@ impl HummingbirdPath {
             path_meta: meta_header,
             info_fields: vec![],
             segments: vec![],
-            reservations: vec![],
+            reservations: HashMap::new(),
         }
     }
 
@@ -603,7 +623,7 @@ impl HummingbirdPath {
 
     /// Returns an iterator over the reservations added to this path.
     pub fn reservations(&self) -> impl Iterator<Item = &Reservation> {
-        self.reservations.iter()
+        self.reservations.values().flatten()
     }
 
     /// Add a reservation to use with this path. Reservations added using this
@@ -618,27 +638,17 @@ impl HummingbirdPath {
             return Err(HummingbirdPathBuilderError::InvalidReservationStart);
         }
 
-        self.reservations.push(reservation);
+        let interfaces = ReservationInterfaces {
+            ingress_interface: reservation.info.ingress_interface,
+            egress_interface: reservation.info.egress_interface,
+        };
+
+        self.reservations
+            .entry(interfaces)
+            .or_insert_with(Vec::new)
+            .push(reservation);
 
         Ok(())
-    }
-
-    fn applicable_hop_field(&self, reservation: &Reservation) -> Option<&HummingbirdHopField> {
-        let ingress_iface = reservation.info.ingress_interface;
-        let egress_iface = reservation.info.egress_interface;
-
-        self.hopfields_with_infofield()
-            .find(|(info, hop)| {
-                // Note: The reservation is only applicable in one direction.
-                !hop.is_flyover() && (ingress_iface, egress_iface) == hop.interfaces(info.cons_dir)
-            })
-            .map(|(_, hop)| hop)
-    }
-
-    fn applicable_reservations(&self) -> impl Iterator<Item = &Reservation> {
-        self.reservations
-            .iter()
-            .filter(|r| self.applicable_hop_field(r).is_some())
     }
 
     /// Return an iterator over the segments on this path.
@@ -676,7 +686,23 @@ impl HummingbirdPath {
     }
 
     /// The length if it were to be encoded now.
+    ///
+    /// Note that adding segments or reservations after calling this method
+    /// may change the encoded length.
     pub fn encoded_length(&self) -> usize {
+        let hop_fields_with_applicable_reservations = self
+            .hopfields_with_infofield()
+            .filter(|(info_field, hop_field)| {
+                let (ingress, egress) = hop_field.interfaces(info_field.cons_dir);
+                let interfaces = ReservationInterfaces {
+                    ingress_interface: ingress,
+                    egress_interface: egress,
+                };
+
+                self.reservations.contains_key(&interfaces)
+            })
+            .count();
+
         self.path_meta.encoded_length()
             + self
                 .info_fields
@@ -689,16 +715,21 @@ impl HummingbirdPath {
                 .flat_map(|s| s.iter())
                 .map(|f| f.encoded_length())
                 .sum::<usize>()
-            + self.applicable_reservations().count()
+            + hop_fields_with_applicable_reservations
                 * (FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE)
     }
 
     /// Apply reservations by turning applicable hop fields into flyover hop
     /// fields, adjusting segment lengths and current hop field index.
     ///
+    /// Both the reservations added using [add_reservation][Self::add_reservation] and the
+    /// provided `additional_reservations` are applied. The `additional_reservations` are not
+    /// stored in the path, but are only applied for this encoding.
+    ///
     /// If `unchecked` is true, then this method will not return an error.
     fn apply_reservations(
         &mut self,
+        additional_reservations: Option<&HashMap<ReservationInterfaces, Vec<Reservation>>>,
         destination: IsdAsn,
         payload_len: u16,
         unchecked: bool,
@@ -706,75 +737,80 @@ impl HummingbirdPath {
         let meta_header = self.path_meta;
         let mut curr_hf_index = meta_header.current_hop_field.byte_offset();
 
-        // Apply reservations by replacing regular hop fields with flyover hop fields.
-        for r in self.reservations.iter() {
-            let ingress_iface = r.info.ingress_interface;
-            let egress_iface = r.info.egress_interface;
+        let mut seglens = [0; 3];
 
-            // Track the byte offset of each hop field as we scan, so that we can
-            // determine whether the matched hop field is before the current hop
-            // field index (and thus whether the index needs to be adjusted).
-            let mut scanned_offset = 0usize;
+        // Create iterator over hop fields with the corresponding info field
+        let hop_fields = self
+            .segments
+            .iter_mut()
+            .enumerate()
+            .zip(self.info_fields.iter())
+            .flat_map(|((segment_idx, segment), info_field)| {
+                segment
+                    .iter_mut()
+                    .map(move |hop_field| (hop_field, info_field, segment_idx))
+            });
 
-            let found = self
-                .segments
-                .iter_mut()
-                .zip(self.info_fields.iter())
-                .flat_map(|(segment, info_field)| {
-                    segment
-                        .iter_mut()
-                        .map(move |hop_field| (info_field, hop_field))
-                })
-                // Find the matching hop field while accumulating its byte offset.
-                // A reservation is only ever applicable to one hop field per path.
-                .find_map(|(info, hop)| {
-                    let this_offset = scanned_offset;
-                    scanned_offset += hop.encoded_length();
-                    // Note: The reservation is only applicable in one direction.
-                    if !hop.is_flyover()
-                        && (ingress_iface, egress_iface) == hop.interfaces(info.cons_dir)
-                    {
-                        Some((hop, this_offset))
-                    } else {
-                        None
-                    }
-                });
+        // Keep track of byte offset of hop fields as we iterate through them
+        let mut hop_offset = 0;
 
-            if let Some((hf, hop_offset)) = found {
-                // If the matched hop field is before the current hop field, the
-                // current hop field's byte offset must be advanced by the size
-                // difference between a flyover and a standard hop field.
-                let is_before = hop_offset < meta_header.current_hop_field.byte_offset();
+        let get_applicable_reservations = |interfaces: ReservationInterfaces| {
+            self.reservations
+                .get(&interfaces)
+                .into_iter()
+                .flatten()
+                .chain(
+                    additional_reservations
+                        .and_then(|ar| ar.get(&interfaces))
+                        .into_iter()
+                        .flatten(),
+                )
+        };
 
-                if let HummingbirdHopField::Standard(sp) = hf {
-                    *hf = HummingbirdHopField::Flyover(sp.apply_reservation(
+        for (hop, info, seg_idx) in hop_fields {
+            // Calculate normalised interfaces
+            let (ingress, egress) = hop.interfaces(info.cons_dir);
+            let interfaces = ReservationInterfaces {
+                ingress_interface: ingress,
+                egress_interface: egress,
+            };
+
+            // Fetch applicable reservation
+            // TOOD: Smarter reservation selection if multiple reservations are applicable
+            let applicable_reservation = get_applicable_reservations(interfaces).next();
+            if let Some(applicable_reservation) = applicable_reservation {
+                if let HummingbirdHopField::Standard(sp) = hop {
+                    *hop = HummingbirdHopField::Flyover(sp.apply_reservation(
                         meta_header,
-                        r,
+                        applicable_reservation,
                         destination,
                         payload_len,
                     )?);
                 }
 
-                if is_before {
+                // If the matched hop field is before the current hop field, the
+                // current hop field's byte offset must be advanced by the size
+                // difference between a flyover and a standard hop field.
+                if hop_offset < meta_header.current_hop_field.byte_offset() {
                     curr_hf_index += FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE;
                 }
             }
+
+            // Advance hop offset
+            hop_offset += hop.encoded_length();
+
+            // Increase segment length counters for each segment the hop field is in.
+            seglens[seg_idx] += hop.encoded_length();
         }
 
         // Adjust segment lengths
-        for (idx, segment) in self.segments.iter().enumerate() {
-            let seg_len = segment
-                .iter()
-                .map(WireEncode::encoded_length)
-                .sum::<usize>();
-
-            if unchecked {
-                self.path_meta.segment_lengths[idx] =
-                    HummingbirdSegmentLength::new_unchecked(seg_len);
+        for seg_idx in 0..3 {
+            self.path_meta.segment_lengths[seg_idx] = if unchecked {
+                HummingbirdSegmentLength::new_unchecked(seglens[seg_idx])
             } else {
-                self.path_meta.segment_lengths[idx] = HummingbirdSegmentLength::new(seg_len)
-                    .ok_or(HummingbirdPathBuilderError::SegmentTooLong)?;
-            }
+                HummingbirdSegmentLength::new(seglens[seg_idx])
+                    .ok_or(HummingbirdPathBuilderError::SegmentTooLong)?
+            };
         }
 
         // Adjust current hop field index in meta header.
@@ -796,17 +832,20 @@ impl HummingbirdPath {
     /// Parameters:
     /// - `destination`: The destination ISD-AS of the path, used for calculating the
     ///   flyover hop field MACs.
-    /// - `payload_len`: the length of the payload contained in the packet 
+    /// - `payload_len`: the length of the payload contained in the packet
     ///   (number of bytes). Used for flyover MAC calculations.
+    /// - `additional_reservations`: Additional reservations to apply only for this
+    ///   particular encoding of the path.
     ///
     /// See [encoded_length][Self::encoded_length] for the length of the resulting encoding.
     pub fn encode_to<T: BufMut>(
         &mut self,
         destination: IsdAsn,
         payload_len: u16,
+        additional_reservations: Option<&HashMap<ReservationInterfaces, Vec<Reservation>>>,
         buffer: &mut T,
     ) -> Result<(), HummingbirdPathBuilderError> {
-        self.apply_reservations(destination, payload_len, false)?;
+        self.apply_reservations(additional_reservations, destination, payload_len, false)?;
 
         // Encode fields to buffer
         self.path_meta.encode_to_unchecked(buffer);
@@ -828,17 +867,20 @@ impl HummingbirdPath {
     /// Parameters:
     /// - `destination`: The destination ISD-AS of the path, used for calculating the
     ///   flyover hop field MACs.
-    /// - `payload_len`: the length of the payload contained in the packet 
+    /// - `payload_len`: the length of the payload contained in the packet
     ///   (number of bytes). Used for flyover MAC calculations.
+    /// - `additional_reservations`: Additional reservations to apply only for this
+    ///   particular encoding of the path.
     ///
     /// See [encoded_length][Self::encoded_length] for the length of the resulting encoding.
     pub fn encode_to_unchecked<T: BufMut>(
         &mut self,
         destination: IsdAsn,
         payload_len: u16,
+        additional_reservations: Option<&HashMap<ReservationInterfaces, Vec<Reservation>>>,
         buffer: &mut T,
     ) {
-        self.apply_reservations(destination, payload_len, true)
+        self.apply_reservations(additional_reservations, destination, payload_len, true)
             .expect("applying reservations should succeed in unchecked mode");
 
         // Encode fields to buffer
@@ -858,13 +900,21 @@ impl HummingbirdPath {
     ///   flyover hop field MACs.
     /// - `payload_len`: the length of the payload contained in the packet
     ///   (number of bytes). Used for flyover MAC calculations.
+    /// - `additional_reservations`: Additional reservations to apply only for this
+    ///   particular encoding of the path.
     pub fn to_encoded(
         &mut self,
         destination: IsdAsn,
         payload_len: u16,
+        additional_reservations: Option<&HashMap<ReservationInterfaces, Vec<Reservation>>>,
     ) -> Result<EncodedHummingbirdPath<Bytes>, HummingbirdPathBuilderError> {
         let mut buffer = vec![0u8; self.encoded_length()];
-        self.encode_to(destination, payload_len, &mut buffer)?;
+        self.encode_to(
+            destination,
+            payload_len,
+            additional_reservations,
+            &mut buffer,
+        )?;
 
         Ok(EncodedHummingbirdPath {
             meta_header: self.path_meta,
@@ -920,17 +970,14 @@ impl WireDecode<Bytes> for HummingbirdPath {
             path_meta: meta_header,
             info_fields,
             segments,
-            reservations: vec![],
+            reservations: HashMap::new(),
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        num::NonZeroU16,
-        time::{Duration, UNIX_EPOCH},
-    };
+    use std::num::NonZeroU16;
 
     use bytes::Bytes;
     use chrono::TimeZone;
@@ -1674,7 +1721,7 @@ mod tests {
         let len = path.encoded_length();
         let mut buf = vec![0u8; len];
         let mut slice: &mut [u8] = &mut buf;
-        path.encode_to_unchecked(dst, 100, &mut slice);
+        path.encode_to_unchecked(dst, 100, None, &mut slice);
         Bytes::from(buf)
     }
 
@@ -1805,7 +1852,7 @@ mod tests {
         let dst = IsdAsn::new(Isd::new(2), Asn::new(2));
         let mut buf = vec![0u8; path.encoded_length()];
         let mut slice: &mut [u8] = &mut buf;
-        path.encode_to_unchecked(dst, 100, &mut slice);
+        path.encode_to_unchecked(dst, 100, None, &mut slice);
 
         // After the meta header (12) and one info field (8), the flyover hop starts at 20.
         // FlyoverHopField layout (after flags[0], exp_time[1], cons_ingress[2..4], cons_egress[4..6],
@@ -1878,7 +1925,7 @@ mod tests {
         let dst = IsdAsn::new(Isd::new(2), Asn::new(2));
         let mut buf = vec![0u8; path.encoded_length()];
         let mut slice: &mut [u8] = &mut buf;
-        path.encode_to_unchecked(dst, 100, &mut slice);
+        path.encode_to_unchecked(dst, 100, None, &mut slice);
 
         // Decode and check the current_hop_field in the encoded meta header.
         let mut bytes = Bytes::from(buf);
@@ -1909,7 +1956,7 @@ mod tests {
         let dst = IsdAsn::new(Isd::new(2), Asn::new(2));
         let mut buf = vec![0u8; path.encoded_length()];
         let mut slice: &mut [u8] = &mut buf;
-        path.encode_to_unchecked(dst, 100, &mut slice);
+        path.encode_to_unchecked(dst, 100, None, &mut slice);
 
         let mut bytes = Bytes::from(buf);
         let decoded = EncodedHummingbirdPath::decode(&mut bytes).unwrap();
