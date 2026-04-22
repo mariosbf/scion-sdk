@@ -95,6 +95,8 @@ mod pathset;
 pub mod reliability;
 /// Path fetcher traits and types.
 pub mod traits;
+/// Path manager for use with Hummingbird reservations.
+pub mod hummingbird;
 
 /// Configuration for the MultiPathManager.
 #[derive(Debug, Clone, Copy)]

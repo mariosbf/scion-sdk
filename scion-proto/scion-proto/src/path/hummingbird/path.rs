@@ -500,6 +500,9 @@ pub struct ReservationInterfaces {
     egress_interface: u16,
 }
 
+/// A mapping from interface pairs to reservations.
+pub type ReservationMap = HashMap<ReservationInterfaces, Vec<Reservation>>;
+
 /// A fully decoded Hummingbird data plane path. It can be used to build new paths
 /// or to modify existing ones. If you only need to read information, use
 /// [EncodedHummingbirdPath] instead for better performance.
@@ -528,7 +531,7 @@ pub struct HummingbirdPath {
     segments: Vec<Vec<HummingbirdHopField>>,
 
     /// Reservations to apply when encoding
-    reservations: HashMap<ReservationInterfaces, Vec<Reservation>>,
+    reservations: ReservationMap,
 }
 
 impl HummingbirdPath {
@@ -645,7 +648,7 @@ impl HummingbirdPath {
 
         self.reservations
             .entry(interfaces)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(reservation);
 
         Ok(())
@@ -729,7 +732,7 @@ impl HummingbirdPath {
     /// If `unchecked` is true, then this method will not return an error.
     fn apply_reservations(
         &mut self,
-        additional_reservations: Option<&HashMap<ReservationInterfaces, Vec<Reservation>>>,
+        additional_reservations: Option<&ReservationMap>,
         destination: IsdAsn,
         payload_len: u16,
         unchecked: bool,
@@ -842,7 +845,7 @@ impl HummingbirdPath {
         &mut self,
         destination: IsdAsn,
         payload_len: u16,
-        additional_reservations: Option<&HashMap<ReservationInterfaces, Vec<Reservation>>>,
+        additional_reservations: Option<&ReservationMap>,
         buffer: &mut T,
     ) -> Result<(), HummingbirdPathBuilderError> {
         self.apply_reservations(additional_reservations, destination, payload_len, false)?;
@@ -877,7 +880,7 @@ impl HummingbirdPath {
         &mut self,
         destination: IsdAsn,
         payload_len: u16,
-        additional_reservations: Option<&HashMap<ReservationInterfaces, Vec<Reservation>>>,
+        additional_reservations: Option<&ReservationMap>,
         buffer: &mut T,
     ) {
         self.apply_reservations(additional_reservations, destination, payload_len, true)
@@ -906,7 +909,7 @@ impl HummingbirdPath {
         &mut self,
         destination: IsdAsn,
         payload_len: u16,
-        additional_reservations: Option<&HashMap<ReservationInterfaces, Vec<Reservation>>>,
+        additional_reservations: Option<&ReservationMap>,
     ) -> Result<EncodedHummingbirdPath<Bytes>, HummingbirdPathBuilderError> {
         let mut buffer = vec![0u8; self.encoded_length()];
         self.encode_to(
