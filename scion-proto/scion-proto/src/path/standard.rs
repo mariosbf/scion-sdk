@@ -24,8 +24,7 @@ use crate::{
     address::IsdAsn,
     packet::{DecodeError, InadequateBufferSize},
     path::hummingbird::{
-        FlyoverHopField, HummingbirdCounter, HummingbirdHopField, HummingbirdMetaHeader,
-        HummingbirdPath, calculate_flyover_mac, calculate_hbird_auth_key, xor_in_place,
+        calculate_flyover_mac, calculate_hbird_auth_key, xor_in_place, FlyoverHopField, HummingbirdCounter, HummingbirdHopField, HummingbirdMetaHeader, HummingbirdPath, FlyoverMacCalculationError
     },
     wire_encoding::{WireDecode, WireEncode},
 };
@@ -390,8 +389,8 @@ impl StandardHopField {
         meta_header: HummingbirdMetaHeader,
         reservation: &crate::hummingbird::Reservation,
         destination: IsdAsn,
-        pkt_len: u16,
-    ) -> FlyoverHopField {
+        payload_len: u16,
+    ) -> Result<FlyoverHopField, FlyoverMacCalculationError> {
         let flyover_key = calculate_hbird_auth_key(
             self.cons_ingress,
             self.cons_egress,
@@ -408,16 +407,16 @@ impl StandardHopField {
         let flyover_mac = calculate_flyover_mac(
             destination.isd(),
             destination.asn(),
-            pkt_len,
+            payload_len,
             res_start_offset,
             meta_header.millis_timestamp(),
             meta_header.counter(),
             &flyover_key,
-        );
+        )?;
         let mut mac = self.mac;
         xor_in_place(&mut mac, &flyover_mac);
 
-        FlyoverHopField {
+        Ok(FlyoverHopField {
             ingress_router_alert: self.ingress_router_alert,
             egress_router_alert: self.egress_router_alert,
             exp_time: self.exp_time,
@@ -428,7 +427,7 @@ impl StandardHopField {
             res_bw: reservation.info.bandwidth,
             res_start_offset,
             res_duration: reservation.info.duration,
-        }
+        })
     }
 }
 
