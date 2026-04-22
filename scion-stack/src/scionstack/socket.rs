@@ -423,6 +423,7 @@ impl<P: PathManager> UdpScionSocket<P> {
             .path_timeout(
                 self.socket.local_addr().isd_asn(),
                 remote_addr.isd_asn(),
+                None,
                 Utc::now(),
                 self.connect_timeout,
             )
@@ -454,6 +455,7 @@ impl<P: PathManager> UdpScionSocket<P> {
             .path_wait(
                 self.socket.local_addr().isd_asn(),
                 destination.isd_asn(),
+                Some(payload.len()),
                 Utc::now(),
             )
             .await?;
