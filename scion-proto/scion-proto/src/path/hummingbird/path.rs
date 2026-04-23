@@ -911,12 +911,14 @@ impl HummingbirdPath {
         payload_len: u16,
         additional_reservations: Option<&ReservationMap>,
     ) -> Result<EncodedHummingbirdPath<Bytes>, HummingbirdPathBuilderError> {
-        let mut buffer = vec![0u8; self.encoded_length()];
+        let len = self.encoded_length();
+        let mut buffer = vec![0u8; len];
+        let mut slice: &mut [u8] = &mut buffer;
         self.encode_to(
             destination,
             payload_len,
             additional_reservations,
-            &mut buffer,
+            &mut slice,
         )?;
 
         Ok(EncodedHummingbirdPath {
