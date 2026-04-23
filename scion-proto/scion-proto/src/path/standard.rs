@@ -25,7 +25,9 @@ use crate::{
     address::IsdAsn,
     packet::{DecodeError, InadequateBufferSize},
     path::hummingbird::{
-        calculate_flyover_mac, calculate_hbird_auth_key, xor_in_place, FlyoverHopField, HummingbirdCounter, HummingbirdHopField, HummingbirdMetaHeader, HummingbirdPath, FlyoverMacCalculationError
+        FlyoverHopField, FlyoverMacCalculationError, HummingbirdCounter, HummingbirdHopField,
+        HummingbirdMetaHeader, HummingbirdPath, calculate_flyover_mac, calculate_hbird_auth_key,
+        xor_in_place,
     },
     wire_encoding::{WireDecode, WireEncode},
 };
@@ -441,7 +443,7 @@ impl StandardHopField {
         meta_header: HummingbirdMetaHeader,
         reservation: &crate::hummingbird::Reservation,
         destination: IsdAsn,
-        payload_len: u16,
+        pkt_len: u16,
     ) -> Result<FlyoverHopField, FlyoverMacCalculationError> {
         let flyover_key = calculate_hbird_auth_key(
             self.cons_ingress,
@@ -459,12 +461,12 @@ impl StandardHopField {
         let flyover_mac = calculate_flyover_mac(
             destination.isd(),
             destination.asn(),
-            payload_len,
+            pkt_len,
             res_start_offset,
             meta_header.millis_timestamp(),
             meta_header.counter(),
             &flyover_key,
-        )?;
+        );
         let mut mac = self.mac;
         xor_in_place(&mut mac, &flyover_mac);
 

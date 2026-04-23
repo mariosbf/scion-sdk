@@ -11,7 +11,6 @@ use aes::cipher::{BlockEncrypt, consts::U16, generic_array::GenericArray};
 use crate::{
     address::{Asn, Isd},
     hummingbird::Bandwidth,
-    packet::CommonHeader,
 };
 
 /// 16-byte keys from which ASes derive Hummingbird authentication keys.
@@ -44,12 +43,12 @@ pub enum FlyoverMacCalculationError {
 pub fn calculate_flyover_mac(
     dst_isd: Isd,
     dst_as: Asn,
-    payload_len: u16,
+    pkt_len: u16,
     res_start_offset: u16,
     millis_timestamp: u16,
     counter: u32,
     key: &HbirdAuthKey,
-) -> Result<[u8; 6], FlyoverMacCalculationError> {
+) -> [u8; 6] {
     use cmac::Mac;
 
     // Input data format (all fields are BE):
@@ -69,9 +68,6 @@ pub fn calculate_flyover_mac(
     let destination_address = ((dst_isd.0 as u64) << 48) | (dst_as.0 & 0xFFFFFFFFFFFF);
     let millis_and_counter = (((millis_timestamp & 0x3FF) as u32) << 22) | (counter & 0x3FFFFF);
 
-    let pkt_len = payload_len.checked_add(4 * CommonHeader::LENGTH as u16)
-        .ok_or(FlyoverMacCalculationError::PacketLengthOverflow)?;
-
     let mut mac_input_data = [0u8; 16];
     mac_input_data[0..8].copy_from_slice(&destination_address.to_be_bytes());
     mac_input_data[8..10].copy_from_slice(&pkt_len.to_be_bytes());
@@ -87,7 +83,7 @@ pub fn calculate_flyover_mac(
     let mut result = [0u8; 6];
     result.copy_from_slice(&mac[..6]);
 
-    Ok(result)
+    result
 }
 
 /// Derives the Hummingbird auth key for a reservation from the reservation key

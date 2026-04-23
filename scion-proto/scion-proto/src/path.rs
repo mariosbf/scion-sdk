@@ -369,12 +369,15 @@ impl Path<Bytes> {
     /// - `counter`: the counter to use in the Hummingbird path meta header, if desired.
     /// - `payload_len`: the length of the payload contained in the packet
     ///   (number of bytes). Used for flyover MAC calculations.
+    /// - `address_header_len`: the length of the address header (number of bytes). Used for
+    ///    flyover MAC calculations.
     pub fn with_reservations_and_timestamp(
         self,
         reservations: impl IntoIterator<Item = Reservation>,
         timestamp: DateTime<Utc>,
         counter: Option<HummingbirdCounter>,
         payload_len: u16,
+        address_header_len: u16,
     ) -> Result<Self, ApplyReservationError> {
         let mut hbird_path = match self.data_plane_path {
             DataPlanePath::EmptyPath => return Ok(self),
@@ -398,7 +401,12 @@ impl Path<Bytes> {
             hbird_path.add_reservation(r)?;
         }
 
-        let encoded_p = hbird_path.to_encoded(self.isd_asn.destination, payload_len, None)?;
+        let encoded_p = hbird_path.to_encoded(
+            self.isd_asn.destination,
+            payload_len,
+            address_header_len,
+            None,
+        )?;
         let data_plane_path = DataPlanePath::Hummingbird(encoded_p);
 
         Ok(Self {
