@@ -496,8 +496,8 @@ impl From<InadequateBufferSize> for HummingbirdPathBuilderError {
 /// A pair of ingress and egress interfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ReservationInterfaces {
-    ingress_interface: u16,
-    egress_interface: u16,
+    pub ingress_interface: u16,
+    pub egress_interface: u16,
 }
 
 /// A mapping from interface pairs to reservations.

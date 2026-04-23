@@ -21,7 +21,17 @@
 //! needed. Scores from multiple metrics can be weighted to reflect their relative importance in
 //! path selection.
 
-use std::{collections::BTreeMap, fmt::Display, sync::Arc, time::SystemTime};
+use std::{
+    collections::BTreeMap,
+    fmt::Display,
+    sync::{Arc, RwLock},
+    time::SystemTime,
+};
+
+use scion_proto::path::{
+    EncodedHopField,
+    hummingbird::{ReservationInterfaces, ReservationMap},
+};
 
 use crate::path::types::{PathManagerPath, Score};
 
@@ -87,6 +97,111 @@ impl PathScoring for PathLengthScorer {
         const PER_HOP_PENALTY: f32 = (MAX_SCORE - MIN_SCORE) / HOP_COUNT_FOR_MIN_SCORE;
         let score_value = MAX_SCORE - (length as f32 * PER_HOP_PENALTY);
         Score::new_clamped(score_value)
+    }
+}
+
+/// Scores paths based on their Hummingbird coverage.
+/// Paths with more Hummingbird hops receive higher scores.
+pub struct PathHbirdCoverageScorer {
+    /// Reservations that are taken into account.
+    reservations: Arc<RwLock<ReservationMap>>,
+}
+
+impl PathHbirdCoverageScorer {
+    /// Creates a new PathHbirdCoverageScorer with the given reservations.
+    pub fn new(reservations: Arc<RwLock<ReservationMap>>) -> Self {
+        Self { reservations }
+    }
+}
+
+impl PathScoring for PathHbirdCoverageScorer {
+    fn metric_name(&self) -> &'static str {
+        "Hummingbird Coverage"
+    }
+
+    fn score(&self, path: &PathManagerPath, now: SystemTime) -> Score {
+        let reservations = self.reservations.read().unwrap();
+        let (total_hops, covered_hops) = match &path.path.data_plane_path {
+            scion_proto::path::DataPlanePath::EmptyPath => (0, 0),
+            scion_proto::path::DataPlanePath::Standard(p) => {
+                let mut total_hops = 0;
+                let mut covered_hops = 0;
+
+                for segment in p.segments() {
+                    let info = segment.info_field();
+
+                    for hop in segment.hop_fields() {
+                        total_hops += 1;
+
+                        let interfaces = ReservationInterfaces {
+                            ingress_interface: hop
+                                .ingress_interface(info)
+                                .map(|v| v.get())
+                                .unwrap_or(0),
+                            egress_interface: hop
+                                .egress_interface(info)
+                                .map(|v| v.get())
+                                .unwrap_or(0),
+                        };
+
+                        if reservations.contains_key(&interfaces) {
+                            covered_hops += 1;
+                        }
+                    }
+                }
+
+                (total_hops, covered_hops)
+            }
+            scion_proto::path::DataPlanePath::Hummingbird(p) => {
+                let mut total_hops = 0;
+                let mut covered_hops = 0;
+
+                for segment in p.segments() {
+                    let info = segment.info_field();
+
+                    for hop in segment.hop_fields() {
+                        total_hops += 1;
+
+                        let interfaces = ReservationInterfaces {
+                            ingress_interface: hop
+                                .ingress_interface(info)
+                                .map(|v| v.get())
+                                .unwrap_or(0),
+                            egress_interface: hop
+                                .egress_interface(info)
+                                .map(|v| v.get())
+                                .unwrap_or(0),
+                        };
+
+                        let have_reservation = reservations
+                            .get(&interfaces)
+                            .is_some_and(|v| !v.iter().any(|r| !r.is_expired_at(now)));
+
+                        if have_reservation || hop.is_flyover() {
+                            covered_hops += 1;
+                        }
+                    }
+                }
+
+                (total_hops, covered_hops)
+            }
+            scion_proto::path::DataPlanePath::Unsupported { .. } => {
+                // Assume that unsupported paths have no Hummingbird coverage.
+                return Score::new_clamped(-1.0);
+            }
+        };
+
+        if total_hops == 0 {
+            // Every hop is covered by Hummingbird.
+            return Score::new_clamped(1.0);
+        }
+
+        let covered_hops = covered_hops as f32;
+        let total_hops = total_hops as f32;
+
+        let percentage_covered = covered_hops / total_hops;
+
+        Score::new_clamped(percentage_covered * 2.0 - 1.0)
     }
 }
 
@@ -212,13 +327,23 @@ impl Display for ScoreReport {
 mod tests {
     use std::{
         cmp::Ordering,
+        collections::HashMap,
         hash::{DefaultHasher, Hash, Hasher},
         net::{IpAddr, Ipv4Addr},
+        time::SystemTime,
     };
 
+    use bytes::Bytes;
+    use chrono::{TimeZone, Utc};
     use scion_proto::{
         address::{Asn, EndhostAddr, Isd, IsdAsn},
-        path::{Path, test_builder::TestPathBuilder},
+        hummingbird::{Bandwidth, Reservation, ReservationInfo},
+        packet::ByEndpoint,
+        path::{
+            DataPlanePath, InfoField, Path, PathType, StandardHopField,
+            hummingbird::{HummingbirdHopField, HummingbirdPath},
+            test_builder::TestPathBuilder,
+        },
     };
 
     use super::*;
@@ -383,6 +508,199 @@ mod tests {
                 .unwrap()
                 .0
         }
+    }
+
+    // --- PathHbirdCoverageScorer helpers ---
+
+    fn empty_scorer_reservations() -> Arc<RwLock<ReservationMap>> {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    fn scorer_reservations(interfaces: &[(u16, u16)]) -> Arc<RwLock<ReservationMap>> {
+        let mut map: ReservationMap = HashMap::new();
+        for &(ingress, egress) in interfaces {
+            map.insert(
+                ReservationInterfaces {
+                    ingress_interface: ingress,
+                    egress_interface: egress,
+                },
+                vec![Reservation {
+                    info: ReservationInfo {
+                        isd_as: SRC_ADDR.isd_asn(),
+                        ingress_interface: ingress,
+                        egress_interface: egress,
+                        res_id: 1,
+                        bandwidth: Bandwidth::from_kbps(1000).unwrap(),
+                        start: 0,  // Tests assume current time is UNIX_EPOCH
+                        duration: 100,   // Lasts for 100 seconds
+                    },
+                    reservation_key: [0u8; 16].into(),
+                }],
+            );
+        }
+        Arc::new(RwLock::new(map))
+    }
+
+    fn wrap_dp(dp: DataPlanePath) -> PathManagerPath {
+        PathManagerPath::new(Path {
+            data_plane_path: dp,
+            underlay_next_hop: None,
+            isd_asn: ByEndpoint {
+                source: SRC_ADDR.isd_asn(),
+                destination: DST_ADDR.isd_asn(),
+            },
+            metadata: None,
+        })
+    }
+
+    /// Builds a Hummingbird path (cons_dir=true) with the given hop interface pairs.
+    /// Hops whose interfaces appear in `flyover_interfaces` are encoded as flyover hops.
+    fn build_hbird_path(
+        hop_pairs: &[(u16, u16)],
+        flyover_interfaces: &[(u16, u16)],
+    ) -> DataPlanePath {
+        let dst = DST_ADDR.isd_asn();
+        let mut hpath =
+            HummingbirdPath::new_with_timestamp(Utc.timestamp_opt(1000, 0).single().unwrap(), None);
+
+        let hop_fields: Vec<HummingbirdHopField> = hop_pairs
+            .iter()
+            .map(|&(ing, eg)| {
+                HummingbirdHopField::Standard(StandardHopField {
+                    ingress_router_alert: false,
+                    egress_router_alert: false,
+                    exp_time: 63,
+                    cons_ingress: ing,
+                    cons_egress: eg,
+                    mac: [0u8; 6],
+                })
+            })
+            .collect();
+
+        hpath
+            .add_segment(
+                InfoField {
+                    peer: false,
+                    cons_dir: true,
+                    seg_id: 0,
+                    timestamp_epoch: 1000,
+                },
+                hop_fields,
+            )
+            .unwrap();
+
+        for &(ing, eg) in flyover_interfaces {
+            hpath
+                .add_reservation(Reservation {
+                    info: ReservationInfo {
+                        isd_as: SRC_ADDR.isd_asn(),
+                        ingress_interface: ing,
+                        egress_interface: eg,
+                        res_id: 1,
+                        bandwidth: Bandwidth::from_kbps(1000).unwrap(),
+                        start: 900,
+                        duration: 200,
+                    },
+                    reservation_key: [0u8; 16].into(),
+                })
+                .unwrap();
+        }
+
+        let encoded = hpath.to_encoded(dst, 100, None).unwrap();
+        DataPlanePath::Hummingbird(encoded)
+    }
+
+    fn cov_score(scorer: &PathHbirdCoverageScorer, path: &PathManagerPath) -> f32 {
+        PathScoring::score(scorer, path, SystemTime::UNIX_EPOCH).value()
+    }
+
+    // --- PathHbirdCoverageScorer tests ---
+
+    #[test]
+    fn hbird_coverage_empty_path_returns_max_score() {
+        let scorer = PathHbirdCoverageScorer::new(empty_scorer_reservations());
+        let path = wrap_dp(DataPlanePath::EmptyPath);
+        assert_eq!(cov_score(&scorer, &path), 1.0);
+    }
+
+    #[test]
+    fn hbird_coverage_unsupported_path_returns_min_score() {
+        let scorer = PathHbirdCoverageScorer::new(empty_scorer_reservations());
+        let path = wrap_dp(DataPlanePath::Unsupported {
+            path_type: PathType::Other(99),
+            bytes: Bytes::new(),
+        });
+        assert_eq!(cov_score(&scorer, &path), -1.0);
+    }
+
+    #[test]
+    fn hbird_coverage_standard_path_no_reservations_returns_min_score() {
+        let scorer = PathHbirdCoverageScorer::new(empty_scorer_reservations());
+        let p = TestPathBuilder::new(SRC_ADDR, DST_ADDR)
+            .down()
+            .add_hop(0, 1)
+            .add_hop(1, 0)
+            .build(1000)
+            .path();
+        assert_eq!(cov_score(&scorer, &PathManagerPath::new(p)), -1.0);
+    }
+
+    #[test]
+    fn hbird_coverage_standard_path_all_covered_returns_max_score() {
+        // 2-hop down segment (cons_dir=true): ingress/egress interfaces are {0,1} and {1,0}.
+        let scorer = PathHbirdCoverageScorer::new(scorer_reservations(&[(0, 1), (1, 0)]));
+        let p = TestPathBuilder::new(SRC_ADDR, DST_ADDR)
+            .down()
+            .add_hop(0, 1)
+            .add_hop(1, 0)
+            .build(1000)
+            .path();
+        assert_eq!(cov_score(&scorer, &PathManagerPath::new(p)), 1.0);
+    }
+
+    #[test]
+    fn hbird_coverage_standard_path_half_covered_returns_zero() {
+        // 2 hops, 1 matching reservation → 50% coverage → score = 0.0.
+        let scorer = PathHbirdCoverageScorer::new(scorer_reservations(&[(0, 1)]));
+        let p = TestPathBuilder::new(SRC_ADDR, DST_ADDR)
+            .down()
+            .add_hop(0, 1)
+            .add_hop(1, 0)
+            .build(1000)
+            .path();
+        assert_eq!(cov_score(&scorer, &PathManagerPath::new(p)), 0.0);
+    }
+
+    #[test]
+    fn hbird_coverage_hbird_all_flyover_returns_max_score() {
+        // Both hops are flyover → 100% covered regardless of scorer reservations.
+        let scorer = PathHbirdCoverageScorer::new(empty_scorer_reservations());
+        let path = wrap_dp(build_hbird_path(&[(1, 2), (3, 4)], &[(1, 2), (3, 4)]));
+        assert_eq!(cov_score(&scorer, &path), 1.0);
+    }
+
+    #[test]
+    fn hbird_coverage_hbird_no_flyover_no_reservations_returns_min_score() {
+        // All standard hops, no scorer reservations → 0% covered.
+        let scorer = PathHbirdCoverageScorer::new(empty_scorer_reservations());
+        let path = wrap_dp(build_hbird_path(&[(1, 2), (3, 4)], &[]));
+        assert_eq!(cov_score(&scorer, &path), -1.0);
+    }
+
+    #[test]
+    fn hbird_coverage_hbird_half_flyover_returns_zero() {
+        // 2 hops, 1 flyover → 50% → score = 0.0.
+        let scorer = PathHbirdCoverageScorer::new(empty_scorer_reservations());
+        let path = wrap_dp(build_hbird_path(&[(1, 2), (3, 4)], &[(1, 2)]));
+        assert_eq!(cov_score(&scorer, &path), 0.0);
+    }
+
+    #[test]
+    fn hbird_coverage_hbird_standard_hop_covered_by_scorer_reservation() {
+        // Standard hops on a Hummingbird path covered by scorer reservations → 100%.
+        let scorer = PathHbirdCoverageScorer::new(scorer_reservations(&[(1, 2), (3, 4)]));
+        let path = wrap_dp(build_hbird_path(&[(1, 2), (3, 4)], &[]));
+        assert_eq!(cov_score(&scorer, &path), 1.0);
     }
 
     #[test]

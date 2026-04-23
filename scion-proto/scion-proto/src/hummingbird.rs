@@ -2,6 +2,8 @@
 //!
 //! See also [path::hummingbird].
 
+use std::time::SystemTime;
+
 use crate::{address::IsdAsn, path::hummingbird::HbirdAuthKey};
 
 /// Bandwidth for Hummingbird reservations.  
@@ -125,6 +127,23 @@ pub struct Reservation {
 
     /// The path for which bandwidth was reserved.
     pub reservation_key: HbirdAuthKey,
+}
+
+impl Reservation {
+    /// Returns whether the reservation has expired.
+    pub fn is_expired(&self) -> bool {
+        self.is_expired_at(SystemTime::now())
+    }
+
+    /// Returns whether the reservation is expired at the given point in time.
+    pub fn is_expired_at(&self, time: SystemTime) -> bool {
+        let time = time
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        self.info.start as u64 + (self.info.duration as u64) > time
+    }
 }
 
 #[cfg(test)]
