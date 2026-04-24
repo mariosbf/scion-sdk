@@ -62,13 +62,7 @@ pub fn to_proto_requests(
 pub fn from_proto_requests(
     req: v1::RedemptionRequests,
 ) -> Result<(Vec<RedemptionRequest>, ClientKey), HbirdRedemptionError> {
-    let client_key_bytes: [u8; 64] = req.client_key.try_into().map_err(|v: Vec<u8>| {
-        HbirdRedemptionError::InvalidReservation(format!(
-            "client_key must be 64 bytes, got {}",
-            v.len()
-        ))
-    })?;
-    let client_key = ClientKey(client_key_bytes);
+    let client_key = ClientKey(req.client_key);
 
     let requests = req
         .redemption
@@ -88,25 +82,19 @@ fn from_proto_request(
 
     let info = from_proto_redemption_info(red_info)?;
 
-    let ingress_token_bytes: [u8; 16] =
-        req.ingress_token
-            .try_into()
-            .map_err(|v: Vec<u8>| {
-                HbirdRedemptionError::InvalidReservation(format!(
-                    "ingress_token must be 16 bytes, got {}",
-                    v.len()
-                ))
-            })?;
+    let ingress_token_bytes: [u8; 16] = req.ingress_token.try_into().map_err(|v: Vec<u8>| {
+        HbirdRedemptionError::InvalidReservation(format!(
+            "ingress_token must be 16 bytes, got {}",
+            v.len()
+        ))
+    })?;
 
-    let egress_token_bytes: [u8; 16] =
-        req.egress_token
-            .try_into()
-            .map_err(|v: Vec<u8>| {
-                HbirdRedemptionError::InvalidReservation(format!(
-                    "egress_token must be 16 bytes, got {}",
-                    v.len()
-                ))
-            })?;
+    let egress_token_bytes: [u8; 16] = req.egress_token.try_into().map_err(|v: Vec<u8>| {
+        HbirdRedemptionError::InvalidReservation(format!(
+            "egress_token must be 16 bytes, got {}",
+            v.len()
+        ))
+    })?;
 
     Ok(RedemptionRequest {
         info,
@@ -118,9 +106,10 @@ fn from_proto_request(
 fn from_proto_redemption_info(
     info: v1::RedemptionInfo,
 ) -> Result<RedemptionInfo, HbirdRedemptionError> {
-    let start_time = chrono::DateTime::from_timestamp(info.start_time as i64, 0).ok_or_else(
-        || HbirdRedemptionError::InvalidReservation("invalid start_time timestamp".into()),
-    )?;
+    let start_time =
+        chrono::DateTime::from_timestamp(info.start_time as i64, 0).ok_or_else(|| {
+            HbirdRedemptionError::InvalidReservation("invalid start_time timestamp".into())
+        })?;
 
     Ok(RedemptionInfo {
         ingress: info.ingress as u16,

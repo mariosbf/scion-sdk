@@ -58,7 +58,7 @@ pub struct EgressToken(pub [u8; 16]);
 
 /// Client public key used for batched redemption requests. 64 bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientKey(pub [u8; 64]);
+pub struct ClientKey(pub Vec<u8>);
 
 /// Status information returned by the Hummingbird service.
 #[derive(Debug, Clone)]
