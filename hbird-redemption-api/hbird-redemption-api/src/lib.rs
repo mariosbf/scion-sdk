@@ -24,7 +24,7 @@
 //! use async_trait::async_trait;
 //! use hbird_redemption_api::routes::nest_hbird_redemption_api;
 //! use hbird_redemption_api_models::{
-//!     ClientKey, HbirdRedemptionError, HbirdRedemptionService, RedemptionRequest, StatusInfo,
+//!     ClientPublicKey, HbirdRedemptionError, HbirdRedemptionService, RedemptionRequest, StatusInfo,
 //! };
 //! use scion_proto::hummingbird::Reservation;
 //! use tokio::net::TcpListener;
@@ -36,7 +36,7 @@
 //!     async fn redeem(
 //!         &self,
 //!         _requests: Vec<RedemptionRequest>,
-//!         _client_key: ClientKey,
+//!         _client_key: ClientPublicKey,
 //!     ) -> Result<Vec<Reservation>, HbirdRedemptionError> {
 //!         todo!()
 //!     }

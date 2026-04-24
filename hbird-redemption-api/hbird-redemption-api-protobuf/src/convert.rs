@@ -14,14 +14,16 @@
 //! Conversions between Hummingbird redemption API protobuf types and models.
 
 use hbird_redemption_api_models::{
-    ClientKey, EgressToken, HbirdRedemptionError, IngressToken, RedemptionInfo, RedemptionRequest,
-    StatusInfo,
+    ClientPrivateKey, ClientPublicKey, EgressToken, HbirdRedemptionError, IngressToken,
+    RedemptionInfo, RedemptionRequest, StatusInfo,
 };
+use rsa::{Oaep, pkcs1::DecodeRsaPublicKey};
 use scion_proto::{
     address::IsdAsn,
     hummingbird::{Bandwidth, Reservation, ReservationInfo},
     path::hummingbird::HbirdAuthKey,
 };
+use sha2::Sha256;
 
 use crate::hbird::v1;
 
@@ -50,19 +52,20 @@ impl From<RedemptionRequest> for v1::RedemptionRequest {
 /// Converts a batch of model requests and a client key into a proto [`v1::RedemptionRequests`].
 pub fn to_proto_requests(
     requests: Vec<RedemptionRequest>,
-    client_key: ClientKey,
+    public_key: Vec<u8>,
 ) -> v1::RedemptionRequests {
     v1::RedemptionRequests {
         redemption: requests.into_iter().map(Into::into).collect(),
-        client_key: client_key.0.to_vec(),
+        client_key: public_key,
     }
 }
 
-/// Converts a proto [`v1::RedemptionRequests`] into model requests and a client key.
+/// Converts a proto [`v1::RedemptionRequests`] into model requests and a parsed client public key.
 pub fn from_proto_requests(
     req: v1::RedemptionRequests,
-) -> Result<(Vec<RedemptionRequest>, ClientKey), HbirdRedemptionError> {
-    let client_key = ClientKey(req.client_key);
+) -> Result<(Vec<RedemptionRequest>, ClientPublicKey), HbirdRedemptionError> {
+    let client_key = ClientPublicKey::from_pkcs1_der(&req.client_key)
+        .map_err(|e| HbirdRedemptionError::InvalidReservation(e.to_string()))?;
 
     let requests = req
         .redemption
@@ -125,14 +128,17 @@ fn from_proto_redemption_info(
 pub fn from_proto_reservation(
     res: v1::Reservation,
     req: &RedemptionRequest,
+    client_key: &ClientPrivateKey,
 ) -> Result<Reservation, HbirdRedemptionError> {
-    if res.auth_key.len() != 16 {
+    let auth_key = client_key.decrypt(Oaep::new::<Sha256>(), &res.auth_key)?;
+
+    if auth_key.len() != 16 {
         return Err(HbirdRedemptionError::InvalidReservation(format!(
-            "auth_key must be 16 bytes, got {}",
-            res.auth_key.len()
+            "auth_key must be 16 bytes (after decryption), got {}",
+            auth_key.len()
         )));
     }
-    let auth_key = HbirdAuthKey::clone_from_slice(&res.auth_key);
+    let auth_key = HbirdAuthKey::clone_from_slice(&auth_key);
 
     Ok(Reservation {
         info: ReservationInfo {
@@ -153,6 +159,7 @@ pub fn from_proto_reservation(
 pub fn from_proto_responses(
     responses: v1::RedemptionResponses,
     requests: &[RedemptionRequest],
+    client_key: &ClientPrivateKey,
 ) -> Result<Vec<Reservation>, HbirdRedemptionError> {
     let proto_reservations = responses.reservation;
     if proto_reservations.len() != requests.len() {
@@ -164,7 +171,7 @@ pub fn from_proto_responses(
     proto_reservations
         .into_iter()
         .zip(requests.iter())
-        .map(|(res, req)| from_proto_reservation(res, req))
+        .map(|(res, req)| from_proto_reservation(res, req, client_key))
         .collect()
 }
 

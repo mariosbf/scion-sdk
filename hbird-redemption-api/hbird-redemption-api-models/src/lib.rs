@@ -56,9 +56,11 @@ pub struct IngressToken(pub [u8; 16]);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressToken(pub [u8; 16]);
 
-/// Client public key used for batched redemption requests. 64 bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientKey(pub Vec<u8>);
+/// Client private key used for decrypting the auth_key in redemption responses.
+pub type ClientPrivateKey = rsa::RsaPrivateKey;
+
+/// Client public key used for encrypting the auth_key in redemption responses.
+pub type ClientPublicKey = rsa::RsaPublicKey;
 
 /// Status information returned by the Hummingbird service.
 #[derive(Debug, Clone)]
@@ -87,12 +89,16 @@ pub enum HbirdRedemptionError {
     /// Reservation data from the server is malformed.
     #[error("invalid reservation data: {0}")]
     InvalidReservation(String),
+
+    /// Decryption error.
+    #[error("decryption error: {0}")]
+    FailedDecryption(#[from] rsa::errors::Error),
 }
 
 /// Hummingbird redemption service trait.
 ///
-/// Implementors provide the ability to redeem Hummingbird flyover reservations
-/// from an external Hummingbird service.
+/// Implementors provide the server-side ability to redeem Hummingbird flyover reservations.
+/// The client's public key is used to encrypt the returned auth keys.
 #[async_trait]
 pub trait HbirdRedemptionService: Send + Sync {
     /// Redeems a batch of flyover reservations.
@@ -101,7 +107,7 @@ pub trait HbirdRedemptionService: Send + Sync {
     async fn redeem(
         &self,
         requests: Vec<RedemptionRequest>,
-        client_key: ClientKey,
+        client_key: ClientPublicKey,
     ) -> Result<Vec<Reservation>, HbirdRedemptionError>;
 
     /// Redeems a single flyover reservation.
@@ -110,7 +116,7 @@ pub trait HbirdRedemptionService: Send + Sync {
     async fn redeem_single(
         &self,
         request: RedemptionRequest,
-        client_key: ClientKey,
+        client_key: ClientPublicKey,
     ) -> Result<Reservation, HbirdRedemptionError> {
         self.redeem(vec![request], client_key)
             .await?

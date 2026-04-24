@@ -16,6 +16,7 @@ scion-proto = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
+rsa = { workspace = true }
 
 [lints]
 workspace = true

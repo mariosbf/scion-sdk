@@ -15,15 +15,15 @@
 
 use std::{ops::Deref, sync::Arc};
 
-use async_trait::async_trait;
 use hbird_redemption_api::routes::{HBIRD_API_V1, HBIRD_SERVICE, REDEEM, STATUS};
 use hbird_redemption_api_models::{
-    ClientKey, HbirdRedemptionError, HbirdRedemptionService, RedemptionRequest, StatusInfo,
+    ClientPrivateKey, HbirdRedemptionError, RedemptionRequest, StatusInfo,
 };
 use hbird_redemption_api_protobuf::{
     convert::{from_proto_responses, to_proto_requests},
     hbird::v1::{RedemptionResponses, StatusResponse},
 };
+use rsa::pkcs1::EncodeRsaPublicKey;
 use scion_proto::hummingbird::Reservation;
 use scion_sdk_reqwest_connect_rpc::{
     client::{CrpcClient, CrpcClientError},
@@ -65,14 +65,22 @@ impl CrpcHbirdRedemptionClient {
     }
 }
 
-#[async_trait]
-impl HbirdRedemptionService for CrpcHbirdRedemptionClient {
-    async fn redeem(
+impl CrpcHbirdRedemptionClient {
+    /// Redeems a batch of flyover reservations.
+    ///
+    /// Derives the public key from `client_private_key`, sends it to the server so the server can
+    /// encrypt the returned auth keys, then decrypts them locally with the private key.
+    pub async fn redeem(
         &self,
         requests: Vec<RedemptionRequest>,
-        client_key: ClientKey,
+        client_private_key: ClientPrivateKey,
     ) -> Result<Vec<Reservation>, HbirdRedemptionError> {
-        let proto_request = to_proto_requests(requests.clone(), client_key);
+        let public_key_der = client_private_key
+            .to_public_key()
+            .to_pkcs1_der()
+            .map_err(|e| HbirdRedemptionError::InvalidReservation(e.to_string()))?
+            .to_vec();
+        let proto_request = to_proto_requests(requests.clone(), public_key_der);
 
         let proto_response = self
             .client
@@ -83,12 +91,26 @@ impl HbirdRedemptionService for CrpcHbirdRedemptionClient {
             .await
             .map_err(crpc_to_hbird_error)?;
 
-        let reservations = from_proto_responses(proto_response, &requests)?;
+        let reservations = from_proto_responses(proto_response, &requests, &client_private_key)?;
         tracing::debug!("Redeemed {} flyover reservation(s)", reservations.len());
         Ok(reservations)
     }
 
-    async fn status(&self) -> Result<StatusInfo, HbirdRedemptionError> {
+    /// Redeems a single flyover reservation.
+    pub async fn redeem_single(
+        &self,
+        request: RedemptionRequest,
+        client_private_key: ClientPrivateKey,
+    ) -> Result<Reservation, HbirdRedemptionError> {
+        self.redeem(vec![request], client_private_key)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(HbirdRedemptionError::EmptyResponse)
+    }
+
+    /// Returns the status of the Hummingbird service.
+    pub async fn status(&self) -> Result<StatusInfo, HbirdRedemptionError> {
         let resp = self
             .client
             .unary_request::<_, StatusResponse>(

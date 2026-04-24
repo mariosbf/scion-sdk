@@ -17,6 +17,8 @@ scion-proto = { workspace = true }
 chrono = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
+sha2 = { workspace = true }
+rsa = { workspace = true }
 
 [lints]
 workspace = true
