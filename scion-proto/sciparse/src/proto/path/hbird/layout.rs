@@ -337,10 +337,10 @@ impl FlyoverHopFieldLayout {
     gen_bitrange_const!(CONS_EGRESS_RNG, 32, 16);
     gen_bitrange_const!(MAC_RNG, 48, 48);
     gen_bitrange_const!(RES_ID_RNG, 96, 22);
-    gen_bitrange_const!(BW_RANGE, 118, 14);
-    gen_bitrange_const!(RES_START_OFFSET_RNG, 132, 16);
-    gen_bitrange_const!(RES_DURATION_RNG, 148, 16);
-    gen_bitrange_const!(TOTAL_RNG, 0, 164);
+    gen_bitrange_const!(BW_RANGE, 118, 10);
+    gen_bitrange_const!(RES_START_OFFSET_RNG, 128, 16);
+    gen_bitrange_const!(RES_DURATION_RNG, 144, 16);
+    gen_bitrange_const!(TOTAL_RNG, 0, 160);
 
     /// Size of hop field in bytes
     pub const SIZE_BYTES: usize = Self::TOTAL_RNG.end / 8;
