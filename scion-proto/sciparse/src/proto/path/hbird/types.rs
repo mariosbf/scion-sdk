@@ -61,13 +61,13 @@ impl HbirdHopFieldFlags {
     }
 }
 
-impl Into<StdHopFieldFlags> for HbirdHopFieldFlags {
-    fn into(self) -> StdHopFieldFlags {
+impl From<HbirdHopFieldFlags> for StdHopFieldFlags {
+    fn from(val: HbirdHopFieldFlags) -> Self {
         let mut std_flags = StdHopFieldFlags::empty();
-        if self.contains(HbirdHopFieldFlags::CONS_INGRESS_ROUTER_ALERT) {
+        if val.contains(HbirdHopFieldFlags::CONS_INGRESS_ROUTER_ALERT) {
             std_flags |= StdHopFieldFlags::CONS_INGRESS_ROUTER_ALERT;
         }
-        if self.contains(HbirdHopFieldFlags::CONS_EGRESS_ROUTER_ALERT) {
+        if val.contains(HbirdHopFieldFlags::CONS_EGRESS_ROUTER_ALERT) {
             std_flags |= StdHopFieldFlags::CONS_EGRESS_ROUTER_ALERT;
         }
         std_flags

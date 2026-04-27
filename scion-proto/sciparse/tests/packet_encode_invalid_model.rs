@@ -98,11 +98,12 @@ mod packet_manipulation {
         address::host_addr::WireHostAddr,
         packet::classify::ClassifiedPacket,
         path::{
+            hbird::{layout::HbirdPathMetaLayout, model::HbirdHopField},
             model::Path,
             standard::{
                 layout::StdPathMetaLayout,
                 model::HopField,
-                types::{StdHopFieldFlags, HopFieldMac},
+                types::{HopFieldMac, StdHopFieldFlags},
             },
             types::PathType,
         },
@@ -167,12 +168,10 @@ mod packet_manipulation {
                         PayloadState::Typed(ClassifiedPayload::Udp(pkt.payload)),
                     )
                 }
-                ClassifiedPacket::Scmp(pkt) => {
-                    (
-                        pkt.header,
-                        PayloadState::Typed(ClassifiedPayload::Scmp(pkt.payload)),
-                    )
-                }
+                ClassifiedPacket::Scmp(pkt) => (
+                    pkt.header,
+                    PayloadState::Typed(ClassifiedPayload::Scmp(pkt.payload)),
+                ),
                 ClassifiedPacket::Other(pkt) => (pkt.header, PayloadState::Raw(pkt.payload)),
             };
 
@@ -190,6 +189,16 @@ mod packet_manipulation {
                                 segment.hop_fields.clear();
                             }
                         }
+                        if let Path::Hummingbird(ref mut hb_path) = header.path {
+                            if hb_path.segments.is_empty() {
+                                continue;
+                            }
+                            let target =
+                                (seg_idx as usize).min(hb_path.segments.len().saturating_sub(1));
+                            if let Some(segment) = hb_path.segments.get_mut(target) {
+                                segment.hop_fields.clear();
+                            }
+                        }
                     }
                     PacketModification::InvalidCurrentHop(exceed_by) => {
                         if let Path::Standard(ref mut std_path) = header.path {
@@ -198,6 +207,19 @@ mod packet_manipulation {
                             let invalid = max_valid + exceed_by as usize;
                             let clamped = invalid.min(StdPathMetaLayout::MAX_SEGMENT_HOPS);
                             std_path.current_hop_field = clamped as u8;
+                        }
+                        if let Path::Hummingbird(ref mut hb_path) = header.path {
+                            let max_valid = hb_path
+                                .segments
+                                .iter()
+                                .flat_map(|seg| &seg.hop_fields)
+                                .map(|hf| hf.required_size())
+                                .rev()
+                                .skip(1)
+                                .sum::<usize>();
+                            let invalid = max_valid + exceed_by as usize;
+                            let clamped = invalid.min(HbirdPathMetaLayout::MAX_SEGMENT_BYTES);
+                            hb_path.current_hop_field = (clamped / 4) as u8;
                         }
                     }
                     PacketModification::InvalidCurrentInfo(exceed_by) => {
@@ -208,6 +230,14 @@ mod packet_manipulation {
                             let clamped =
                                 invalid.min(StdPathMetaLayout::CURR_INFO_FIELD_RNG.max_uint());
                             std_path.current_info_field = clamped as u8;
+                        }
+                        if let Path::Hummingbird(ref mut hb_path) = header.path {
+                            let count = hb_path.info_field_count();
+                            let max_valid = if count == 0 { 0 } else { count - 1 };
+                            let invalid = max_valid + exceed_by as usize;
+                            let clamped =
+                                invalid.min(HbirdPathMetaLayout::CURR_INFO_FIELD_RNG.max_uint());
+                            hb_path.current_info_field = clamped as u8;
                         }
                     }
                     PacketModification::TooManyHopFields(seg_idx, extra) => {
@@ -229,6 +259,27 @@ mod packet_manipulation {
                                         cons_egress: 0,
                                         mac: HopFieldMac::from([0; 6]),
                                     },
+                                );
+                            }
+                        }
+                        if let Path::Hummingbird(ref mut hb_path) = header.path {
+                            let seg_len = hb_path.segments.len();
+                            if seg_len == 0 {
+                                continue;
+                            }
+                            let seg_idx = (seg_idx as usize).min(seg_len - 1);
+                            let segment = &mut hb_path.segments[seg_idx];
+                            let target_hops = 90usize.saturating_add(extra as usize);
+                            if segment.hop_fields.len() < target_hops {
+                                segment.hop_fields.resize(
+                                    target_hops,
+                                    HbirdHopField::Standard(HopField {
+                                        flags: StdHopFieldFlags::empty(),
+                                        expiration_units: 0,
+                                        cons_ingress: 0,
+                                        cons_egress: 0,
+                                        mac: HopFieldMac::from([0; 6]),
+                                    }),
                                 );
                             }
                         }
@@ -273,12 +324,10 @@ mod packet_manipulation {
                         payload: scmp,
                     })
                 }
-                PayloadState::Raw(raw) => {
-                    ClassifiedPacket::Other(ScionRawPacket {
-                        header,
-                        payload: raw,
-                    })
-                }
+                PayloadState::Raw(raw) => ClassifiedPacket::Other(ScionRawPacket {
+                    header,
+                    payload: raw,
+                }),
             }
         }
     }
@@ -316,11 +365,9 @@ mod packet_manipulation {
                     };
 
                     prop::collection::vec(packet_modification_strategy(has_scion_path), 1..=5)
-                        .prop_map(move |modifications| {
-                            InvalidPacketOptions {
-                                base: base.clone(),
-                                modifications,
-                            }
+                        .prop_map(move |modifications| InvalidPacketOptions {
+                            base: base.clone(),
+                            modifications,
                         })
                 })
                 .boxed()

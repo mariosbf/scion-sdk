@@ -286,6 +286,9 @@ fn compare_path(sci: &sciparse::path::model::Path, proto: &scion_proto::path::Da
                 "Unsupported path data mismatch"
             );
         }
+        (Path::Hummingbird(sci_hbird), DataPlanePath::Hummingbird(proto_hbird)) => {
+            compare_hbird_path(sci_hbird, proto_hbird);
+        }
         (Path::OneHop(_), DataPlanePath::Unsupported { .. }) => {
             // scion-proto treats OneHop as unsupported, so we just compare raw bytes
             // via the top-level re-encode check.
@@ -353,28 +356,7 @@ fn compare_standard_path(
         .enumerate()
     {
         let sci_info = &sci_seg.info_field;
-        assert_eq!(
-            sci_info
-                .flags
-                .contains(sciparse::path::standard::types::InfoFieldFlags::CONS_DIR),
-            proto_info.cons_dir,
-            "info_field[{i}].cons_dir mismatch"
-        );
-        assert_eq!(
-            sci_info
-                .flags
-                .contains(sciparse::path::standard::types::InfoFieldFlags::PEERING),
-            proto_info.peer,
-            "info_field[{i}].peer mismatch"
-        );
-        assert_eq!(
-            sci_info.segment_id, proto_info.seg_id,
-            "info_field[{i}].seg_id mismatch"
-        );
-        assert_eq!(
-            sci_info.timestamp, proto_info.timestamp_epoch,
-            "info_field[{i}].timestamp mismatch"
-        );
+        compare_info_field(sci_info, proto_info, i);
     }
 
     // Hop fields
@@ -389,33 +371,225 @@ fn compare_standard_path(
         "hop field count mismatch"
     );
     for (i, (sci_hop, proto_hop)) in sci_hops.iter().zip(decoded.hop_fields.iter()).enumerate() {
-        assert_eq!(
-            sci_hop
-                .flags
-                .contains(sciparse::path::standard::types::StdHopFieldFlags::CONS_EGRESS_ROUTER_ALERT),
-            proto_hop.egress_router_alert,
-            "hop_field[{i}].egress_router_alert mismatch"
-        );
-        assert_eq!(
-            sci_hop.flags.contains(
-                sciparse::path::standard::types::StdHopFieldFlags::CONS_INGRESS_ROUTER_ALERT
-            ),
-            proto_hop.ingress_router_alert,
-            "hop_field[{i}].ingress_router_alert mismatch"
-        );
-        assert_eq!(
-            sci_hop.expiration_units, proto_hop.exp_time,
-            "hop_field[{i}].exp_time mismatch"
-        );
-        assert_eq!(
-            sci_hop.cons_ingress, proto_hop.cons_ingress,
-            "hop_field[{i}].cons_ingress mismatch"
-        );
-        assert_eq!(
-            sci_hop.cons_egress, proto_hop.cons_egress,
-            "hop_field[{i}].cons_egress mismatch"
-        );
-        assert_eq!(sci_hop.mac.0, proto_hop.mac, "hop_field[{i}].mac mismatch");
+        compare_hop_field(sci_hop, proto_hop, i);
+    }
+}
+
+fn compare_info_field(
+    sci: &sciparse::path::standard::model::InfoField,
+    proto: &scion_proto::path::standard::InfoField,
+    index: usize,
+) {
+    assert_eq!(
+        sci.flags
+            .contains(sciparse::path::standard::types::InfoFieldFlags::CONS_DIR),
+        proto.cons_dir,
+        "info_field[{index}].cons_dir mismatch"
+    );
+    assert_eq!(
+        sci.flags
+            .contains(sciparse::path::standard::types::InfoFieldFlags::PEERING),
+        proto.peer,
+        "info_field[{index}].peer mismatch"
+    );
+    assert_eq!(
+        sci.segment_id, proto.seg_id,
+        "info_field[{index}].seg_id mismatch"
+    );
+    assert_eq!(
+        sci.timestamp, proto.timestamp_epoch,
+        "info_field[{index}].timestamp mismatch"
+    );
+}
+
+fn compare_hop_field(
+    sci: &sciparse::path::standard::model::HopField,
+    proto: &scion_proto::path::standard::StandardHopField,
+    index: usize,
+) {
+    assert_eq!(
+        sci.flags
+            .contains(sciparse::path::standard::types::StdHopFieldFlags::CONS_EGRESS_ROUTER_ALERT),
+        proto.egress_router_alert,
+        "hop_field[{index}].egress_router_alert mismatch"
+    );
+    assert_eq!(
+        sci.flags
+            .contains(sciparse::path::standard::types::StdHopFieldFlags::CONS_INGRESS_ROUTER_ALERT),
+        proto.ingress_router_alert,
+        "hop_field[{index}].ingress_router_alert mismatch"
+    );
+    assert_eq!(
+        sci.expiration_units, proto.exp_time,
+        "hop_field[{index}].exp_time mismatch"
+    );
+    assert_eq!(
+        sci.cons_ingress, proto.cons_ingress,
+        "hop_field[{index}].cons_ingress mismatch"
+    );
+    assert_eq!(
+        sci.cons_egress, proto.cons_egress,
+        "hop_field[{index}].cons_egress mismatch"
+    );
+    assert_eq!(sci.mac.0, proto.mac, "hop_field[{index}].mac mismatch");
+}
+
+fn compare_hbird_path(
+    sci: &sciparse::path::hbird::model::HummingbirdPath,
+    proto_enc: &scion_proto::path::hummingbird::EncodedHummingbirdPath,
+) {
+    let meta = proto_enc.meta_header();
+
+    // Meta header
+    assert_eq!(
+        sci.current_info_field,
+        meta.current_info_field.get(),
+        "current_info_field mismatch"
+    );
+    assert_eq!(
+        sci.current_hop_field,
+        meta.current_hop_field.encode(),
+        "current_hop_field mismatch"
+    );
+
+    let (seg0, seg1, seg2) = sci.segment_lengths_bytes();
+    assert_eq!(
+        seg0,
+        meta.segment_lengths[0].bytes(),
+        "segment_lengths[0] mismatch"
+    );
+    assert_eq!(
+        seg1,
+        meta.segment_lengths[1].bytes(),
+        "segment_lengths[1] mismatch"
+    );
+    assert_eq!(
+        seg2,
+        meta.segment_lengths[2].bytes(),
+        "segment_lengths[2] mismatch"
+    );
+    assert_eq!(
+        sci.base_timestamp,
+        proto_enc.meta_header().base_timestamp.get(),
+        "base_timestamp mismatch"
+    );
+    assert_eq!(
+        sci.millis_timestamp,
+        proto_enc.meta_header().millis_timestamp.get(),
+        "millis_timestamp mismatch"
+    );
+    assert_eq!(
+        sci.counter,
+        proto_enc.meta_header().counter.get(),
+        "counter mismatch"
+    );
+
+    // Decode the encoded path to get info/hop fields for detailed comparison
+    let mut raw = bytes::Bytes::copy_from_slice(proto_enc.raw());
+    let decoded = scion_proto::path::hummingbird::HummingbirdPath::decode(&mut raw)
+        .expect("Failed to decode hbird path from scion-proto");
+
+    // Info fields
+    assert_eq!(
+        sci.segments.len(),
+        decoded.segments().count(),
+        "info field count mismatch"
+    );
+    for (i, (sci_seg, proto_info)) in sci
+        .segments
+        .iter()
+        .zip(decoded.segments().map(|(i, _)| i))
+        .enumerate()
+    {
+        let sci_info = &sci_seg.info_field;
+        compare_info_field(sci_info, proto_info, i);
+    }
+
+    // Hop fields
+    let sci_hops: Vec<_> = sci
+        .segments
+        .iter()
+        .flat_map(|s| s.hop_fields.iter())
+        .collect();
+    assert_eq!(
+        sci_hops.len(),
+        decoded
+            .segments()
+            .map(|(_, hops)| hops.len())
+            .sum::<usize>(),
+        "hop field count mismatch"
+    );
+    for (i, (&sci_hop, proto_hop)) in sci_hops
+        .iter()
+        .zip(decoded.segments().flat_map(|(_, hfs)| hfs.iter()))
+        .enumerate()
+    {
+        match (sci_hop, proto_hop) {
+            (
+                sciparse::path::hbird::model::HbirdHopField::Standard(sci_hf),
+                scion_proto::path::hummingbird::HummingbirdHopField::Standard(proto_hf),
+            ) => {
+                compare_hop_field(sci_hf, proto_hf, i);
+            }
+            (
+                sciparse::path::hbird::model::HbirdHopField::Flyover(sci_hf),
+                scion_proto::path::hummingbird::HummingbirdHopField::Flyover(proto_hf),
+            ) => {
+                assert_eq!(
+                    sci_hf.flags.contains(
+                        sciparse::path::standard::types::StdHopFieldFlags::CONS_EGRESS_ROUTER_ALERT
+                    ),
+                    proto_hf.egress_router_alert,
+                    "hop_field[{i}].egress_router_alert mismatch"
+                );
+                assert_eq!(
+                    sci_hf.flags
+                        .contains(sciparse::path::standard::types::StdHopFieldFlags::CONS_INGRESS_ROUTER_ALERT),
+                    proto_hf.ingress_router_alert,
+                    "hop_field[{i}].ingress_router_alert mismatch"
+                );
+                assert_eq!(
+                    sci_hf.expiration_units, proto_hf.exp_time,
+                    "hop_field[{i}].exp_time mismatch"
+                );
+                assert_eq!(
+                    sci_hf.cons_ingress, proto_hf.cons_ingress,
+                    "hop_field[{i}].cons_ingress mismatch"
+                );
+                assert_eq!(
+                    sci_hf.cons_egress, proto_hf.cons_egress,
+                    "hop_field[{i}].cons_egress mismatch"
+                );
+                assert_eq!(
+                    sci_hf.mac.0, proto_hf.aggregated_mac,
+                    "hop_field[{i}].mac mismatch"
+                );
+
+                assert_eq!(
+                    sci_hf.res_id, proto_hf.res_id,
+                    "hop_field[{i}].res_id mismatch"
+                );
+                assert_eq!(
+                    sci_hf.bw,
+                    proto_hf.res_bw.encode(),
+                    "hop_field[{i}].bw mismatch"
+                );
+
+                assert_eq!(
+                    sci_hf.res_start_offset, proto_hf.res_start_offset,
+                    "hop_field[{i}].res_start_offset mismatch"
+                );
+                assert_eq!(
+                    sci_hf.res_duration, proto_hf.res_duration,
+                    "hop_field[{i}].res_duration mismatch"
+                );
+            }
+            _ => {
+                panic!(
+                    "hop_field[{i}] type mismatch: sciparse={sci_hop:?} vs scion-proto={proto_hop:?}"
+                )
+            }
+        }
     }
 }
 

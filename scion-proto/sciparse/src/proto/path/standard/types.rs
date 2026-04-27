@@ -172,7 +172,14 @@ pub mod ptest {
 
         fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
             any::<u8>()
-                .prop_map(StdHopFieldFlags::from_bits_retain)
+                // .prop_map(|v| v & (StdHopFieldFlags::CONS_EGRESS_ROUTER_ALERT || StdHopFieldFlags::CONS_INGRESS_ROUTER_ALERT) // Only allow the two defined flags to be set
+                .prop_map(|v| {
+                    StdHopFieldFlags::from_bits_retain(
+                        v & (StdHopFieldFlags::CONS_EGRESS_ROUTER_ALERT
+                            | StdHopFieldFlags::CONS_INGRESS_ROUTER_ALERT)
+                            .bits(),
+                    )
+                })
                 .boxed()
         }
     }

@@ -26,7 +26,7 @@ use crate::{
         },
         standard::{
             layout::{HopFieldLayout, InfoFieldLayout},
-            types::{HopFieldMac, StdHopFieldFlags},
+            types::{HopFieldMac, InfoFieldFlags, StdHopFieldFlags},
             view::{HopFieldView, InfoFieldView},
         },
     },
@@ -107,12 +107,12 @@ impl HbirdPathView {
         HbirdPathMetaLayout::BASE_TIMESTAMP_RNG,
         u32
     );
-    gen_field_write!(
+    gen_unsafe_field_write!(
         set_millis_timestamp,
         HbirdPathMetaLayout::MILLIS_TIMESTAMP_RNG,
         u16
     );
-    gen_field_write!(set_counter, HbirdPathMetaLayout::COUNTER_RNG, u32);
+    gen_unsafe_field_write!(set_counter, HbirdPathMetaLayout::COUNTER_RNG, u32);
 }
 
 // Data Helpers
@@ -154,18 +154,19 @@ impl HbirdPathView {
 
         let is_flyover = self.is_flyover_checked(byte_offset)?;
 
-        // Check if the entire hop field is within bounds
+        // Check if the entire hop field is within bounds (use range to avoid off-by-one
+        // when the field ends exactly at the buffer boundary)
         let _ = if is_flyover {
-            self.0.get(start + FlyoverHopFieldLayout::SIZE_BYTES)
+            self.0.get(start..start + FlyoverHopFieldLayout::SIZE_BYTES)
         } else {
-            self.0.get(start + HopFieldLayout::SIZE_BYTES)
+            self.0.get(start..start + HopFieldLayout::SIZE_BYTES)
         }?;
 
         Some(
             HbirdPathDataLayout::new(
-                self.seg0_len() as usize * 4,
-                self.seg1_len() as usize * 4,
-                self.seg2_len() as usize * 4,
+                self.seg0_len_bytes() as usize,
+                self.seg1_len_bytes() as usize,
+                self.seg2_len_bytes() as usize,
             )
             .hop_field_range(byte_offset, is_flyover)
             .shift(HbirdPathMetaLayout::SIZE_BYTES)
@@ -216,14 +217,15 @@ impl HbirdPathView {
                 HopFieldLayout::SIZE_BYTES
             };
 
-            if curr_offset == byte_offset {
-                return Some(curr_idx);
-            }
-
             curr_offset += field_size;
             curr_idx += 1;
         }
-        None
+
+        if curr_offset == byte_offset {
+            Some(curr_idx)
+        } else {
+            None
+        }
     }
 
     /// Returns a view over the hop field at the given byte offset, or None if the
@@ -284,27 +286,24 @@ impl HbirdPathView {
     pub fn hop_fields(
         &self,
     ) -> impl Iterator<Item = HbirdHopFieldView<&HopFieldView, &FlyoverHopFieldView>> {
-        let layout = HbirdPathDataLayout::new(
-            self.seg0_len() as usize * 4,
-            self.seg1_len() as usize * 4,
-            self.seg2_len() as usize * 4,
-        );
+        let total_seg_bytes = self.seg0_len_bytes() as usize
+            + self.seg1_len_bytes() as usize
+            + self.seg2_len_bytes() as usize;
 
-        let hop_fields_range = layout
-            .hop_fields_range()
-            .shift(HbirdPathMetaLayout::SIZE_BYTES)
-            .aligned_byte_range();
+        // Iterate relative byte offsets (0..total_seg_bytes); scan yields a hop field only when
+        // the offset matches the expected start of the next hop field.
+        (0..total_seg_bytes)
+            .scan(0usize, move |next_hf_start, byte_offset| {
+                if byte_offset != *next_hf_start {
+                    return Some(None);
+                }
 
-        hop_fields_range.scan(0, |next_hf_start, byte_offset| {
-            if byte_offset != *next_hf_start {
-                return None;
-            }
+                let field = self.hop_field(byte_offset)?;
+                *next_hf_start += field.size_bytes();
 
-            let field = self.hop_field(byte_offset)?;
-            *next_hf_start += field.size_bytes();
-
-            Some(field)
-        })
+                Some(Some(field))
+            })
+            .flatten()
     }
 }
 // Data mut
@@ -396,7 +395,7 @@ impl Debug for HbirdPathView {
 }
 
 /// A view over a Hummingbird SCION path hop field
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum HbirdHopFieldView<HopFieldViewRef, FlyoverHopFieldViewRef>
 where
     HopFieldViewRef: Deref<Target = HopFieldView>,
@@ -485,6 +484,30 @@ where
         }
     }
 
+    /// Returns the ingress interface in the direction the packet is travelling.
+    ///
+    /// Reads `cons_ingress` when the `CONS_DIR` flag is set on `info_field`, and
+    /// `cons_egress` otherwise (reversed segment).
+    #[inline]
+    pub fn ingress_interface(&self, info_field: &InfoFieldView) -> u16 {
+        match self {
+            HbirdHopFieldView::Standard(v) => v.ingress_interface(info_field),
+            HbirdHopFieldView::Flyover(v) => v.ingress_interface(info_field),
+        }
+    }
+
+    /// Returns the egress interface in the direction the packet is travelling.
+    ///
+    /// Reads `cons_egress` when the `CONS_DIR` flag is set on `info_field`, and
+    /// `cons_ingress` otherwise (reversed segment).
+    #[inline]
+    pub fn egress_interface(&self, info_field: &InfoFieldView) -> u16 {
+        match self {
+            HbirdHopFieldView::Standard(v) => v.egress_interface(info_field),
+            HbirdHopFieldView::Flyover(v) => v.egress_interface(info_field),
+        }
+    }
+
     /// Returns the MAC of the hop field
     #[inline]
     pub fn mac(&self) -> HopFieldMac {
@@ -533,10 +556,10 @@ where
 {
     /// Sets the flags of the hop field
     #[inline]
-    pub fn set_std_flags(&mut self, flags: StdHopFieldFlags) {
+    pub fn set_flags(&mut self, flags: StdHopFieldFlags) {
         match self {
             HbirdHopFieldView::Standard(v) => v.set_flags(flags),
-            HbirdHopFieldView::Flyover(v) => v.set_std_flags(flags),
+            HbirdHopFieldView::Flyover(v) => v.set_flags(flags),
         }
     }
 
@@ -640,11 +663,15 @@ impl View for FlyoverHopFieldView {
 impl FlyoverHopFieldView {
     /// Returns the flags of the hop field
     #[inline]
-    pub fn flags(&self) -> HbirdHopFieldFlags {
+    pub fn flags(&self) -> StdHopFieldFlags {
         // SAFETY: buffer size is checked on construction
         let value =
             unsafe { unchecked_bit_range_be_read::<u8>(&self.0, FlyoverHopFieldLayout::FLAGS_RNG) };
-        HbirdHopFieldFlags::from_bits_retain(value)
+
+        // Mask out flyover bit to get standard flags
+        let value = value & !HbirdHopFieldFlags::FLYOVER.bits();
+
+        StdHopFieldFlags::from_bits_retain(value)
     }
 
     gen_field_read!(exp_time, HopFieldLayout::EXP_TIME_RNG, u8);
@@ -672,27 +699,44 @@ impl FlyoverHopFieldView {
 
         HopFieldMac(mac)
     }
+
+    /// Returns the ingress interface in the direction the packet is travelling.
+    ///
+    /// Reads `cons_ingress` when the `CONS_DIR` flag is set on `info_field`, and
+    /// `cons_egress` otherwise (reversed segment).
+    #[inline]
+    pub fn ingress_interface(&self, info_field: &InfoFieldView) -> u16 {
+        if info_field.flags().contains(InfoFieldFlags::CONS_DIR) {
+            self.cons_ingress()
+        } else {
+            self.cons_egress()
+        }
+    }
+
+    /// Returns the egress interface in the direction the packet is travelling.
+    ///
+    /// Reads `cons_egress` when the `CONS_DIR` flag is set on `info_field`, and
+    /// `cons_ingress` otherwise (reversed segment).
+    #[inline]
+    pub fn egress_interface(&self, info_field: &InfoFieldView) -> u16 {
+        if info_field.flags().contains(InfoFieldFlags::CONS_DIR) {
+            self.cons_egress()
+        } else {
+            self.cons_ingress()
+        }
+    }
 }
 // Mutable
 impl FlyoverHopFieldView {
     /// Sets the flags of the hop field
     #[inline]
-    pub fn set_flags(&mut self, flags: HbirdHopFieldFlags) {
+    pub fn set_flags(&mut self, flags: StdHopFieldFlags) {
         // SAFETY: buffer size is checked on construction
-        let value = flags.bits();
+        // Preserve the FLYOVER bit — it is structural, not a user-settable flag.
+        let value = flags.bits() | HbirdHopFieldFlags::FLYOVER.bits();
         unsafe {
             unchecked_bit_range_be_write::<u8>(&mut self.0, FlyoverHopFieldLayout::FLAGS_RNG, value)
         }
-    }
-
-    /// Sets the standard flags of the hop field, i.e., the flags that are also
-    /// present in standard hop fields.
-    #[inline]
-    pub fn set_std_flags(&mut self, flags: StdHopFieldFlags) {
-        let mut new_flags = flags.into();
-        // Ensure the flyover bit is set
-        new_flags |= HbirdHopFieldFlags::FLYOVER;
-        self.set_flags(new_flags);
     }
 
     gen_field_write!(set_exp_time, HopFieldLayout::EXP_TIME_RNG, u8);

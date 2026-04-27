@@ -135,8 +135,8 @@ mod wire_manipulation {
     impl PacketBreakingOptions {
         pub fn apply(&self) -> Vec<u8> {
             // Encode the valid packet
-            if self.base.wire_valid().is_err() {
-                panic!("Base packet is not wire-valid, cannot apply breaking options");
+            if let Err(e) = self.base.wire_valid() {
+                panic!("Base packet is not wire-valid, cannot apply breaking options: {e}");
             }
 
             let mut buf = vec![0u8; self.base.required_size()];
@@ -166,6 +166,24 @@ mod wire_manipulation {
 
                     if let Some(overflow) = self.info_field_overflow {
                         path_view.set_curr_info_field(overflow);
+                    }
+
+                    if let Some((seg0, seg1, seg2)) = self.segment_len {
+                        unsafe {
+                            path_view.set_seg0_len(seg0);
+                            path_view.set_seg1_len(seg1);
+                            path_view.set_seg2_len(seg2);
+                        }
+                    }
+                } else if let ScionPathViewMut::Hummingbird(path_view) = view.path_mut() {
+                    if let Some(hf_overflow) = self.hop_field_overflow {
+                        let curr = path_view.curr_info_field();
+                        let overflow = curr.saturating_add(hf_overflow).min(255 >> 2);
+                        path_view.set_curr_info_field(overflow);
+                    }
+
+                    if let Some(overflow) = self.info_field_overflow {
+                        path_view.set_curr_hop_field(overflow);
                     }
 
                     if let Some((seg0, seg1, seg2)) = self.segment_len {

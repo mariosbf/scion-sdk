@@ -142,6 +142,12 @@ impl HummingbirdSegmentLength {
     pub const fn encode(&self) -> u8 {
         self.0
     }
+    
+    /// Get the length of the segment in bytes
+    #[inline]
+    pub const fn bytes(&self) -> usize {
+        self.0 as usize * 4
+    }
 
     /// Decode this value from its wire representation.
     #[inline]

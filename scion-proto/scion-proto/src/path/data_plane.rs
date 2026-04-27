@@ -236,6 +236,12 @@ impl From<EncodedStandardPath> for DataPlanePath {
     }
 }
 
+impl From<EncodedHummingbirdPath> for DataPlanePath {
+    fn from(value: EncodedHummingbirdPath) -> Self {
+        Self::Hummingbird(value)
+    }
+}
+
 impl<T, U> PartialEq<DataPlanePath<U>> for DataPlanePath<T>
 where
     T: Deref<Target = [u8]>,
@@ -294,6 +300,7 @@ impl WireDecodeWithContext<Bytes> for DataPlanePath {
         match path_type {
             PathType::Empty => Ok(DataPlanePath::EmptyPath),
             PathType::Scion => Ok(EncodedStandardPath::decode(data)?.into()),
+            PathType::Hummingbird => Ok(EncodedHummingbirdPath::decode(data)?.into()),
             other => {
                 if data.remaining() < length_hint {
                     Err(Self::Error::PacketEmptyOrTruncated)
