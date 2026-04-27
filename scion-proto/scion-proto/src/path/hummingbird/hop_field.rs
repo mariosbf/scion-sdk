@@ -287,7 +287,7 @@ impl<'a> TryFrom<&'a EncodedHummingbirdHopField> for &'a EncodedFlyoverHopField 
 ///  0                   1                   2                   3
 ///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |r r r r r r I E|    ExpTime    |           ConsIngress         |
+/// |F r r r r r I E|    ExpTime    |           ConsIngress         |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// |        ConsEgress             |                               |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
