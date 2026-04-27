@@ -22,15 +22,9 @@ use crate::{
         layout::Layout,
         write::unchecked_bit_range_be_write,
     },
-    path::{
-        layout::ScionHeaderPathLayout,
-        standard::{
-            layout::{HopFieldLayout, InfoFieldLayout, StdPathDataLayout, StdPathMetaLayout},
-            mac::{ForwardingKey, HopMacCalculate, HopMacInput, HopMacInputSource},
-            types::{StdHopFieldFlags, HopFieldMac, InfoFieldFlags},
-            view::{HopFieldView, InfoFieldView, StandardPathView},
-        },
-    },
+    path::{layout::ScionHeaderPathLayout, standard::{
+        layout::{HopFieldLayout, InfoFieldLayout, StdPathDataLayout, StdPathMetaLayout}, mac::{ForwardingKey, HopMacCalculate, HopMacInput, HopMacInputSource}, types::{HopFieldMac, InfoFieldFlags, StdHopFieldFlags}, view::{HopFieldView, InfoFieldView, StandardPathView}
+    }},
 };
 
 /// Represents a standard SCION path

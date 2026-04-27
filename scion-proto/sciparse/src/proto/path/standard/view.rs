@@ -30,9 +30,7 @@ use crate::{
     path::standard::{
         layout::{
             HopFieldLayout, InfoFieldLayout, StdPathDataLayout, StdPathLayout, StdPathMetaLayout,
-        },
-        mac::{HopMacInput, HopMacInputSource},
-        types::{StdHopFieldFlags, HopFieldMac, InfoFieldFlags},
+        }, mac::{HopMacInput, HopMacInputSource}, types::{HopFieldMac, InfoFieldFlags, StdHopFieldFlags}
     },
 };
 

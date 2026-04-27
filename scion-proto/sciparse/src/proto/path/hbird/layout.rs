@@ -190,9 +190,9 @@ impl HbirdPathDataLayout {
     pub fn hop_field_range(&self, byte_offset: usize, is_flyover: bool) -> BitRange {
         let base = self.info_fields_range().size_bytes();
         if is_flyover {
-            return FlyoverHopFieldLayout::TOTAL_RNG.shift(base + byte_offset);
+            FlyoverHopFieldLayout::TOTAL_RNG.shift(base + byte_offset)
         } else {
-            return HopFieldLayout::TOTAL_RNG.shift(base + byte_offset);
+            HopFieldLayout::TOTAL_RNG.shift(base + byte_offset)
         }
     }
 

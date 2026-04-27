@@ -426,9 +426,9 @@ pub struct FlyoverHopField {
     pub res_id: u32,
     /// Bandwidth of the Hummingbird reservation being used.
     ///
-    /// The bandwidth is a 10-bit value. The 6 most significant bits of `bw` are
-    /// masked out. The 5 most significant bits of the remainder are denoted   
-    /// `significand` and the remaining 5 bits are the `exponent`.
+    /// The bandwidth is a 10-bit value (6 most significant bits of the u16 are unused).
+    /// The 5 most significant bits of the 10-bit value are the `significand` and the
+    /// remaining 5 bits are the `exponent`.
     /// The bandwidth of the reservation is then
     /// - `significand` if `exponent = 0`, and
     /// - `(32 + significand) << (exponent - 1)` otherwise.
