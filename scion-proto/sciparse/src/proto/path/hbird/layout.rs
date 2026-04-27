@@ -210,12 +210,14 @@ impl HbirdPathDataLayout {
     #[inline]
     pub fn hop_fields_range(&self) -> BitRange {
         let info_fields_end = self.info_fields_range().end;
-        let hop_fields_length = self.segment_lengths_in_bytes.0 as usize
-            + self.segment_lengths_in_bytes.1 as usize
-            + self.segment_lengths_in_bytes.2 as usize;
+
+        let hop_fields_bits = (self.segment_lengths_in_bytes.0
+            + self.segment_lengths_in_bytes.1
+            + self.segment_lengths_in_bytes.2)
+            * 8;
         BitRange {
             start: info_fields_end,
-            end: info_fields_end + hop_fields_length,
+            end: info_fields_end + hop_fields_bits,
         }
     }
 }
