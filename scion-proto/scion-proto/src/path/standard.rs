@@ -445,16 +445,6 @@ impl StandardHopField {
         destination: IsdAsn,
         pkt_len: u16,
     ) -> Result<FlyoverHopField, FlyoverMacCalculationError> {
-        let flyover_key = calculate_hbird_auth_key(
-            self.cons_ingress,
-            self.cons_egress,
-            reservation.info.res_id,
-            reservation.info.bandwidth,
-            reservation.info.start,
-            reservation.info.duration,
-            &reservation.reservation_key,
-        );
-
         // TODO: Casting to u16 could be problematic
         let res_start_offset = (meta_header.base_timestamp.get() - reservation.info.start) as u16;
 
@@ -465,7 +455,7 @@ impl StandardHopField {
             res_start_offset,
             meta_header.millis_timestamp(),
             meta_header.counter(),
-            &flyover_key,
+            &reservation.reservation_key,
         );
         let mut mac = self.mac;
         xor_in_place(&mut mac, &flyover_mac);
@@ -476,7 +466,7 @@ impl StandardHopField {
             exp_time: self.exp_time,
             cons_ingress: self.cons_ingress,
             cons_egress: self.cons_egress,
-            aggregated_mac: self.mac,
+            aggregated_mac: mac,
             res_id: reservation.info.res_id,
             res_bw: reservation.info.bandwidth,
             res_start_offset,
