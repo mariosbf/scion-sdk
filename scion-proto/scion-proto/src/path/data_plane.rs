@@ -15,7 +15,7 @@
 
 //! Types and functions for SCION data plane paths.
 
-use std::ops::Deref;
+use std::{num::NonZero, ops::Deref};
 
 use bytes::{Buf, BufMut, Bytes};
 
@@ -165,6 +165,15 @@ where
                 Ok(DataPlanePath::Standard(hummingbird_path.to_reversed()))
             }
             Self::Unsupported { path_type, .. } => Err(UnsupportedPathType(u8::from(*path_type))),
+        }
+    }
+
+    /// Returns the first interface on the path, if it exists.
+    pub fn first_interface(&self) -> Option<NonZero<u16>> {
+        match self {
+            DataPlanePath::Standard(standard_path) => standard_path.iter_interfaces().next(),
+            DataPlanePath::Hummingbird(hbird_path) => hbird_path.iter_interfaces().next(),
+            _ => None,
         }
     }
 }

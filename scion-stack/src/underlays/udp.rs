@@ -27,7 +27,7 @@ use scion_proto::{
     packet::{
         ByEndpoint, PacketClassification, ScionPacketRaw, ScionPacketUdp, classify_scion_packet,
     },
-    path::{DataPlanePath, Path, PathInterface},
+    path::{Path, PathInterface},
     scmp::SCMP_PROTOCOL_NUMBER,
     wire_encoding::{WireDecode as _, WireEncodeVec as _},
 };
@@ -206,17 +206,15 @@ impl UnderlaySocket for UdpUnderlaySocket {
         }
 
         // Extract the source IA and next hop from the packet.
-        let interface_id = if let DataPlanePath::Standard(standard_path) = &packet.headers.path
-            && let Some(interface_id) = standard_path.iter_interfaces().next()
-        {
-            interface_id
-        } else {
+        let interface_id = &packet.headers.path.first_interface();
+        if interface_id.is_none() {
             return Box::pin(async move {
                 Err(ScionSocketSendError::InvalidPacket(
                     "Path does not contain first hop.".into(),
                 ))
             });
         };
+        let interface_id = interface_id.unwrap();
 
         let next_hop = match self
             .underlay_discovery
@@ -271,15 +269,13 @@ impl UnderlaySocket for UdpUnderlaySocket {
         }
 
         // Extract the source IA and next hop from the packet.
-        let interface_id = if let DataPlanePath::Standard(standard_path) = &packet.headers.path
-            && let Some(interface_id) = standard_path.iter_interfaces().next()
-        {
-            interface_id
-        } else {
+        let interface_id = &packet.headers.path.first_interface();
+        if interface_id.is_none() {
             return Err(ScionSocketSendError::InvalidPacket(
                 "Path does not contain first hop.".into(),
             ));
         };
+        let interface_id = interface_id.unwrap();
 
         let next_hop = match self
             .underlay_discovery
@@ -420,16 +416,14 @@ impl AsyncUdpUnderlaySocket for UdpAsyncUdpUnderlaySocket {
         }
 
         // Extract the source IA and next hop from the packet.
-        let interface_id = if let DataPlanePath::Standard(standard_path) = &packet.headers.path
-            && let Some(interface_id) = standard_path.iter_interfaces().next()
-        {
-            interface_id
-        } else {
+        let interface_id = &packet.headers.path.first_interface();
+        if interface_id.is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Path does not contain first hop.".to_string(),
             ));
         };
+        let interface_id = interface_id.unwrap();
 
         let next_hop = self
             .discovery
