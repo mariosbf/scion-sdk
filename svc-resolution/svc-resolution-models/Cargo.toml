@@ -1,0 +1,22 @@
+[package]
+name = "svc-resolution-models"
+version = "0.5.2"
+edition.workspace = true
+authors = ["Anapaya & contributors"]
+license = "Apache-2.0"
+description = "Service resolution models and client trait"
+repository = "https://github.com/anapaya/scion-sdk"
+keywords = ["SCION", "networking"]
+
+[dependencies]
+# Local Dependencies
+scion-protobuf = { workspace = true }
+scion-proto = { workspace = true }
+url = { workspace = true }
+
+# Global Dependencies
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

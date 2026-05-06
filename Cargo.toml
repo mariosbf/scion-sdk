@@ -12,6 +12,7 @@ members = [
     "scion-proto/*",
     "scion-stack",
     "snap/*",
+    "svc-resolution/*",
     "tools/proto-gen",
 ]
 
@@ -35,6 +36,9 @@ hbird-redemption-api-client = { path = "hbird-redemption-api/hbird-redemption-ap
 hbird-redemption-api = { path = "hbird-redemption-api/hbird-redemption-api", version = "0.5.2" }
 hbird-redemption-api-models = { path = "hbird-redemption-api/hbird-redemption-api-models", version = "0.5.2" }
 hbird-redemption-api-protobuf = { path = "hbird-redemption-api/hbird-redemption-api-protobuf", version = "0.5.2" }
+
+svc-resolution-models = { path = "svc-resolution/svc-resolution-models", version = "0.5.2" }
+svc-resolution-client = { path = "svc-resolution/svc-resolution-client", version = "0.5.2" }
 
 # hsd-api = { path = "hsd-api/hsd-api", version = "0.2" }
 # hsd-api-protobuf = { path = "hsd-api/hsd-api-protobuf", version = "0.2" }

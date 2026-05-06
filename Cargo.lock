@@ -1605,9 +1605,9 @@ dependencies = [
 
 [[package]]
 name = "foundations"
-version = "5.6.5"
+version = "5.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d36d8893ec9e7330abf6b33e03308c3824c4e0d2c7a72a7adb02e0e0e375d618"
+checksum = "6634dcef0c06273d416158d512a2a27a8c09f8f5d28c3a10ad17ac3400c32871"
 dependencies = [
  "anyhow",
  "erased-serde",
@@ -1625,9 +1625,9 @@ dependencies = [
 
 [[package]]
 name = "foundations-macros"
-version = "5.6.5"
+version = "5.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a943f490c4526c66ebc9943d0bd72f2caa2545355308a3393830b9c11b08544"
+checksum = "9a6e06fc30d6ff96b8b593f9cfeeb755757e8d1cd0a6946c07e5030ad40c104c"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -4035,9 +4035,9 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "saa"
-version = "5.5.1"
+version = "5.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd8d438861332c3b1ac396c77bd9cac620ea1ff347efb63c05a83d8f0a593899"
+checksum = "68f5acb362a0e75c2a963532fa7fabf13dff81626dc494df16488d30befcbea0"
 
 [[package]]
 name = "same-file"
@@ -4050,9 +4050,9 @@ dependencies = [
 
 [[package]]
 name = "scc"
-version = "3.7.0"
+version = "3.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16c154cf1d115a1e901d7f4e3f279eb6eb455f0d670c1cf3c1aa74d50ad37fa9"
+checksum = "5bcd12b6caff5213cc3c03123cde8c3db5e413008a63b0c0ba35e6275825ea92"
 dependencies = [
  "saa",
  "sdd",
@@ -4862,6 +4862,33 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "svc-resolution-client"
+version = "0.5.2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "prost",
+ "scion-proto",
+ "scion-protobuf",
+ "scion-stack",
+ "svc-resolution-models",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "svc-resolution-models"
+version = "0.5.2"
+dependencies = [
+ "async-trait",
+ "scion-proto",
+ "scion-protobuf",
+ "thiserror 2.0.18",
+ "url",
+]
 
 [[package]]
 name = "symlink"
