@@ -84,9 +84,6 @@ impl UdpScionServiceResolutionClient {
             .await
             .map_err(|e| SvcResolutionError::Receive(e.to_string()))?;
         tracing::trace!(%sender, "received service resolution response");
-        // Sender validation is intentionally omitted: the socket is purpose-built for this
-        // single request/response exchange, and service resolution is typically called once
-        // at startup against a well-known anycast address.
 
         let proto_resp = ServiceResolutionResponse::decode(&recv_buf[..len])
             .map_err(|e| SvcResolutionError::Decode(e.to_string()))?;

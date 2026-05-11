@@ -1880,13 +1880,19 @@ name = "hbird-redemption-api-client"
 version = "0.5.2"
 dependencies = [
  "anyhow",
+ "chrono",
  "hbird-redemption-api",
  "hbird-redemption-api-models",
  "hbird-redemption-api-protobuf",
- "reqwest",
+ "http",
+ "rand 0.8.6",
  "rsa",
  "scion-proto",
  "scion-sdk-reqwest-connect-rpc",
+ "scion-sdk-scion-connect-rpc",
+ "scion-stack",
+ "svc-resolution-client",
+ "svc-resolution-models",
  "tokio",
  "tracing",
  "url",
@@ -1900,6 +1906,10 @@ dependencies = [
  "chrono",
  "rsa",
  "scion-proto",
+ "scion-sdk-reqwest-connect-rpc",
+ "scion-sdk-scion-connect-rpc",
+ "scion-stack",
+ "svc-resolution-models",
  "thiserror 2.0.18",
 ]
 

@@ -49,7 +49,7 @@ impl From<RedemptionRequest> for v1::RedemptionRequest {
     }
 }
 
-/// Converts a batch of model requests and a client key into a proto [`v1::RedemptionRequests`].
+/// Converts a model request and a client key into a proto [`v1::RedemptionRequests`].
 pub fn to_proto_requests(
     requests: Vec<RedemptionRequest>,
     public_key: Vec<u8>,

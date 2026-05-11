@@ -16,6 +16,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use scion_proto::hummingbird::{Bandwidth, Reservation};
+use scion_stack::scionstack::ScionSocketBindError;
 use thiserror::Error;
 
 /// Information about a desired Hummingbird flyover reservation.
@@ -93,6 +94,32 @@ pub enum HbirdRedemptionError {
     /// Decryption error.
     #[error("decryption error: {0}")]
     FailedDecryption(#[from] rsa::errors::Error),
+
+    /// Error making service resolution request
+    #[error("service resolution error: {0}")]
+    ServiceResolution(#[from] svc_resolution_models::SvcResolutionError),
+
+    /// Error parsing PKCS#1 keys
+    #[error("PKCS#1 error: {0}")]
+    Pkcs1(#[from] rsa::pkcs1::Error),
+}
+
+impl From<scion_sdk_reqwest_connect_rpc::client::CrpcClientError> for HbirdRedemptionError {
+    fn from(err: scion_sdk_reqwest_connect_rpc::client::CrpcClientError) -> Self {
+        HbirdRedemptionError::Transport(err.to_string())
+    }
+}
+
+impl From<scion_sdk_scion_connect_rpc::client::RequestError> for HbirdRedemptionError {
+    fn from(err: scion_sdk_scion_connect_rpc::client::RequestError) -> Self {
+        HbirdRedemptionError::Transport(err.to_string())
+    }
+}
+
+impl From<ScionSocketBindError> for HbirdRedemptionError {
+    fn from(err: ScionSocketBindError) -> Self {
+        HbirdRedemptionError::Transport(err.to_string())
+    }
 }
 
 /// Hummingbird redemption service trait.

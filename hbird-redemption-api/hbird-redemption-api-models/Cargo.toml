@@ -11,6 +11,10 @@ keywords = ["SCION", "networking"]
 [dependencies]
 # Local Dependencies
 scion-proto = { workspace = true }
+scion-stack = { workspace = true }
+scion-sdk-reqwest-connect-rpc = { workspace = true }
+scion-sdk-scion-connect-rpc = { workspace = true }
+svc-resolution-models = { workspace = true }
 
 # Global Dependencies
 async-trait = { workspace = true }
