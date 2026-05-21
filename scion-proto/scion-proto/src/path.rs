@@ -45,7 +45,7 @@ use crate::{
     address::IsdAsn,
     hummingbird::Reservation,
     packet::{ByEndpoint, DecodeError},
-    path::hummingbird::{HummingbirdCounter, HummingbirdPathBuilderError},
+    path::hummingbird::{HummingbirdPath, HummingbirdPathBuilderError},
     wire_encoding::WireDecode,
 };
 
@@ -335,20 +335,43 @@ where
             }
         }
     }
+
+    /// Returns the ASes traversed by the path, if available.
+    pub fn ases(&self) -> Option<Vec<IsdAsn>> {
+        self.metadata.as_ref().and_then(|m| {
+            m.interfaces.as_ref().map(|intfs| {
+                intfs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| {
+                        // Except for the first and last AS, every AS appears
+                        // twice in the interfaces list (once as ingress and once
+                        // as egress). Here, we skip the entries corresponding
+                        // to egress interfaces.
+                        *i == 0 || *i % 2 == 1
+                    })
+                    .map(|(_, intf)| intf.isd_asn)
+                    .collect()
+            })
+        })
+    }
 }
 
 /// Error returned when applying reservations to a path fails.
 #[derive(thiserror::Error, Debug)]
-pub enum ApplyReservationError {
+pub enum HummingbirdConversionError {
     /// Path type is not supported for adding reservations.
-    #[error("no underlay available: {0}")]
-    UnsupportedPathType(#[from] UnsupportedPathType),
+    #[error("unsupported path type")]
+    UnsupportedPathType,
     /// Failed to decode underlying data plan path.
     #[error("failed to decode underlying data plane path")]
     DecodeError(#[from] DecodeError),
     /// Error in path Hummingbird path builder.
     #[error("failed to add reservation to path: {0}")]
     HummingbirdPathBuilderError(#[from] HummingbirdPathBuilderError),
+    /// Missing ISD ASN information in path metadata.
+    #[error("missing ISD ASN information in path metadata")]
+    MissingIsdAsn,
 }
 
 impl Path<Bytes> {
@@ -365,37 +388,17 @@ impl Path<Bytes> {
     ///
     /// Parameters:
     /// - `reservations`: the reservations to apply to the path.
-    /// - `timestamp`: the timestamp to use in the Hummingbird path meta header.
-    /// - `counter`: the counter to use in the Hummingbird path meta header, if desired.
     /// - `payload_len`: the length of the payload contained in the packet
     ///   (number of bytes). Used for flyover MAC calculations.
     /// - `address_header_len`: the length of the address header (number of bytes). Used for
-    ///    flyover MAC calculations.
-    pub fn with_reservations_and_timestamp(
+    ///   flyover MAC calculations.
+    pub fn with_reservations(
         self,
         reservations: impl IntoIterator<Item = Reservation>,
-        timestamp: DateTime<Utc>,
-        counter: Option<HummingbirdCounter>,
         payload_len: u16,
         address_header_len: u16,
-    ) -> Result<Self, ApplyReservationError> {
-        let mut hbird_path = match self.data_plane_path {
-            DataPlanePath::EmptyPath => return Ok(self),
-            DataPlanePath::Standard(p) => {
-                // Decode path
-                let standard_path: StandardPath = p.try_into()?;
-
-                // Turn to hbird_path
-                standard_path.to_hummingbird_with_timestamp(timestamp, counter)
-            }
-            DataPlanePath::Hummingbird(p) => p.try_into()?,
-            DataPlanePath::Unsupported {
-                path_type,
-                bytes: _,
-            } => {
-                return Err(UnsupportedPathType(path_type.into()).into());
-            }
-        };
+    ) -> Result<Self, HummingbirdConversionError> {
+        let mut hbird_path = self.to_hbird()?;
 
         for r in reservations {
             hbird_path.add_reservation(r)?;
@@ -415,6 +418,41 @@ impl Path<Bytes> {
             isd_asn: self.isd_asn,
             metadata: self.metadata,
         })
+    }
+
+    /// Converts the path to a Hummingbird path.
+    ///
+    /// If the underlying path is a standard path or an encoded Hummingbird path,
+    /// then the interface information from the path metadata is necessary
+    /// to perform the conversion (see [`Metadata`] [`PathInterface`]).
+    ///
+    /// If the underlying path is of type `Unsupported`, then the conversion
+    /// will fail.
+    pub fn to_hbird(&self) -> Result<HummingbirdPath, HummingbirdConversionError> {
+        match &self.data_plane_path {
+            DataPlanePath::EmptyPath => Ok(HummingbirdPath::new()),
+            DataPlanePath::Standard(p) => {
+                let ifaces = self
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.interfaces.as_ref())
+                    .ok_or(HummingbirdConversionError::MissingIsdAsn)?;
+
+                let standard_path: StandardPath = p.clone().try_into()?;
+                Ok(standard_path.to_hbird(ifaces)?)
+            }
+            DataPlanePath::Hummingbird(p) => {
+                let ases = self
+                    .ases()
+                    .ok_or(HummingbirdConversionError::MissingIsdAsn)?;
+                let mut bytes = p.encoded_path.clone();
+                Ok(HummingbirdPath::decode(&mut bytes, &ases)?)
+            }
+            DataPlanePath::Unsupported {
+                path_type: _,
+                bytes: _,
+            } => Err(HummingbirdConversionError::UnsupportedPathType),
+        }
     }
 }
 

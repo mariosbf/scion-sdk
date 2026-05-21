@@ -486,7 +486,10 @@ fn compare_hbird_path(
 
     // Decode the encoded path to get info/hop fields for detailed comparison
     let mut raw = bytes::Bytes::copy_from_slice(proto_enc.raw());
-    let decoded = scion_proto::path::hummingbird::HummingbirdPath::decode(&mut raw)
+    let total_hops = proto_enc.hop_fields().count();
+    let dummy_ases: Vec<scion_proto::address::IsdAsn> =
+        vec![scion_proto::address::IsdAsn::WILDCARD; total_hops];
+    let decoded = scion_proto::path::hummingbird::HummingbirdPath::decode(&mut raw, &dummy_ases)
         .expect("Failed to decode hbird path from scion-proto");
 
     // Info fields
@@ -521,7 +524,7 @@ fn compare_hbird_path(
     );
     for (i, (&sci_hop, proto_hop)) in sci_hops
         .iter()
-        .zip(decoded.segments().flat_map(|(_, hfs)| hfs.iter()))
+        .zip(decoded.segments().flat_map(|(_, hfs)| hfs.iter().map(|(_, h)| h)))
         .enumerate()
     {
         match (sci_hop, proto_hop) {

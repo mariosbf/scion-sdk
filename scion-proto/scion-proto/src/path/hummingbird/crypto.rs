@@ -23,12 +23,6 @@ pub type HbirdKey = GenericArray<u8, U16>;
 /// Denoted A_K in the Hummingbird paper.
 pub type HbirdAuthKey = GenericArray<u8, U16>;
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq, Clone, Copy)]
-pub enum FlyoverMacCalculationError {
-    #[error("packet length overflow")]
-    PacketLengthOverflow,
-}
-
 /// Calculates the flyover MAC for a flyover hop.
 /// Note: Only calculates the flyover MAC, not the aggregated MAC.
 ///
@@ -71,8 +65,6 @@ pub fn calculate_flyover_mac(
     mac_input_data[8..10].copy_from_slice(&pkt_len.to_be_bytes());
     mac_input_data[10..12].copy_from_slice(&res_start_offset.to_be_bytes());
     mac_input_data[12..16].copy_from_slice(&millis_and_counter.to_be_bytes());
-
-    println!("MAC input data: {:02x?}", mac_input_data);
 
     use aes::cipher::KeyInit;
 
@@ -139,10 +131,16 @@ pub fn calculate_hbird_auth_key(
     flyover_key
 }
 
+/// XORs the bytes of `a` and `b` in place, storing the result in `a`.
+/// If `a` and `b` have different lengths, the excess bytes of the longer slice are
+/// ignored.
 pub fn xor_in_place(a: &mut [u8], b: &[u8]) {
     a.iter_mut().zip(b.iter()).for_each(|(x, y)| *x ^= y);
 }
 
+/// XORs the bytes of `a` and `b`, returning an iterator over the result.
+/// If `a` and `b` have different lengths, the excess bytes of the longer
+/// slice are ignored.
 pub fn xor(a: &[u8], b: &[u8]) -> impl Iterator<Item = u8> {
     a.iter().zip(b.iter()).map(|(x, y)| x ^ y)
 }
@@ -156,16 +154,7 @@ mod tests {
 
     #[test]
     pub fn correct_mac() {
-        // Verifying flyover MAC {"ingress": 1, "egress": 2, "resID": 1, "Bw": 82, "startTime": 3, "Duration": 9,
-        //   "ak": "66584cd6050116c228cc3b4dc2c9cc56"}
-        // FullFlyoverMac input {"dstIA": "1-ff00:0:112", "pktlen": 22, "resStartTime": 3, "highResTime": 1476395008}
-        // FullFlyoverMac buffer {"buffer": "AAH/AAAAARIAFgADWAAAAA=="}
-        //   -> ISD=1, AS=ff00:0:112, pktlen=22, resStartOffset=3, highResTS=0x58000000
-        //   -> millis=(0x58000000>>22)&0x3FF=352, counter=0
-        // SCMP: Aggregate MAC verification failed
-        //   {"expected": "39e6852b6e88", "scionMac": "c8ca9ceb3060", ...}
-        //   -> flyover_mac = expected XOR scionMac = f1 2c 19 c0 5e e8
-
+        // Test case generated using reference implementation in Go.
         let correct_aggregate_mac = [0x39, 0xe6, 0x85, 0x2b, 0x6e, 0x88];
         let scion_mac = [0xc8, 0xca, 0x9c, 0xeb, 0x30, 0x60];
 

@@ -20,7 +20,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 
 pub use super::{
-    EncodedStandardHopField, EncodedInfoField, EncodedSegment, EncodedSegments, HopFields, InfoFields,
+    EncodedInfoField, EncodedSegment, EncodedSegments, EncodedStandardHopField, HopFields,
+    InfoFields,
 };
 use crate::{
     packet::DecodeError,
@@ -200,23 +201,17 @@ where
             let cons_dir = info_field.is_constructed_dir();
 
             seg.hop_fields()
-                .flat_map(move |hop_field| {
-                    match cons_dir {
-                        true => {
-                            [
-                                hop_field.cons_ingress_interface(),
-                                hop_field.cons_egress_interface(),
-                            ]
-                            .into_iter()
-                        }
-                        false => {
-                            [
-                                hop_field.cons_egress_interface(),
-                                hop_field.cons_ingress_interface(),
-                            ]
-                            .into_iter()
-                        }
-                    }
+                .flat_map(move |hop_field| match cons_dir {
+                    true => [
+                        hop_field.cons_ingress_interface(),
+                        hop_field.cons_egress_interface(),
+                    ]
+                    .into_iter(),
+                    false => [
+                        hop_field.cons_egress_interface(),
+                        hop_field.cons_ingress_interface(),
+                    ]
+                    .into_iter(),
                 })
                 .flatten()
         })

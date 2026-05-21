@@ -16,7 +16,7 @@
 //! Errors raised when encoding or decoding SCION packets.
 
 use super::Version;
-use crate::path::DataPlanePathErrorKind;
+use crate::path::{DataPlanePathErrorKind, hummingbird::HummingbirdPathBuilderError};
 
 /// Errors raised when failing to decode a [`ScionPacketRaw`][super::ScionPacketRaw] or
 /// [`ScionPacketUdp`][super::ScionPacketUdp] or its constituents.
@@ -55,6 +55,20 @@ pub enum EncodeError {
     /// This is most likely due to a too long path.
     #[error("packet header is too large")]
     HeaderTooLarge,
+}
+
+/// Errors raised when failing to encode a [`ScionPacketRaw`][super::ScionPacketRaw],
+/// [`super::ScionPacketScmp`], or [`ScionPacketUdp`][super::ScionPacketUdp] when
+/// using a [`HummingbirdPath`][crate::path::hummingbird::HummingbirdPath].
+#[derive(Debug, thiserror::Error, PartialEq, Eq, Clone, Copy)]
+pub enum HbirdEncodeError {
+    /// Encode error
+    #[error("error during packet encoding")]
+    EncodeError(#[from] EncodeError),
+
+    /// Error inside the Hummingbird path builder.
+    #[error("error in the Hummingbird path builder")]
+    HummingbirdPathBuilderError(#[from] HummingbirdPathBuilderError),
 }
 
 /// Errors raised when creating a [`ScionPacketScmp`][super::ScionPacketScmp].

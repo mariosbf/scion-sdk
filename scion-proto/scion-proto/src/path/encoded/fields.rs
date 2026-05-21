@@ -289,6 +289,7 @@ macro_rules! field_iterator {
         }
 
         impl<$life> $name<$life> {
+            /// Creates a new iterator over the encoded hop fields in `data`.
             pub fn new(data: &'a [u8]) -> Self {
                 assert_eq!(data.len() % <$field>::LENGTH, 0);
                 Self {

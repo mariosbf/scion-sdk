@@ -14,20 +14,22 @@
 // limitations under the License.
 //! Standard SCION path.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use bytes::{Buf as _, BufMut, Bytes};
 use chrono::{DateTime, Utc};
-use sciparse::path::standard::types::{StdHopFieldFlags, InfoFieldFlags};
+use sciparse::path::standard::types::{InfoFieldFlags, StdHopFieldFlags};
 
 use super::{HopFieldIndex, InfoFieldIndex, MetaHeader, MetaReserved, SegmentLength, encoded};
 use crate::{
     address::IsdAsn,
     packet::{DecodeError, InadequateBufferSize},
-    path::hummingbird::{
-        FlyoverHopField, FlyoverMacCalculationError, HummingbirdCounter, HummingbirdHopField,
-        HummingbirdMetaHeader, HummingbirdPath, calculate_flyover_mac, calculate_hbird_auth_key,
-        xor_in_place,
+    path::{
+        PathInterface,
+        hummingbird::{
+            FlyoverHopField, HummingbirdCounter, HummingbirdHopField, HummingbirdMetaHeader,
+            HummingbirdPath, calculate_flyover_mac, xor_in_place,
+        },
     },
     wire_encoding::{WireDecode, WireEncode},
 };
@@ -92,29 +94,25 @@ impl StandardPath {
     ) -> Self {
         let info_fields = sciparse_path
             .iter_info_fields()
-            .map(|f| {
-                InfoField {
-                    peer: f.flags.contains(InfoFieldFlags::PEERING),
-                    cons_dir: f.flags.contains(InfoFieldFlags::CONS_DIR),
-                    seg_id: f.segment_id,
-                    timestamp_epoch: f.timestamp,
-                }
+            .map(|f| InfoField {
+                peer: f.flags.contains(InfoFieldFlags::PEERING),
+                cons_dir: f.flags.contains(InfoFieldFlags::CONS_DIR),
+                seg_id: f.segment_id,
+                timestamp_epoch: f.timestamp,
             })
             .collect();
 
         let hop_fields = sciparse_path
             .iter_hop_fields()
-            .map(|f| {
-                StandardHopField {
-                    ingress_router_alert: f
-                        .flags
-                        .contains(StdHopFieldFlags::CONS_INGRESS_ROUTER_ALERT),
-                    egress_router_alert: f.flags.contains(StdHopFieldFlags::CONS_EGRESS_ROUTER_ALERT),
-                    exp_time: f.expiration_units,
-                    cons_ingress: f.cons_ingress,
-                    cons_egress: f.cons_egress,
-                    mac: f.mac.0,
-                }
+            .map(|f| StandardHopField {
+                ingress_router_alert: f
+                    .flags
+                    .contains(StdHopFieldFlags::CONS_INGRESS_ROUTER_ALERT),
+                egress_router_alert: f.flags.contains(StdHopFieldFlags::CONS_EGRESS_ROUTER_ALERT),
+                exp_time: f.expiration_units,
+                cons_ingress: f.cons_ingress,
+                cons_egress: f.cons_egress,
+                mac: f.mac.0,
             })
             .collect();
 
@@ -136,40 +134,55 @@ impl StandardPath {
         }
     }
 
-    /// Turns this path into a HummingbirdPath with the current timestamp and
-    /// a default counter value.
-    pub fn to_hummingbird(self) -> HummingbirdPath {
-        self.to_hummingbird_with_timestamp(DateTime::<Utc>::from(SystemTime::now()), None)
+    /// Turns this path into a HummingbirdPath with a default counter value.
+    pub fn to_hbird(
+        self,
+        interfaces: &[PathInterface],
+    ) -> Result<HummingbirdPath, super::HummingbirdConversionError> {
+        self.to_hbird_with_counter(HummingbirdCounter::default(), interfaces)
     }
 
-    /// Turns this path into a HummingbirdPath with the provided timestamp and
-    /// counter.
+    /// Turns this path into a HummingbirdPath with the provided counter value.
     ///
-    /// # Panics
-    ///
-    /// Panics if the provided timestamp is before the UNIX epoch, since the
-    /// HummingbirdMetaHeader requires a timestamp that is the number of seconds
-    /// since the UNIX epoch.
-    pub fn to_hummingbird_with_timestamp(
+    /// Returns [`super::HummingbirdConversionError::MissingIsdAsn`] if `interfaces` does not
+    /// contain enough entries to cover every hop field in the path.
+    pub fn to_hbird_with_counter(
         self,
-        timestamp: DateTime<Utc>,
-        counter: Option<HummingbirdCounter>,
-    ) -> HummingbirdPath {
-        let segments =
-            self.path_meta
-                .segment_lengths
-                .iter()
-                .scan(&self.hop_fields[..], |rest, &len| {
-                    let (head, tail) = rest.split_at(len.length());
-                    *rest = tail;
-                    Some(
-                        head.iter()
-                            .map(|hf| HummingbirdHopField::Standard(hf.clone()))
-                            .collect(),
-                    )
-                });
+        counter: HummingbirdCounter,
+        interfaces: &[PathInterface],
+    ) -> Result<HummingbirdPath, super::HummingbirdConversionError> {
+        let mut iface_index = 0;
 
-        let mut hbird_path = HummingbirdPath::new_with_timestamp(timestamp, counter);
+        let mut remaining_hops = &self.hop_fields[..];
+        let mut segments = vec![];
+        for segment_len in self
+            .path_meta
+            .segment_lengths
+            .iter()
+            .map(|v| v.get() as usize)
+        {
+            let mut segment_hops = Vec::with_capacity(segment_len);
+
+            for hop in &remaining_hops[..segment_len] {
+                let isd_as = interfaces
+                    .get(iface_index)
+                    .ok_or(super::HummingbirdConversionError::MissingIsdAsn)?
+                    .isd_asn;
+                segment_hops.push((isd_as, HummingbirdHopField::Standard(hop.clone())));
+
+                if hop.cons_ingress != 0 {
+                    iface_index += 1;
+                }
+                if hop.cons_egress != 0 {
+                    iface_index += 1;
+                }
+            }
+
+            remaining_hops = &remaining_hops[segment_len..];
+            segments.push(segment_hops);
+        }
+
+        let mut hbird_path = HummingbirdPath::new_with_counter(counter);
         hbird_path.set_current_info_field_index(self.path_meta.current_info_field.into());
         hbird_path.set_current_hop_field_index(self.path_meta.current_hop_field.into());
 
@@ -177,7 +190,7 @@ impl StandardPath {
             hbird_path.add_segment(info_field, segment).unwrap();
         }
 
-        hbird_path
+        Ok(hbird_path)
     }
 }
 
@@ -444,7 +457,7 @@ impl StandardHopField {
         reservation: &crate::hummingbird::Reservation,
         destination: IsdAsn,
         pkt_len: u16,
-    ) -> Result<FlyoverHopField, FlyoverMacCalculationError> {
+    ) -> FlyoverHopField {
         // TODO: Casting to u16 could be problematic
         let res_start_offset = (meta_header.base_timestamp.get() - reservation.info.start) as u16;
 
@@ -460,7 +473,7 @@ impl StandardHopField {
         let mut mac = self.mac;
         xor_in_place(&mut mac, &flyover_mac);
 
-        Ok(FlyoverHopField {
+        FlyoverHopField {
             ingress_router_alert: self.ingress_router_alert,
             egress_router_alert: self.egress_router_alert,
             exp_time: self.exp_time,
@@ -471,7 +484,7 @@ impl StandardHopField {
             res_bw: reservation.info.bandwidth,
             res_start_offset,
             res_duration: reservation.info.duration,
-        })
+        }
     }
 }
 

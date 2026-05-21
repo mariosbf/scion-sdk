@@ -226,7 +226,7 @@ use quic::{AddressTranslator, Endpoint, ScionAsyncUdpSocket};
 use scion_proto::{
     address::{Isd, IsdAsn, SocketAddr},
     packet::ScionPacketRaw,
-    path::Path,
+    path::{HummingbirdConversionError, Path},
 };
 use scion_sdk_reqwest_connect_rpc::client::CrpcClientError;
 use snap_tun::client::ConnectSnapTunSocketError;
@@ -901,6 +901,17 @@ pub enum ScionSocketSendError {
     /// Error return when send is called on a socket that is not connected.
     #[error("socket is not connected")]
     NotConnected,
+}
+
+/// Error returned by [`UdpScionSocket::send_to_via_with_reservations`].
+#[derive(Debug, thiserror::Error)]
+pub enum SendWithReservationsError {
+    /// Failed to convert the path to Hummingbird format or apply reservations.
+    #[error("hummingbird path conversion failed: {0}")]
+    Conversion(#[from] HummingbirdConversionError),
+    /// The underlying send failed.
+    #[error("send failed: {0}")]
+    Send(#[from] ScionSocketSendError),
 }
 
 /// Minimum size of the path buffer required by [`ScionSocketReceiveError::PathBufTooSmall`].

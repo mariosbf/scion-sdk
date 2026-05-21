@@ -17,12 +17,13 @@ use std::{sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use chrono::Utc;
-use futures::future::BoxFuture;
+use futures::{FutureExt, TryFutureExt, future::BoxFuture};
 use scion_proto::{
     address::{ScionAddr, SocketAddr},
     datagram::UdpMessage,
+    hummingbird::Reservation,
     packet::{ByEndpoint, ScionPacketRaw, ScionPacketScmp, ScionPacketUdp},
-    path::Path,
+    path::{HummingbirdConversionError, Path, hummingbird::HummingbirdPath},
     scmp::{SCMP_PROTOCOL_NUMBER, ScmpMessage},
 };
 use scion_sdk_quic_scion::socket::{BoxedSocketError, GenericScionUdpSocket};
@@ -32,7 +33,7 @@ use crate::{
     path::manager::{MultiPathManager, traits::PathManager},
     scionstack::{
         MIN_PATH_BUFFER_SIZE, ScionSocketConnectError, ScionSocketReceiveError,
-        ScionSocketSendError, scmp_handler::ScmpHandler,
+        ScionSocketSendError, SendWithReservationsError, scmp_handler::ScmpHandler,
     },
     types::Subscribers,
 };
@@ -94,6 +95,34 @@ impl PathUnawareUdpScionSocket {
         }
         .into();
         self.inner.send(packet)
+    }
+
+    /// Send a SCION UDP datagram via the given Hummingbird path.
+    pub fn send_to_via_hbird<'a>(
+        &'a self,
+        payload: &[u8],
+        destination: SocketAddr,
+        path: &mut HummingbirdPath,
+    ) -> BoxFuture<'a, Result<Path, ScionSocketSendError>> {
+        let (udp_packet, path) = match ScionPacketUdp::new_with_hbird_path(
+            ByEndpoint {
+                source: self.inner.local_addr(),
+                destination,
+            },
+            path,
+            Bytes::copy_from_slice(payload),
+        ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                return Box::pin(async move {
+                    Err(ScionSocketSendError::InvalidPacket(
+                        format!("error encoding packet: {e}").into(),
+                    ))
+                });
+            }
+        };
+        let packet: ScionPacketRaw = udp_packet.into();
+        self.inner.send(packet).map_ok(|_| path).boxed()
     }
 
     /// Receive a SCION packet with the sender and path.
@@ -514,6 +543,57 @@ impl<P: PathManager> UdpScionSocket<P> {
                 self.send_error_receivers
                     .for_each(|receiver| receiver.report_send_error(e));
             })
+    }
+
+    /// Send a datagram to the specified destination using a Hummingbird path.
+    pub async fn send_to_via_hbird(
+        &self,
+        payload: &[u8],
+        destination: SocketAddr,
+        hummingbird_path: &mut HummingbirdPath,
+    ) -> Result<Path, ScionSocketSendError> {
+        self.socket
+            .send_to_via_hbird(payload, destination, hummingbird_path)
+            .await
+            .inspect_err(|e| {
+                self.send_error_receivers
+                    .for_each(|receiver| receiver.report_send_error(e));
+            })
+    }
+
+    /// Send a datagram to the specified destination using the given path and Hummingbird
+    /// reservations.
+    ///
+    /// The path is converted to a Hummingbird path and the reservations are applied before
+    /// sending. Returns a [`SendWithReservationsError::Conversion`] if the path cannot be
+    /// converted or a reservation cannot be applied, and a [`SendWithReservationsError::Send`]
+    /// if the underlying send fails.
+    pub async fn send_to_via_with_reservations(
+        &self,
+        payload: &[u8],
+        destination: SocketAddr,
+        path: &Path<&[u8]>,
+        reservations: &[Reservation],
+    ) -> Result<Path, SendWithReservationsError> {
+        let bytes_path = path.to_bytes_path();
+
+        let mut hbird_path = bytes_path.to_hbird()?;
+        for r in reservations {
+            hbird_path
+                .add_reservation(r.clone())
+                .map_err(HummingbirdConversionError::from)?;
+        }
+
+        let sent_path = self
+            .socket
+            .send_to_via_hbird(payload, destination, &mut hbird_path)
+            .await
+            .inspect_err(|e| {
+                self.send_error_receivers
+                    .for_each(|receiver| receiver.report_send_error(e));
+            })?;
+
+        Ok(sent_path)
     }
 
     /// Receive a datagram from any address, along with the sender address and path.

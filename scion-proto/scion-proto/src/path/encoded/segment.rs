@@ -94,6 +94,7 @@ impl<'a, Hs> EncodedSegments<'a, Hs>
 where
     Hs: Clone,
 {
+    /// Creates a new iterator over the provided encoded path segments.
     pub fn new(segments: [Option<EncodedSegment<'a, Hs>>; 3]) -> Self {
         let end = segments.iter().position(Option::is_none).unwrap_or(3);
         Self {

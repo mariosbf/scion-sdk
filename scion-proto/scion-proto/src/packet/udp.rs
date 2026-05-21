@@ -21,8 +21,8 @@ use super::{InadequateBufferSize, MessageChecksum, ScionHeaders, ScionPacket, Sc
 use crate::{
     address::SocketAddr,
     datagram::{UdpDecodeError, UdpMessage},
-    packet::{ByEndpoint, EncodeError},
-    path::DataPlanePath,
+    packet::{AddressHeader, ByEndpoint, EncodeError, error::HbirdEncodeError},
+    path::{DataPlanePath, Path, hummingbird::HummingbirdPath},
     wire_encoding::{WireDecode, WireEncodeVec},
 };
 
@@ -86,6 +86,46 @@ impl ScionPacketUdp {
         datagram.set_checksum(&headers.address);
 
         Ok(Self { headers, datagram })
+    }
+
+    /// Creates a new SCION UDP packet pased on the UDP payload and Hummingbird
+    /// path.
+    pub fn new_with_hbird_path(
+        endhosts: ByEndpoint<SocketAddr>,
+        hbird_path: &mut HummingbirdPath,
+        payload: Bytes,
+    ) -> Result<(Self, Path), HbirdEncodeError> {
+        let address_header = AddressHeader::from(endhosts);
+
+        let udp_header_len =
+            u16::try_from(UdpMessage::HEADER_LEN).map_err(|_| EncodeError::PayloadTooLarge)?;
+
+        let payload_len = u16::try_from(payload.len()).map_err(|_| EncodeError::PayloadTooLarge)?;
+
+        let payload_len = payload_len
+            .checked_add(udp_header_len)
+            .ok_or(EncodeError::PayloadTooLarge)?;
+
+        let path = hbird_path.to_bytes_path(
+            endhosts.source.isd_asn(),
+            endhosts.destination.isd_asn(),
+            payload_len,
+            address_header.total_length() as u16,
+            None,
+        )?;
+
+        let headers = ScionHeaders::new_with_ports(
+            endhosts,
+            path.data_plane_path.clone(),
+            UdpMessage::PROTOCOL_NUMBER,
+            payload_len as usize,
+        )?;
+
+        let mut datagram = UdpMessage::new(endhosts.map(|e| e.port()), payload)
+            .map_err(|_| EncodeError::PayloadTooLarge)?;
+        datagram.set_checksum(&headers.address);
+
+        Ok((Self { headers, datagram }, path))
     }
 }
 

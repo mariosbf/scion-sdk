@@ -1,4 +1,6 @@
-use std::{collections::HashMap, ops::Deref, time::SystemTime};
+//! Hummingbird path type and associated encoding.
+
+use std::{collections::HashMap, ops::Deref};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use chrono::{DateTime, Utc};
@@ -6,17 +8,19 @@ use chrono::{DateTime, Utc};
 use crate::{
     address::IsdAsn,
     hummingbird::Reservation,
-    packet::{CommonHeader, DecodeError, InadequateBufferSize},
+    packet::{ByEndpoint, CommonHeader, DecodeError, InadequateBufferSize},
     path::{
-        EncodedHopField, EncodedInfoField, EncodedSegment, EncodedSegments,
+        DataPlanePath, EncodedHopField, EncodedInfoField, EncodedSegment, EncodedSegments,
         EncodedStandardHopField, EncodedStandardPath, HopField, HopFieldIndex, InfoField,
-        InfoFieldIndex, InfoFields, MetaHeader, MetaReserved, SegmentLength, StandardHopField,
+        InfoFieldIndex, InfoFields, MetaHeader, MetaReserved, Path, SegmentLength,
+        StandardHopField,
         hummingbird::{
-            EncodedFlyoverHopField, FlyoverHopField, FlyoverMacCalculationError,
-            HummingbirdCounter, HummingbirdHopField, HummingbirdHopFields,
-            HummingbirdHopfieldIndex, HummingbirdInfoFieldIndex, HummingbirdMetaHeader,
-            HummingbirdMetaReserved, HummingbirdSegmentLength,
+            EncodedFlyoverHopField, FlyoverHopField, HummingbirdBaseTimestamp, HummingbirdCounter,
+            HummingbirdHopField, HummingbirdHopFields, HummingbirdHopfieldIndex,
+            HummingbirdInfoFieldIndex, HummingbirdMetaHeader, HummingbirdMetaReserved,
+            HummingbirdMillisTimestamp, HummingbirdSegmentLength,
         },
+        metadata::{Metadata, PathInterface},
     },
     wire_encoding::{WireDecode, WireEncode},
 };
@@ -139,7 +143,7 @@ where
         InfoFields::new(&self.encoded_path[start..stop])
     }
 
-    /// Returns an iterator over all of the [`EncodedHummingbirdHopFields`]s in
+    /// Returns an iterator over all of the [`EncodedHummingbirdHopField`]s in
     /// the path.
     pub fn hop_fields(&self) -> HummingbirdHopFields<'_> {
         let start = HummingbirdMetaHeader::info_field_offset(0)
@@ -460,19 +464,6 @@ pub enum HummingbirdPathBuilderError {
     #[error("A Hummingbird segment can be at most 508 bytes long")]
     SegmentTooLong,
 
-    /// Invalid reservation start relative to path meta header, e.g. reservation
-    /// starts in the future or start offset is too large to fit in the hop field.
-    #[error("Invalid reservation start relative to path meta header")]
-    InvalidReservationStart,
-
-    /// Reservation is not applicable to any hop field in the path.
-    /// A reservation is applicable to a hop field if the hop field is not
-    /// a flyover hop field and the reservation's ingress and egress
-    /// interfaces match the hop field's interfaces (in the appropriate
-    /// direction).
-    #[error("Reservation is not applicable to any hop field in the path")]
-    ReservationNotApplicable,
-
     /// Current hop field index is not valid, i.e., either not divisible
     /// by 4 or it the value is too large to fit in the allocated bits.
     #[error("Current hop field index is not valid")]
@@ -482,9 +473,27 @@ pub enum HummingbirdPathBuilderError {
     #[error("The provided buffer did not have sufficient size")]
     InadequateBufferSize,
 
-    /// Error trying to compute flyover MAC.
-    #[error("Error calculating flyover MAC for reservation")]
-    FlyoverMacCalculationError(#[from] FlyoverMacCalculationError),
+    /// Invalid base timestamp, i.e., base timestamp does not fit in the meta header field.
+    #[error("Invalid base timestamp")]
+    InvalidBaseTimestamp(i64),
+
+    /// Invalid milliseconds timestamp, i.e., milliseconds timestamp does not fit in the meta
+    /// header field.
+    #[error("Invalid milliseconds timestamp")]
+    InvalidMillisTimestamp(u32),
+
+    /// Payload to long.
+    #[error("Payload too long")]
+    PayloadTooLong,
+
+    /// Decoding error
+    #[error("Decoding error")]
+    DecodeError(#[from] DecodeError),
+
+    /// The `ases` slice provided to `decode` does not contain enough entries for
+    /// the number of hop fields in the encoded path.
+    #[error("Insufficient AS information: not enough ISD-AS entries for the encoded path")]
+    InsufficientAsInfo,
 }
 
 impl From<InadequateBufferSize> for HummingbirdPathBuilderError {
@@ -496,6 +505,7 @@ impl From<InadequateBufferSize> for HummingbirdPathBuilderError {
 /// A pair of ingress and egress interfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ReservationInterfaces {
+    isd_as: IsdAsn,
     ingress_interface: u16,
     egress_interface: u16,
 }
@@ -525,36 +535,28 @@ pub struct HummingbirdPath {
     info_fields: Vec<InfoField>,
 
     /// Segments of the path.
-    segments: Vec<Vec<HummingbirdHopField>>,
+    segments: Vec<Vec<(IsdAsn, HummingbirdHopField)>>,
 
     /// Reservations to apply when encoding
     reservations: HashMap<ReservationInterfaces, Vec<Reservation>>,
 }
 
 impl HummingbirdPath {
-    /// Creates a new HummingbirdPath with the current system time as the base  
-    /// timestamp, a default counter and no reservations.   
+    /// Creates a new HummingbirdPath a default counter.
     pub fn new() -> HummingbirdPath {
-        Self::new_with_timestamp(DateTime::<Utc>::from(SystemTime::now()), None)
+        Self::new_with_counter(HummingbirdCounter::default())
     }
 
-    /// Creates a new HummingbirdPath with the specified base timestamp, an optional
-    /// counter, and no reservations. If the counter is not provided, the default
-    /// value is picked.
-    pub fn new_with_timestamp(
-        timestamp: DateTime<Utc>,
-        counter: Option<HummingbirdCounter>,
-    ) -> HummingbirdPath {
-        let millis = timestamp.timestamp_subsec_millis() as u16;
-
+    /// Creates a new HummingbirdPath with the given counter value.
+    pub fn new_with_counter(counter: HummingbirdCounter) -> HummingbirdPath {
         let meta_header = HummingbirdMetaHeader {
             current_info_field: 0.into(),
             current_hop_field: HummingbirdHopfieldIndex::new_unchecked(0),
             reserved: HummingbirdMetaReserved::default(),
             segment_lengths: [HummingbirdSegmentLength::new_unchecked(0); 3],
-            base_timestamp: timestamp.into(),
-            millis_timestamp: millis.into(),
-            counter: counter.unwrap_or_default(),
+            base_timestamp: 0.into(),
+            millis_timestamp: 0.into(),
+            counter,
         };
 
         HummingbirdPath {
@@ -585,21 +587,6 @@ impl HummingbirdPath {
         self.path_meta.current_hop_field = index;
     }
 
-    /// Returns the base timestamp of the path.
-    pub fn base_timestamp(&self) -> u32 {
-        self.path_meta.base_timestamp()
-    }
-
-    /// Returns the millis timestamp of the path.
-    pub fn millis_timestamp(&self) -> u16 {
-        self.path_meta.millis_timestamp()
-    }
-
-    /// Set the millis timestamp of the path to the specified value.
-    pub fn set_millis_timestamp(&mut self, millis: u16) {
-        self.path_meta.millis_timestamp = millis.into();
-    }
-
     /// Returns the counter of the path.
     pub fn counter(&self) -> HummingbirdCounter {
         self.path_meta.counter
@@ -608,17 +595,6 @@ impl HummingbirdPath {
     /// Set the counter of the path to the specified value.
     pub fn set_counter(&mut self, counter: HummingbirdCounter) {
         self.path_meta.counter = counter;
-    }
-
-    /// Returns an iterator over all hop fields in the path zipped
-    /// with their corresponding info fields.
-    fn hopfields_with_infofield(&self) -> impl Iterator<Item = (&InfoField, &HummingbirdHopField)> {
-        self.segments
-            .iter()
-            .zip(self.info_fields.iter())
-            .flat_map(|(segment, info_field)| {
-                segment.iter().map(move |hop_field| (info_field, hop_field))
-            })
     }
 
     /// Returns an iterator over the reservations added to this path.
@@ -633,12 +609,8 @@ impl HummingbirdPath {
         &mut self,
         reservation: Reservation,
     ) -> Result<(), HummingbirdPathBuilderError> {
-        if self.path_meta.base_timestamp() < reservation.info.start {
-            // Reservation start is in the future, so it cannot be applied to this path.
-            return Err(HummingbirdPathBuilderError::InvalidReservationStart);
-        }
-
         let interfaces = ReservationInterfaces {
+            isd_as: reservation.info.isd_as,
             ingress_interface: reservation.info.ingress_interface,
             egress_interface: reservation.info.egress_interface,
         };
@@ -652,7 +624,7 @@ impl HummingbirdPath {
     }
 
     /// Return an iterator over the segments on this path.
-    pub fn segments(&self) -> impl Iterator<Item = (&InfoField, &[HummingbirdHopField])> {
+    pub fn segments(&self) -> impl Iterator<Item = (&InfoField, &[(IsdAsn, HummingbirdHopField)])> {
         self.segments
             .iter()
             .zip(self.info_fields.iter())
@@ -663,7 +635,7 @@ impl HummingbirdPath {
     pub fn add_segment(
         &mut self,
         info_field: InfoField,
-        hop_fields: Vec<HummingbirdHopField>,
+        hop_fields: Vec<(IsdAsn, HummingbirdHopField)>,
     ) -> Result<(), HummingbirdPathBuilderError> {
         if self.info_fields.len() >= 3 {
             return Err(HummingbirdPathBuilderError::TooManySegments);
@@ -671,7 +643,7 @@ impl HummingbirdPath {
 
         let segment_len = hop_fields
             .iter()
-            .map(WireEncode::encoded_length)
+            .map(|(_, hop_field)| hop_field.encoded_length())
             .sum::<usize>();
 
         let segment_len = HummingbirdSegmentLength::new(segment_len)
@@ -697,16 +669,12 @@ impl HummingbirdPath {
             .count();
 
         self.path_meta.encoded_length()
-            + self
-                .info_fields
-                .iter()
-                .map(|f| f.encoded_length())
-                .sum::<usize>()
+            + self.info_fields_len()
             + self
                 .segments
                 .iter()
                 .flat_map(|s| s.iter())
-                .map(|f| f.encoded_length())
+                .map(|(_, hop_field)| hop_field.encoded_length())
                 .sum::<usize>()
             + hop_fields_with_applicable_reservations
                 * (FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE)
@@ -750,38 +718,36 @@ impl HummingbirdPath {
         let seg_iter = self.segments.iter();
         let info_iter = self.info_fields.iter();
 
-        let mut iter = seg_iter.zip(info_iter).enumerate().peekable();
+        let mut seg_and_info_iter = seg_iter.zip(info_iter).enumerate().peekable();
 
         // Create iterator over hop fields with
         // - the segment index
         // - the index of the hop field
         // - reservation to apply (if such a reservation exists)
-        while let Some((seg_idx, (segment, info))) = iter.next() {
-            let next = iter.peek();
+        while let Some((seg_idx, (segment, info))) = seg_and_info_iter.next() {
+            let next = seg_and_info_iter.peek();
             let next_segment = next.map(|(_, (s, _))| s);
             let next_info = next.map(|(_, (_, i))| i);
 
             let first_hop_of_next_segment = next_segment.and_then(|s| s.first());
 
-            for (hop_idx, hop_field) in segment.iter().enumerate() {
+            for (hop_idx, (hop_isd_asn, hop_field)) in segment.iter().enumerate() {
                 let is_last_hop_of_segment = hop_idx == segment.len() - 1;
 
                 let (ingress, egress) = hop_field.interfaces(info.cons_dir);
-                let interfaces = {
-                    if is_last_hop_of_segment {
-                        let egress = first_hop_of_next_segment
-                            .map(|h| h.interfaces(next_info.unwrap().cons_dir).1)
-                            .unwrap_or(egress);
-                        ReservationInterfaces {
-                            ingress_interface: ingress,
-                            egress_interface: egress,
-                        }
-                    } else {
-                        ReservationInterfaces {
-                            ingress_interface: ingress,
-                            egress_interface: egress,
-                        }
-                    }
+                let egress = if is_last_hop_of_segment {
+                    // For the last hop of a segment the effective egress is the
+                    // egress of the first hop of the next segment (segment boundary).
+                    first_hop_of_next_segment
+                        .map(|(_, h)| h.interfaces(next_info.unwrap().cons_dir).1)
+                        .unwrap_or(egress)
+                } else {
+                    egress
+                };
+                let interfaces = ReservationInterfaces {
+                    ingress_interface: ingress,
+                    egress_interface: egress,
+                    isd_as: *hop_isd_asn,
                 };
 
                 let reservation = self
@@ -794,6 +760,31 @@ impl HummingbirdPath {
         }
 
         hop_fields
+    }
+
+    fn set_timestamp(&mut self, time: DateTime<Utc>) -> Result<(), HummingbirdPathBuilderError> {
+        let base_timestamp = time
+            .timestamp()
+            .try_into()
+            .ok()
+            .and_then(HummingbirdBaseTimestamp::new)
+            .ok_or(HummingbirdPathBuilderError::InvalidBaseTimestamp(
+                time.timestamp(),
+            ))?;
+
+        let millis_timestamp = time
+            .timestamp_subsec_millis()
+            .try_into()
+            .ok()
+            .and_then(HummingbirdMillisTimestamp::new)
+            .ok_or(HummingbirdPathBuilderError::InvalidMillisTimestamp(
+                time.timestamp_subsec_millis(),
+            ))?;
+
+        self.path_meta.base_timestamp = base_timestamp;
+        self.path_meta.millis_timestamp = millis_timestamp;
+
+        Ok(())
     }
 
     /// Apply reservations by turning applicable hop fields into flyover hop
@@ -812,6 +803,8 @@ impl HummingbirdPath {
         address_header_len: u16,
         unchecked: bool,
     ) -> Result<(), HummingbirdPathBuilderError> {
+        self.set_timestamp(Utc::now())?;
+
         let meta_header = self.path_meta;
         let mut curr_hf_index = meta_header.current_hop_field.byte_offset();
 
@@ -828,7 +821,7 @@ impl HummingbirdPath {
                 .segments
                 .iter()
                 .flat_map(|s| s.iter())
-                .map(|f| f.encoded_length())
+                .map(|(_, hop_field)| hop_field.encoded_length())
                 .sum::<usize>()
             + hop_fields_with_applicable_reservations
                 * (FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE);
@@ -837,16 +830,14 @@ impl HummingbirdPath {
             .and_then(|v| v.checked_add(CommonHeader::LENGTH as u16))
             .and_then(|v| v.checked_add(address_header_len))
             .and_then(|v| v.checked_add(payload_len))
-            .ok_or(HummingbirdPathBuilderError::FlyoverMacCalculationError(
-                FlyoverMacCalculationError::PacketLengthOverflow,
-            ))?;
+            .ok_or(HummingbirdPathBuilderError::PayloadTooLong)?;
 
         // Keep track of byte offset of hop fields as we iterate through them
         let mut hop_offset = 0;
         let mut seglens = [0; 3];
 
         for (seg_idx, hop_idx, res) in hop_fields {
-            let hop = &mut self.segments[seg_idx][hop_idx];
+            let (_, hop) = &mut self.segments[seg_idx][hop_idx];
             if let Some(res) = res {
                 if let HummingbirdHopField::Standard(sp) = hop {
                     *hop = HummingbirdHopField::Flyover(sp.apply_reservation(
@@ -854,7 +845,7 @@ impl HummingbirdPath {
                         &res,
                         destination,
                         pkt_len,
-                    )?);
+                    ));
                 }
 
                 // If the matched hop field is before the current hop field, the
@@ -928,7 +919,7 @@ impl HummingbirdPath {
         for info in self.info_fields.iter() {
             info.encode_to(buffer)?;
         }
-        for hop_field in self.segments.iter().flat_map(|s| s.iter()) {
+        for (_, hop_field) in self.segments.iter().flat_map(|s| s.iter()) {
             hop_field.encode_to(buffer)?;
         }
 
@@ -971,7 +962,7 @@ impl HummingbirdPath {
         for info in self.info_fields.iter() {
             info.encode_to_unchecked(buffer);
         }
-        for hop_field in self.segments.iter().flat_map(|s| s.iter()) {
+        for (_, hop_field) in self.segments.iter().flat_map(|s| s.iter()) {
             hop_field.encode_to_unchecked(buffer);
         }
     }
@@ -1008,26 +999,80 @@ impl HummingbirdPath {
             encoded_path: buffer.into(),
         })
     }
-}
 
-impl Default for HummingbirdPath {
-    fn default() -> Self {
-        Self::new()
+    /// Encodes this path (applying reservations) and returns a [`Path<Bytes>`]
+    /// ready for use in a SCION packet.
+    ///
+    /// The `interfaces` field of the returned path's [`Metadata`] is populated
+    /// from the decoded segments. All other metadata fields are left at their
+    /// defaults.
+    ///
+    /// Parameters:
+    /// - `source`: The source ISD-AS of the path.
+    /// - `destination`: The destination ISD-AS of the path, used for calculating the
+    ///   flyover hop field MACs.
+    /// - `payload_len`: the length of the payload contained in the packet
+    ///   (number of bytes). Used for flyover MAC calculations.
+    /// - `additional_reservations`: Additional reservations to apply only for this
+    ///   particular encoding of the path.
+    pub fn to_bytes_path(
+        &mut self,
+        source: IsdAsn,
+        destination: IsdAsn,
+        payload_len: u16,
+        address_header_len: u16,
+        additional_reservations: Option<&HashMap<ReservationInterfaces, Vec<Reservation>>>,
+    ) -> Result<Path<Bytes>, HummingbirdPathBuilderError> {
+        // Build PathInterface list from decoded segments.
+        let interfaces: Vec<PathInterface> = self
+            .segments()
+            .flat_map(|(info_field, hops)| {
+                let cons_dir = info_field.cons_dir;
+                hops.iter().flat_map(move |(isd_asn, hop_field)| {
+                    let (ingress, egress) = hop_field.interfaces(cons_dir);
+                    [
+                        (ingress != 0).then(|| PathInterface::new(*isd_asn, ingress)),
+                        (egress != 0).then(|| PathInterface::new(*isd_asn, egress)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                })
+            })
+            .collect();
+
+        let encoded = self.to_encoded(
+            destination,
+            payload_len,
+            address_header_len,
+            additional_reservations,
+        )?;
+
+        let mut path = Path::new(
+            DataPlanePath::Hummingbird(encoded),
+            ByEndpoint {
+                source,
+                destination,
+            },
+            None,
+        );
+        path.metadata = Some(Metadata {
+            interfaces: Some(interfaces),
+            ..Default::default()
+        });
+
+        Ok(path)
     }
-}
 
-impl TryFrom<EncodedHummingbirdPath> for HummingbirdPath {
-    type Error = DecodeError;
-
-    fn try_from(mut value: EncodedHummingbirdPath) -> Result<Self, Self::Error> {
-        Self::decode(&mut value.encoded_path)
-    }
-}
-
-impl WireDecode<Bytes> for HummingbirdPath {
-    type Error = DecodeError;
-
-    fn decode(data: &mut Bytes) -> Result<Self, Self::Error> {
+    /// Decodes a Hummingbird path from the provided byte buffer and ISD-AS list.
+    ///
+    /// The AS list needs to contain the ISD-AS numbers of each AS along the path,
+    /// in the same order as they are traversed by the path.
+    ///
+    /// Parameters:
+    /// - `data`: byte buffer containing the encoded path. The buffer will be
+    ///   modified by advancing it past the bytes that were decoded.
+    /// - `ases`: list of ISD-AS numbers corresponding to the ASes along the path, in order.
+    pub fn decode(data: &mut Bytes, ases: &[IsdAsn]) -> Result<Self, HummingbirdPathBuilderError> {
         let meta_header = HummingbirdMetaHeader::decode(data)?;
 
         let mut info_fields = Vec::new();
@@ -1038,6 +1083,7 @@ impl WireDecode<Bytes> for HummingbirdPath {
             info_fields.push(info_field);
         }
 
+        let mut as_idx = 0;
         for i in 0..3 {
             let mut seg_len = meta_header.segment_lengths[i as usize].length();
             if seg_len == 0 {
@@ -1048,7 +1094,18 @@ impl WireDecode<Bytes> for HummingbirdPath {
             while seg_len > 0 {
                 let hop_field = HummingbirdHopField::decode(data)?;
                 seg_len -= hop_field.encoded_length();
-                hop_fields.push(hop_field);
+
+                let isd_as = ases
+                    .get(as_idx)
+                    .copied()
+                    .ok_or(HummingbirdPathBuilderError::InsufficientAsInfo)?;
+                hop_fields.push((isd_as, hop_field));
+
+                if seg_len != 0 {
+                    // Don't move to next ISD-AS after last hop of segment
+                    // because the next hop will be in the same AS
+                    as_idx += 1;
+                }
             }
             segments.push(hop_fields);
         }
@@ -1062,12 +1119,15 @@ impl WireDecode<Bytes> for HummingbirdPath {
     }
 }
 
+impl Default for HummingbirdPath {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU16;
-
-    use bytes::Bytes;
-    use chrono::TimeZone;
 
     use super::*;
     use crate::{
@@ -1077,6 +1137,7 @@ mod tests {
         path::DataPlanePathErrorKind,
         wire_encoding::WireDecode,
     };
+    use bytes::Bytes;
 
     // Helpers
 
@@ -1593,12 +1654,6 @@ mod tests {
     // HummingbirdPath helpers
     // ---------------------------------------------------------------------------
 
-    fn epoch_plus(secs: u64) -> DateTime<Utc> {
-        Utc.timestamp_opt(secs as i64, 0)
-            .single()
-            .expect("valid timestamp")
-    }
-
     fn make_info(cons_dir: bool, timestamp: u32) -> InfoField {
         InfoField {
             peer: false,
@@ -1608,15 +1663,18 @@ mod tests {
         }
     }
 
-    fn make_std_hop(cons_ingress: u16, cons_egress: u16) -> HummingbirdHopField {
-        HummingbirdHopField::Standard(StandardHopField {
-            ingress_router_alert: false,
-            egress_router_alert: false,
-            exp_time: 63,
-            cons_ingress,
-            cons_egress,
-            mac: [0u8; 6],
-        })
+    fn make_std_hop(cons_ingress: u16, cons_egress: u16) -> (IsdAsn, HummingbirdHopField) {
+        (
+            IsdAsn::new(Isd::new(1), Asn::new(1)),
+            HummingbirdHopField::Standard(StandardHopField {
+                ingress_router_alert: false,
+                egress_router_alert: false,
+                exp_time: 63,
+                cons_ingress,
+                cons_egress,
+                mac: [0u8; 6],
+            }),
+        )
     }
 
     fn make_reservation(
@@ -1650,7 +1708,7 @@ mod tests {
 
     #[test]
     fn add_single_segment_updates_meta() {
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(
             make_info(true, 1),
             vec![make_std_hop(1, 2), make_std_hop(3, 4)],
@@ -1668,7 +1726,7 @@ mod tests {
 
     #[test]
     fn add_three_segments_succeeds() {
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         for i in 0..3u16 {
             path.add_segment(
                 make_info(true, i as u32),
@@ -1685,7 +1743,7 @@ mod tests {
 
     #[test]
     fn add_fourth_segment_returns_too_many_segments() {
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         for i in 0..3u16 {
             path.add_segment(
                 make_info(true, i as u32),
@@ -1704,52 +1762,12 @@ mod tests {
     fn add_segment_too_long_returns_error() {
         // HummingbirdSegmentLength::new() caps at 508 bytes (127 * 4).
         // 43 standard hops × 12 bytes = 516 bytes > 508 → SegmentTooLong.
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
-        let hops: Vec<HummingbirdHopField> = (0..43u16).map(|i| make_std_hop(i, i + 1)).collect();
+        let mut path = HummingbirdPath::new();
+        let hops: Vec<(IsdAsn, HummingbirdHopField)> = (0..43u16).map(|i| make_std_hop(i, i + 1)).collect();
         let result = path.add_segment(make_info(true, 1), hops);
         assert!(
             matches!(result, Err(HummingbirdPathBuilderError::SegmentTooLong)),
             "expected SegmentTooLong, got {result:?}"
-        );
-    }
-
-    // ---------------------------------------------------------------------------
-    // add_reservation
-    // ---------------------------------------------------------------------------
-
-    #[test]
-    fn add_reservation_with_start_before_base_ts_succeeds() {
-        // base_timestamp = 1000; reservation.start = 900 → start is in the past → OK.
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
-        path.add_segment(make_info(true, 1), vec![make_std_hop(1, 2)])
-            .unwrap();
-        let res = make_reservation(1, 2, 900, 200, 1024);
-        assert!(path.add_reservation(res).is_ok());
-    }
-
-    #[test]
-    fn add_reservation_with_start_equal_base_ts_succeeds() {
-        // Reservation starts exactly at the base timestamp → offset = 0, valid.
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
-        path.add_segment(make_info(true, 1), vec![make_std_hop(1, 2)])
-            .unwrap();
-        let res = make_reservation(1, 2, 1000, 200, 1024);
-        assert!(path.add_reservation(res).is_ok());
-    }
-
-    #[test]
-    fn add_reservation_with_start_after_base_ts_fails() {
-        // Reservation start is in the future relative to the path base timestamp.
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
-        path.add_segment(make_info(true, 1), vec![make_std_hop(1, 2)])
-            .unwrap();
-        let res = make_reservation(1, 2, 1001, 200, 1024);
-        assert!(
-            matches!(
-                path.add_reservation(res),
-                Err(HummingbirdPathBuilderError::InvalidReservationStart)
-            ),
-            "should reject reservation whose start is after base_timestamp"
         );
     }
 
@@ -1760,7 +1778,7 @@ mod tests {
     #[test]
     fn encoded_length_no_reservations() {
         // 12 (meta) + 8 (info) + 2×12 (hops) = 44 bytes.
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(
             make_info(true, 1),
             vec![make_std_hop(1, 2), make_std_hop(3, 4)],
@@ -1773,7 +1791,7 @@ mod tests {
     fn encoded_length_with_matching_reservation() {
         // Same path as above, but one standard hop (12 B) is replaced by a flyover
         // hop (20 B) → extra 8 bytes → 52 bytes total.
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(
             make_info(true, 1),
             vec![make_std_hop(1, 2), make_std_hop(3, 4)],
@@ -1790,7 +1808,7 @@ mod tests {
         // Reservation that spans a segment boundary
         // => Turn first hop fields into flyover hop fields
         // => 8 extra bytes
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(
             make_info(true, 1),
             vec![make_std_hop(1, 2), make_std_hop(3, 0)],
@@ -1811,7 +1829,7 @@ mod tests {
     #[test]
     fn encoded_length_with_non_matching_reservation() {
         // Reservation doesn't match any hop field → no size change.
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(
             make_info(true, 1),
             vec![make_std_hop(1, 2), make_std_hop(3, 4)],
@@ -1838,7 +1856,7 @@ mod tests {
     #[test]
     fn encode_roundtrip_via_encoded_hummingbird_path() {
         // Build a path, encode it, decode it back via EncodedHummingbirdPath.
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(
             make_info(true, 1),
             vec![make_std_hop(0x0A, 0x0B), make_std_hop(0x0C, 0x0D)],
@@ -1853,7 +1871,7 @@ mod tests {
         // 2 hops × 12 bytes = 24 bytes → seg_len = 6
         assert_eq!(meta.segment_lengths[0].encode(), 6);
         assert_eq!(meta.segment_lengths[1].encode(), 0);
-        assert_eq!(meta.base_timestamp.get(), 1000);
+        assert!(meta.base_timestamp.get() > 0);
 
         let hops: Vec<(u16, u16)> = decoded
             .hop_fields()
@@ -1869,7 +1887,7 @@ mod tests {
 
     #[test]
     fn encode_no_reservation_produces_no_flyover_bits() {
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(
             make_info(true, 1),
             vec![make_std_hop(1, 2), make_std_hop(3, 4)],
@@ -1890,7 +1908,7 @@ mod tests {
     fn encode_with_matching_reservation_sets_flyover_bit() {
         // cons_dir=true: interfaces(true) = (cons_ingress, cons_egress)
         // Reservation with ingress=1, egress=2 should match the first hop.
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(
             make_info(true, 1),
             vec![make_std_hop(1, 2), make_std_hop(3, 4)],
@@ -1919,7 +1937,7 @@ mod tests {
     fn encode_with_matching_reservation_across_segment_boundary_sets_flyover_bit() {
         // cons_dir=true: interfaces(true) = (cons_ingress, cons_egress)
         // Reservation with ingress=3, egress=4 should match the first hop.
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(
             make_info(true, 1),
             vec![make_std_hop(1, 2), make_std_hop(3, 0)],
@@ -1954,7 +1972,7 @@ mod tests {
     fn encode_flyover_hop_preserves_interfaces() {
         // After applying a reservation, the resulting flyover hop field must still
         // carry the original cons_ingress / cons_egress values.
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(
             make_info(true, 1),
             vec![make_std_hop(0x0A, 0x0B), make_std_hop(0x0C, 0x0D)],
@@ -1987,11 +2005,11 @@ mod tests {
     #[test]
     fn encode_flyover_hop_encodes_reservation_metadata() {
         // The flyover hop field must encode the reservation start offset and duration.
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(make_info(true, 1), vec![make_std_hop(1, 2)])
             .unwrap();
-        // start=900 → res_start_offset = base_ts - start = 1000 - 900 = 100
-        let res = make_reservation(1, 2, 900, 300, 1024);
+        let reservation_start = 900u32;
+        let res = make_reservation(1, 2, reservation_start, 300, 1024);
         path.add_reservation(res).unwrap();
 
         let dst = IsdAsn::new(Isd::new(2), Asn::new(2));
@@ -2004,16 +2022,21 @@ mod tests {
         // agg_mac[6..12], res_id+bw[12..16]):
         //   ResStartOffset is at bytes [16..18] of the flyover hop → absolute offset 36.
         //   ResDuration is at bytes [18..20] of the flyover hop → absolute offset 38.
+        let encoded_base_ts = path.path_meta.base_timestamp();
+        let expected_offset = encoded_base_ts.wrapping_sub(reservation_start) as u16;
         let res_start_offset = u16::from_be_bytes([buf[36], buf[37]]);
         let res_duration = u16::from_be_bytes([buf[38], buf[39]]);
-        assert_eq!(res_start_offset, 100, "res_start_offset = base_ts - start");
+        assert_eq!(
+            res_start_offset, expected_offset,
+            "res_start_offset = base_ts - start"
+        );
         assert_eq!(res_duration, 300, "res_duration preserved");
     }
 
     #[test]
     fn encode_with_non_matching_reservation_no_flyover() {
         // A reservation that doesn't match any hop field must be silently ignored.
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(make_info(true, 1), vec![make_std_hop(1, 2)])
             .unwrap();
         let res = make_reservation(99, 100, 1000, 200, 1024); // wrong interfaces
@@ -2030,7 +2053,7 @@ mod tests {
         // When a standard hop (12 B) is replaced by a flyover hop (20 B),
         // the segment length in the meta header must be updated accordingly.
         // 1 flyover + 1 standard = 20 + 12 = 32 bytes → seg_len = 8.
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(
             make_info(true, 1),
             vec![make_std_hop(1, 2), make_std_hop(3, 4)],
@@ -2056,7 +2079,7 @@ mod tests {
         // A reservation applied to the FIRST hop (at offset 0) turns it into a flyover
         // (20 B instead of 12 B), shifting the third hop's offset by +8 to 32.
         // The encoded current_hop_field must be updated to reflect the new offset.
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(
             make_info(true, 1),
             vec![make_std_hop(1, 2), make_std_hop(3, 4), make_std_hop(5, 6)],
@@ -2087,7 +2110,7 @@ mod tests {
         // Path with 3 hops; current_hop_field = 0 (pointing to the first hop).
         // A reservation applied to the THIRD hop (at offset 24) is AFTER the current
         // hop, so current_hop_field must NOT be changed (stays 0).
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(
             make_info(true, 1),
             vec![make_std_hop(1, 2), make_std_hop(3, 4), make_std_hop(5, 6)],
@@ -2120,7 +2143,7 @@ mod tests {
     fn hb_path_wire_decode_single_segment() {
         // Build → encode → decode via WireDecode for HummingbirdPath.
         // The decoded path should carry the same info fields and hop fields.
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(
             make_info(true, 42),
             vec![make_std_hop(0x0A, 0x0B), make_std_hop(0x0C, 0x0D)],
@@ -2130,7 +2153,11 @@ mod tests {
         let dst = IsdAsn::new(Isd::new(2), Asn::new(2));
         let mut encoded_bytes = encode_path(&mut path, dst);
 
-        let decoded = HummingbirdPath::decode(&mut encoded_bytes).unwrap();
+        let ases = [
+            IsdAsn::new(Isd::new(1), Asn::new(1)),
+            IsdAsn::new(Isd::new(1), Asn::new(2)),
+        ];
+        let decoded = HummingbirdPath::decode(&mut encoded_bytes, &ases).unwrap();
 
         assert_eq!(decoded.info_fields.len(), 1);
         assert_eq!(decoded.info_fields[0].timestamp_epoch, 42);
@@ -2139,15 +2166,15 @@ mod tests {
         assert_eq!(decoded.segments.len(), 1);
         assert_eq!(decoded.segments[0].len(), 2);
 
-        let (ing0, eg0) = decoded.segments[0][0].interfaces(true);
+        let (ing0, eg0) = decoded.segments[0][0].1.interfaces(true);
         assert_eq!((ing0, eg0), (0x0A, 0x0B));
-        let (ing1, eg1) = decoded.segments[0][1].interfaces(true);
+        let (ing1, eg1) = decoded.segments[0][1].1.interfaces(true);
         assert_eq!((ing1, eg1), (0x0C, 0x0D));
     }
 
     #[test]
     fn hb_path_wire_decode_two_segments() {
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(5000), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(
             make_info(true, 10),
             vec![make_std_hop(1, 2), make_std_hop(3, 4)],
@@ -2159,7 +2186,11 @@ mod tests {
         let dst = IsdAsn::new(Isd::new(1), Asn::new(1));
         let mut encoded_bytes = encode_path(&mut path, dst);
 
-        let decoded = HummingbirdPath::decode(&mut encoded_bytes).unwrap();
+        let ases = [
+            IsdAsn::new(Isd::new(1), Asn::new(1)),
+            IsdAsn::new(Isd::new(1), Asn::new(2)),
+        ];
+        let decoded = HummingbirdPath::decode(&mut encoded_bytes, &ases).unwrap();
 
         assert_eq!(decoded.info_fields.len(), 2);
         assert_eq!(decoded.info_fields[0].timestamp_epoch, 10);
@@ -2172,21 +2203,23 @@ mod tests {
 
     #[test]
     fn hb_path_wire_decode_preserves_base_timestamp() {
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(9999), None);
+        let mut path = HummingbirdPath::new();
         path.add_segment(make_info(true, 1), vec![make_std_hop(1, 2)])
             .unwrap();
 
         let dst = IsdAsn::new(Isd::new(1), Asn::new(1));
         let mut encoded_bytes = encode_path(&mut path, dst);
 
-        let decoded = HummingbirdPath::decode(&mut encoded_bytes).unwrap();
-        assert_eq!(decoded.path_meta.base_timestamp(), 9999);
+        let expected_ts = path.path_meta.base_timestamp();
+        let ases = [IsdAsn::new(Isd::new(1), Asn::new(1))];
+        let decoded = HummingbirdPath::decode(&mut encoded_bytes, &ases).unwrap();
+        assert_eq!(decoded.path_meta.base_timestamp(), expected_ts);
     }
 
     #[test]
-    fn hb_path_try_from_encoded_roundtrip() {
-        // Encode via HummingbirdPath and decode via TryFrom<EncodedHummingbirdPath>.
-        let mut path = HummingbirdPath::new_with_timestamp(epoch_plus(1000), None);
+    fn hb_path_wire_decode_roundtrip() {
+        // Encode via HummingbirdPath and decode back via HummingbirdPath::decode.
+        let mut path = HummingbirdPath::new();
         path.add_segment(
             make_info(true, 77),
             vec![make_std_hop(11, 22), make_std_hop(33, 44)],
@@ -2196,9 +2229,11 @@ mod tests {
         let dst = IsdAsn::new(Isd::new(1), Asn::new(1));
         let mut encoded_bytes = encode_path(&mut path, dst);
 
-        // Decode via EncodedHummingbirdPath first, then convert.
-        let encoded = EncodedHummingbirdPath::decode(&mut encoded_bytes).unwrap();
-        let decoded = HummingbirdPath::try_from(encoded).unwrap();
+        let ases = [
+            IsdAsn::new(Isd::new(1), Asn::new(1)),
+            IsdAsn::new(Isd::new(1), Asn::new(2)),
+        ];
+        let decoded = HummingbirdPath::decode(&mut encoded_bytes, &ases).unwrap();
 
         assert_eq!(decoded.info_fields.len(), 1);
         assert_eq!(decoded.info_fields[0].timestamp_epoch, 77);
