@@ -22,7 +22,10 @@
 use bytes::Bytes;
 
 mod error;
-pub use error::{DecodeError, EncodeError, InadequateBufferSize, ScmpEncodeError};
+pub use error::{
+    DecodeError, EncodeError, InadequateBufferSize, NonEncodeError, NonScmpEncodeError,
+    PathProviderEncodeError, PathProviderScmpEncodeError, ScmpEncodeError,
+};
 
 mod headers;
 pub use headers::{

@@ -459,6 +459,8 @@ impl StandardHopField {
         pkt_len: u16,
     ) -> FlyoverHopField {
         // TODO: Casting to u16 could be problematic
+        // TODO: Return error when reservation is not yet valid. Otherwise,
+        // this will panic.
         let res_start_offset = (meta_header.base_timestamp.get() - reservation.info.start) as u16;
 
         let flyover_mac = calculate_flyover_mac(

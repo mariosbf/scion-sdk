@@ -22,8 +22,8 @@ use scion_proto::{
     address::{ScionAddr, SocketAddr},
     datagram::UdpMessage,
     hummingbird::Reservation,
-    packet::{ByEndpoint, ScionPacketRaw, ScionPacketScmp, ScionPacketUdp},
-    path::{HummingbirdConversionError, Path, hummingbird::HummingbirdPath},
+    packet::{ByEndpoint, NonEncodeError, NonScmpEncodeError, ScionPacketRaw, ScionPacketScmp, ScionPacketUdp},
+    path::{Path, PathProvider},
     scmp::{SCMP_PROTOCOL_NUMBER, ScmpMessage},
 };
 use scion_sdk_quic_scion::socket::{BoxedSocketError, GenericScionUdpSocket};
@@ -98,18 +98,22 @@ impl PathUnawareUdpScionSocket {
     }
 
     /// Send a SCION UDP datagram via the given Hummingbird path.
-    pub fn send_to_via_hbird<'a>(
+    pub fn send_to_via_with_provider<'a, E, P>(
         &'a self,
         payload: &[u8],
         destination: SocketAddr,
-        path: &mut HummingbirdPath,
-    ) -> BoxFuture<'a, Result<Path, ScionSocketSendError>> {
-        let (udp_packet, path) = match ScionPacketUdp::new_with_hbird_path(
+        path_provider: &P,
+    ) -> BoxFuture<'a, Result<Path, ScionSocketSendError>>
+    where
+        E: 'a + NonEncodeError + Send,
+        P: PathProvider<Error = E>,
+    {
+        let (udp_packet, path) = match ScionPacketUdp::new_with_path_provider(
             ByEndpoint {
                 source: self.inner.local_addr(),
                 destination,
             },
-            path,
+            path_provider,
             Bytes::copy_from_slice(payload),
         ) {
             Ok(pair) => pair,
@@ -123,6 +127,31 @@ impl PathUnawareUdpScionSocket {
         };
         let packet: ScionPacketRaw = udp_packet.into();
         self.inner.send(packet).map_ok(|_| path).boxed()
+    }
+
+    /// Send a datagram to the specified destination using the given path and
+    /// Hummingbird reservations.
+    ///
+    /// Returns a [`SendWithReservationsError::Conversion`] if the path cannot be
+    /// converted or a reservation cannot be applied, and a
+    /// [`SendWithReservationsError::Send`] if the underlying send fails.
+    pub async fn send_to_via_with_reservations(
+        &self,
+        payload: &[u8],
+        destination: SocketAddr,
+        path: &Path<&[u8]>,
+        reservations: &[Reservation],
+    ) -> Result<Path, SendWithReservationsError> {
+        let bytes_path = path.to_bytes_path();
+
+        let mut hbird_path = bytes_path.to_hbird()?;
+        for r in reservations {
+            hbird_path.add_reservation(r.clone());
+        }
+
+        Ok(self
+            .send_to_via_with_provider(payload, destination, &hbird_path)
+            .await?)
     }
 
     /// Receive a SCION packet with the sender and path.
@@ -314,6 +343,38 @@ impl ScmpScionSocket {
         };
         let packet = packet.into();
         Box::pin(async move { self.inner.send(packet).await })
+    }
+
+    /// Send a SCION SCMP datagram via a path obtained from the given path provider.
+    pub fn send_to_via_with_provider<'a, P, E>(
+        &'a self,
+        message: ScmpMessage,
+        destination: ScionAddr,
+        path_provider: &P,
+    ) -> BoxFuture<'a, Result<Path, ScionSocketSendError>>
+    where
+        E: NonScmpEncodeError + 'a + Send,
+        P: PathProvider<Error = E>,
+    {
+        let (udp_packet, path) = match ScionPacketScmp::new_with_path_provider(
+            ByEndpoint {
+                source: self.inner.local_addr().scion_address(),
+                destination,
+            },
+            path_provider,
+            message,
+        ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                return Box::pin(async move {
+                    Err(ScionSocketSendError::InvalidPacket(
+                        format!("error encoding packet: {e}").into(),
+                    ))
+                });
+            }
+        };
+        let packet: ScionPacketRaw = udp_packet.into();
+        self.inner.send(packet).map_ok(|_| path).boxed()
     }
 
     /// Receive a SCMP message with the sender and path.
@@ -545,15 +606,20 @@ impl<P: PathManager> UdpScionSocket<P> {
             })
     }
 
-    /// Send a datagram to the specified destination using a Hummingbird path.
-    pub async fn send_to_via_hbird(
+    /// Send a datagram to the specified destination via a path obtained from the
+    /// provided path provider.
+    pub async fn send_to_via_with_provider<E, PF>(
         &self,
         payload: &[u8],
         destination: SocketAddr,
-        hummingbird_path: &mut HummingbirdPath,
-    ) -> Result<Path, ScionSocketSendError> {
+        path_provider: &PF,
+    ) -> Result<Path, ScionSocketSendError>
+    where
+        E: Send + NonEncodeError,
+        PF: PathProvider<Error = E>,
+    {
         self.socket
-            .send_to_via_hbird(payload, destination, hummingbird_path)
+            .send_to_via_with_provider(payload, destination, path_provider)
             .await
             .inspect_err(|e| {
                 self.send_error_receivers
@@ -575,25 +641,15 @@ impl<P: PathManager> UdpScionSocket<P> {
         path: &Path<&[u8]>,
         reservations: &[Reservation],
     ) -> Result<Path, SendWithReservationsError> {
-        let bytes_path = path.to_bytes_path();
-
-        let mut hbird_path = bytes_path.to_hbird()?;
-        for r in reservations {
-            hbird_path
-                .add_reservation(r.clone())
-                .map_err(HummingbirdConversionError::from)?;
-        }
-
-        let sent_path = self
-            .socket
-            .send_to_via_hbird(payload, destination, &mut hbird_path)
+        self.socket
+            .send_to_via_with_reservations(payload, destination, path, reservations)
             .await
             .inspect_err(|e| {
-                self.send_error_receivers
-                    .for_each(|receiver| receiver.report_send_error(e));
-            })?;
-
-        Ok(sent_path)
+                if let SendWithReservationsError::Send(e) = e {
+                    self.send_error_receivers
+                        .for_each(|receiver| receiver.report_send_error(e));
+                }
+            })
     }
 
     /// Receive a datagram from any address, along with the sender address and path.

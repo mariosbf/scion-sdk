@@ -23,10 +23,14 @@ use super::{
 };
 use crate::{
     address::ScionAddr,
-    packet::ByEndpoint,
-    path::{DataPlanePath, EncodedHopField},
+    packet::{
+        AddressHeader, ByEndpoint,
+        error::{NonScmpEncodeError, PathProviderScmpEncodeError},
+    },
+    path::{DataPlanePath, EncodedHopField, Path, PathProvider},
     scmp::{
-        ScmpDecodeError, ScmpMessage, ScmpMessageBase, ScmpTracerouteRequest, ScmpType, SCMP_PROTOCOL_NUMBER
+        SCMP_PROTOCOL_NUMBER, ScmpDecodeError, ScmpMessage, ScmpMessageBase, ScmpTracerouteRequest,
+        ScmpType,
     },
     wire_encoding::{WireDecode, WireEncodeVec},
 };
@@ -70,6 +74,42 @@ impl ScionPacketScmp {
         message.set_checksum(&headers.address);
 
         Ok(Self { headers, message })
+    }
+
+    /// Creates a new SCION SCMP packet based on the SCMP message correctly setting the checksum.
+    ///
+    /// This does not work for an [`ScmpTracerouteRequest`] message, which requires setting specific
+    /// router alert flags. Use [`Self::new_traceroute_request`] for this purpose.
+    pub fn new_with_path_provider<E, P>(
+        endhosts: ByEndpoint<ScionAddr>,
+        path_provider: &P,
+        mut message: ScmpMessage,
+    ) -> Result<(Self, Path), PathProviderScmpEncodeError<E>>
+    where
+        E: NonScmpEncodeError,
+        P: PathProvider<Error = E>,
+    {
+        let address_header_len = AddressHeader::from(endhosts).total_length() as u16;
+
+        let payload_len = message.total_length() as u16;
+
+        let path = path_provider.build(
+            endhosts.map(|e| e.isd_asn()),
+            payload_len,
+            address_header_len,
+        )?;
+
+        let headers = ScionHeaders::new(
+            endhosts,
+            path.data_plane_path.clone(),
+            SCMP_PROTOCOL_NUMBER,
+            message.total_length(),
+            FlowId::default(),
+        )
+        .map_err(ScmpEncodeError::from)?;
+        message.set_checksum(&headers.address);
+
+        Ok((Self { headers, message }, path))
     }
 
     /// Creates a new SCION packet containing an [`ScmpTracerouteRequest`].

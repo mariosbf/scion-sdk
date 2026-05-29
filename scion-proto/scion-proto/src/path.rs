@@ -44,7 +44,7 @@ use tracing::warn;
 use crate::{
     address::IsdAsn,
     hummingbird::Reservation,
-    packet::{ByEndpoint, DecodeError},
+    packet::{ByEndpoint, DecodeError, NonEncodeError, NonScmpEncodeError},
     path::hummingbird::{HummingbirdPath, HummingbirdPathBuilderError},
     wire_encoding::WireDecode,
 };
@@ -401,15 +401,11 @@ impl Path<Bytes> {
         let mut hbird_path = self.to_hbird()?;
 
         for r in reservations {
-            hbird_path.add_reservation(r)?;
+            hbird_path.add_reservation(r);
         }
 
-        let encoded_p = hbird_path.to_encoded(
-            self.isd_asn.destination,
-            payload_len,
-            address_header_len,
-            None,
-        )?;
+        let encoded_p =
+            hbird_path.to_encoded(self.isd_asn.destination, payload_len, address_header_len)?;
         let data_plane_path = DataPlanePath::Hummingbird(encoded_p);
 
         Ok(Self {
@@ -591,6 +587,33 @@ impl<T> std::fmt::Display for Path<T> {
         };
 
         Ok(())
+    }
+}
+
+/// Builds a [`Path`] for use in a SCION packet, potentially applying a reservation.
+pub trait PathProvider {
+    /// Error type returned when building the path fails.
+    type Error: NonEncodeError + NonScmpEncodeError + Send;
+
+    /// Builds a Path instance.
+    fn build(
+        &self,
+        isd_asn: ByEndpoint<IsdAsn>,
+        payload_len: u16,
+        address_header_len: u16,
+    ) -> Result<Path, Self::Error>;
+}
+
+impl<T: AsRef<[u8]>> PathProvider for Path<T> {
+    type Error = std::convert::Infallible;
+
+    fn build(
+        &self,
+        _isd_asn: ByEndpoint<IsdAsn>,
+        _payload_len: u16,
+        _address_header_len: u16,
+    ) -> Result<Path, Self::Error> {
+        Ok(self.to_bytes_path())
     }
 }
 

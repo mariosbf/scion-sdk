@@ -453,7 +453,7 @@ where
     pub fn std_flags(&self) -> StdHopFieldFlags {
         match self {
             HbirdHopFieldView::Standard(v) => v.flags(),
-            HbirdHopFieldView::Flyover(v) => v.flags().into(),
+            HbirdHopFieldView::Flyover(v) => v.flags(),
         }
     }
 

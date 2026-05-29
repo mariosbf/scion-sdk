@@ -16,7 +16,7 @@
 //! Errors raised when encoding or decoding SCION packets.
 
 use super::Version;
-use crate::path::{DataPlanePathErrorKind, hummingbird::HummingbirdPathBuilderError};
+use crate::path::DataPlanePathErrorKind;
 
 /// Errors raised when failing to decode a [`ScionPacketRaw`][super::ScionPacketRaw] or
 /// [`ScionPacketUdp`][super::ScionPacketUdp] or its constituents.
@@ -57,18 +57,23 @@ pub enum EncodeError {
     HeaderTooLarge,
 }
 
-/// Errors raised when failing to encode a [`ScionPacketRaw`][super::ScionPacketRaw],
-/// [`super::ScionPacketScmp`], or [`ScionPacketUdp`][super::ScionPacketUdp] when
-/// using a [`HummingbirdPath`][crate::path::hummingbird::HummingbirdPath].
+/// Marker trait for error types that are not [EncodeError].
+///
+/// This prevents [PathProviderEncodeError<EncodeError>], which would
+/// create conflicting `From` implementations.
+pub trait NonEncodeError: std::error::Error {}
+
+impl NonEncodeError for std::convert::Infallible {}
+
+/// Errors raised when encoding a SCION UDP packet with a path provider.
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone, Copy)]
-pub enum HbirdEncodeError {
-    /// Encode error
+pub enum PathProviderEncodeError<E: NonEncodeError> {
+    /// A general [`EncodeError`] occurred.
     #[error("error during packet encoding")]
     EncodeError(#[from] EncodeError),
-
-    /// Error inside the Hummingbird path builder.
-    #[error("error in the Hummingbird path builder")]
-    HummingbirdPathBuilderError(#[from] HummingbirdPathBuilderError),
+    /// An error occurred in the path provider.
+    #[error("error in the path provider")]
+    PathProviderError(#[from] E),
 }
 
 /// Errors raised when creating a [`ScionPacketScmp`][super::ScionPacketScmp].
@@ -86,6 +91,25 @@ pub enum ScmpEncodeError {
     #[error("encoding error")]
     GeneralEncodeError(#[from] EncodeError),
 }
+
+/// Errors raised when encoding a SCION SCMP packet with a path provider.
+#[derive(Debug, thiserror::Error, PartialEq, Eq, Clone, Copy)]
+pub enum PathProviderScmpEncodeError<E: NonScmpEncodeError> {
+    /// A [`ScmpEncodeError`] occurred.
+    #[error("error during SCMP packet encoding")]
+    ScmpEncodeError(#[from] ScmpEncodeError),
+    /// An error occurred in the path provider.
+    #[error("error in the path provider")]
+    PathProviderError(#[from] E),
+}
+
+/// Marker trait for error types that are not [ScmpEncodeError].
+///
+/// This prevents [PathProviderScmpEncodeError<ScmpEncodeError>], which would
+/// create conflicting `From` implementations.
+pub trait NonScmpEncodeError: std::error::Error {}
+
+impl NonScmpEncodeError for std::convert::Infallible {}
 
 /// Raised if the buffer does not have sufficient capacity for encoding the SCION headers.
 ///

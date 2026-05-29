@@ -17,12 +17,15 @@
 
 use bytes::{Buf, Bytes};
 
-use super::{InadequateBufferSize, MessageChecksum, ScionHeaders, ScionPacket, ScionPacketRaw};
+use super::{
+    InadequateBufferSize, MessageChecksum, NonEncodeError, PathProviderEncodeError, ScionHeaders,
+    ScionPacket, ScionPacketRaw,
+};
 use crate::{
     address::SocketAddr,
     datagram::{UdpDecodeError, UdpMessage},
-    packet::{AddressHeader, ByEndpoint, EncodeError, error::HbirdEncodeError},
-    path::{DataPlanePath, Path, hummingbird::HummingbirdPath},
+    packet::{AddressHeader, ByEndpoint, EncodeError},
+    path::{DataPlanePath, Path, PathProvider},
     wire_encoding::{WireDecode, WireEncodeVec},
 };
 
@@ -88,13 +91,16 @@ impl ScionPacketUdp {
         Ok(Self { headers, datagram })
     }
 
-    /// Creates a new SCION UDP packet pased on the UDP payload and Hummingbird
-    /// path.
-    pub fn new_with_hbird_path(
+    /// Creates a new SCION UDP packet based on the UDP payload and path provider.
+    pub fn new_with_path_provider<E, P>(
         endhosts: ByEndpoint<SocketAddr>,
-        hbird_path: &mut HummingbirdPath,
+        path_provider: &P,
         payload: Bytes,
-    ) -> Result<(Self, Path), HbirdEncodeError> {
+    ) -> Result<(Self, Path), PathProviderEncodeError<E>>
+    where
+        E: NonEncodeError,
+        P: PathProvider<Error = E>,
+    {
         let address_header = AddressHeader::from(endhosts);
 
         let udp_header_len =
@@ -106,12 +112,10 @@ impl ScionPacketUdp {
             .checked_add(udp_header_len)
             .ok_or(EncodeError::PayloadTooLarge)?;
 
-        let path = hbird_path.to_bytes_path(
-            endhosts.source.isd_asn(),
-            endhosts.destination.isd_asn(),
+        let path = path_provider.build(
+            endhosts.map(|e| e.isd_asn()),
             payload_len,
             address_header.total_length() as u16,
-            None,
         )?;
 
         let headers = ScionHeaders::new_with_ports(
