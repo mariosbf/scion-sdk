@@ -45,7 +45,7 @@ use crate::{
     address::IsdAsn,
     hummingbird::Reservation,
     packet::{ByEndpoint, DecodeError, NonEncodeError, NonScmpEncodeError},
-    path::hummingbird::{HummingbirdPath, HummingbirdPathBuilderError},
+    path::hummingbird::{HummingbirdPath, HummingbirdPathError},
     wire_encoding::WireDecode,
 };
 
@@ -368,7 +368,7 @@ pub enum HummingbirdConversionError {
     DecodeError(#[from] DecodeError),
     /// Error in path Hummingbird path builder.
     #[error("failed to add reservation to path: {0}")]
-    HummingbirdPathBuilderError(#[from] HummingbirdPathBuilderError),
+    HummingbirdPathBuilderError(#[from] HummingbirdPathError),
     /// Missing ISD ASN information in path metadata.
     #[error("missing ISD ASN information in path metadata")]
     MissingIsdAsn,

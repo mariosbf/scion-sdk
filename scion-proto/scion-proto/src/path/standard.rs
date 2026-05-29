@@ -28,7 +28,7 @@ use crate::{
         PathInterface,
         hummingbird::{
             FlyoverHopField, HummingbirdCounter, HummingbirdHopField, HummingbirdMetaHeader,
-            HummingbirdPath, calculate_flyover_mac, xor_in_place,
+            HummingbirdPath, HummingbirdPathError, calculate_flyover_mac, xor_in_place,
         },
     },
     wire_encoding::{WireDecode, WireEncode},
@@ -457,11 +457,13 @@ impl StandardHopField {
         reservation: &crate::hummingbird::Reservation,
         destination: IsdAsn,
         pkt_len: u16,
-    ) -> FlyoverHopField {
-        // TODO: Casting to u16 could be problematic
-        // TODO: Return error when reservation is not yet valid. Otherwise,
-        // this will panic.
-        let res_start_offset = (meta_header.base_timestamp.get() - reservation.info.start) as u16;
+    ) -> Result<FlyoverHopField, HummingbirdPathError> {
+        let res_start_offset = meta_header
+            .base_timestamp
+            .get()
+            .checked_sub(reservation.info.start)
+            .and_then(|offset| offset.try_into().ok())
+            .ok_or(HummingbirdPathError::ReservationNotValid)?;
 
         let flyover_mac = calculate_flyover_mac(
             destination.isd(),
@@ -475,7 +477,7 @@ impl StandardHopField {
         let mut mac = self.mac;
         xor_in_place(&mut mac, &flyover_mac);
 
-        FlyoverHopField {
+        Ok(FlyoverHopField {
             ingress_router_alert: self.ingress_router_alert,
             egress_router_alert: self.egress_router_alert,
             exp_time: self.exp_time,
@@ -486,7 +488,7 @@ impl StandardHopField {
             res_bw: reservation.info.bandwidth,
             res_start_offset,
             res_duration: reservation.info.duration,
-        }
+        })
     }
 }
 
