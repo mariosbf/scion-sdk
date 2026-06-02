@@ -63,8 +63,6 @@ impl<T> EncodedHummingbirdPath<T>
 where
     T: Deref<Target = [u8]>,
 {
-    // TODO: Add Hummingbird-specific methods.
-
     /// Returns the encoded raw path.
     pub fn raw(&self) -> &[u8] {
         &self.encoded_path
@@ -534,7 +532,7 @@ pub struct HummingbirdPath {
     info_fields: Vec<InfoField>,
 
     /// Segments of the path.
-    segments: Vec<Vec<(IsdAsn, HummingbirdHopField)>>,
+    segments: Vec<Vec<(IsdAsn, StandardHopField)>>,
 
     /// Reservations to apply when encoding
     reservations: BTreeMap<ReservationInterfaces, Vec<Reservation>>,
@@ -618,7 +616,7 @@ impl HummingbirdPath {
     }
 
     /// Return an iterator over the segments on this path.
-    pub fn segments(&self) -> impl Iterator<Item = (&InfoField, &[(IsdAsn, HummingbirdHopField)])> {
+    pub fn segments(&self) -> impl Iterator<Item = (&InfoField, &[(IsdAsn, StandardHopField)])> {
         self.segments
             .iter()
             .zip(self.info_fields.iter())
@@ -629,7 +627,7 @@ impl HummingbirdPath {
     pub fn add_segment(
         &mut self,
         info_field: InfoField,
-        hop_fields: Vec<(IsdAsn, HummingbirdHopField)>,
+        hop_fields: Vec<(IsdAsn, StandardHopField)>,
     ) -> Result<(), HummingbirdPathError> {
         if self.info_fields.len() >= 3 {
             return Err(HummingbirdPathError::TooManySegments);
@@ -725,18 +723,14 @@ impl HummingbirdPath {
                 } else {
                     egress
                 };
+
                 let interfaces = ReservationInterfaces {
                     ingress_interface: ingress,
                     egress_interface: egress,
                     isd_as: *hop_isd_asn,
                 };
 
-                let reservation = if !hop_field.is_flyover() {
-                    self.applicable_reservations(interfaces).next().cloned()
-                } else {
-                    None
-                };
-
+                let reservation = self.applicable_reservations(interfaces).next().cloned();
                 hop_fields.push((seg_idx, hop_idx, reservation));
             }
         }
@@ -804,9 +798,7 @@ impl HummingbirdPath {
 
         for (seg_idx, hop_idx, res) in hop_fields {
             let (_, hop) = &self.segments[seg_idx][hop_idx];
-            let hop = if let Some(res) = res
-                && let HummingbirdHopField::Standard(sp) = hop
-            {
+            let hop = if let Some(res) = res {
                 // If the matched hop field is before the current hop field, the
                 // current hop field's byte offset must be advanced by the size
                 // difference between a flyover and a standard hop field.
@@ -814,14 +806,14 @@ impl HummingbirdPath {
                     curr_hf_index += FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE;
                 }
 
-                HummingbirdHopField::Flyover(sp.apply_reservation(
+                HummingbirdHopField::Flyover(hop.apply_reservation(
                     meta_header,
                     &res,
                     destination,
                     pkt_len,
                 )?)
             } else {
-                hop.clone()
+                HummingbirdHopField::Standard(hop.clone())
             };
 
             // Advance hop offset
@@ -960,6 +952,12 @@ impl HummingbirdPath {
 
     /// Decodes a Hummingbird path from the provided byte buffer and ISD-AS list.
     ///
+    /// The resulting path is suitable for sending packets, if the MACs in all
+    /// flyover hop fields are de-aggregated. This should be the case if the
+    /// path was obtained from the header of an incoming SCION packet, since
+    /// border routers are expected to de-aggregate flyover hop fields before
+    /// forwarding the packet to an end host.
+    ///
     /// The AS list needs to contain the ISD-AS numbers of each AS along the path,
     /// in the same order as they are traversed by the path.
     ///
@@ -988,6 +986,20 @@ impl HummingbirdPath {
             let mut hop_fields = Vec::new();
             while seg_len > 0 {
                 let hop_field = HummingbirdHopField::decode(data)?;
+                let hop_field = match hop_field {
+                    HummingbirdHopField::Standard(h) => h,
+                    HummingbirdHopField::Flyover(h) => StandardHopField {
+                        ingress_router_alert: h.ingress_router_alert,
+                        egress_router_alert: h.egress_router_alert,
+                        exp_time: h.exp_time,
+                        cons_ingress: h.cons_ingress,
+                        cons_egress: h.cons_egress,
+                        // Note: This is where we need to assume that MACs are
+                        // de-aggregated.
+                        mac: h.aggregated_mac,
+                    },
+                };
+
                 seg_len -= hop_field.encoded_length();
 
                 let isd_as = ases
@@ -1571,17 +1583,17 @@ mod tests {
         }
     }
 
-    fn make_std_hop(cons_ingress: u16, cons_egress: u16) -> (IsdAsn, HummingbirdHopField) {
+    fn make_std_hop(cons_ingress: u16, cons_egress: u16) -> (IsdAsn, StandardHopField) {
         (
             IsdAsn::new(Isd::new(1), Asn::new(1)),
-            HummingbirdHopField::Standard(StandardHopField {
+            StandardHopField {
                 ingress_router_alert: false,
                 egress_router_alert: false,
                 exp_time: 63,
                 cons_ingress,
                 cons_egress,
                 mac: [0u8; 6],
-            }),
+            },
         )
     }
 
@@ -1674,8 +1686,9 @@ mod tests {
         // HummingbirdSegmentLength::new() caps at 508 bytes (127 * 4).
         // 43 standard hops × 12 bytes = 516 bytes > 508 → SegmentTooLong.
         let mut path = HummingbirdPath::new();
-        let hops: Vec<(IsdAsn, HummingbirdHopField)> =
-            (0..43u16).map(|i| make_std_hop(i, i + 1)).collect();
+        let hops = (0..43u16)
+            .map(|i| make_std_hop(i, i + 1))
+            .collect::<Vec<_>>();
         let result = path.add_segment(make_info(true, 1), hops);
         assert!(
             matches!(result, Err(HummingbirdPathError::SegmentTooLong)),

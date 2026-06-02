@@ -21,8 +21,10 @@ use futures::{FutureExt, TryFutureExt, future::BoxFuture};
 use scion_proto::{
     address::{ScionAddr, SocketAddr},
     datagram::UdpMessage,
-    hummingbird::Reservation,
-    packet::{ByEndpoint, NonEncodeError, NonScmpEncodeError, ScionPacketRaw, ScionPacketScmp, ScionPacketUdp},
+    packet::{
+        ByEndpoint, NonEncodeError, NonScmpEncodeError, ScionPacketRaw, ScionPacketScmp,
+        ScionPacketUdp,
+    },
     path::{Path, PathProvider},
     scmp::{SCMP_PROTOCOL_NUMBER, ScmpMessage},
 };
@@ -33,7 +35,7 @@ use crate::{
     path::manager::{MultiPathManager, traits::PathManager},
     scionstack::{
         MIN_PATH_BUFFER_SIZE, ScionSocketConnectError, ScionSocketReceiveError,
-        ScionSocketSendError, SendWithReservationsError, scmp_handler::ScmpHandler,
+        ScionSocketSendError, scmp_handler::ScmpHandler,
     },
     types::Subscribers,
 };
@@ -127,31 +129,6 @@ impl PathUnawareUdpScionSocket {
         };
         let packet: ScionPacketRaw = udp_packet.into();
         self.inner.send(packet).map_ok(|_| path).boxed()
-    }
-
-    /// Send a datagram to the specified destination using the given path and
-    /// Hummingbird reservations.
-    ///
-    /// Returns a [`SendWithReservationsError::Conversion`] if the path cannot be
-    /// converted or a reservation cannot be applied, and a
-    /// [`SendWithReservationsError::Send`] if the underlying send fails.
-    pub async fn send_to_via_with_reservations(
-        &self,
-        payload: &[u8],
-        destination: SocketAddr,
-        path: &Path<&[u8]>,
-        reservations: &[Reservation],
-    ) -> Result<Path, SendWithReservationsError> {
-        let bytes_path = path.to_bytes_path();
-
-        let mut hbird_path = bytes_path.to_hbird()?;
-        for r in reservations {
-            hbird_path.add_reservation(r.clone());
-        }
-
-        Ok(self
-            .send_to_via_with_provider(payload, destination, &hbird_path)
-            .await?)
     }
 
     /// Receive a SCION packet with the sender and path.
@@ -624,31 +601,6 @@ impl<P: PathManager> UdpScionSocket<P> {
             .inspect_err(|e| {
                 self.send_error_receivers
                     .for_each(|receiver| receiver.report_send_error(e));
-            })
-    }
-
-    /// Send a datagram to the specified destination using the given path and Hummingbird
-    /// reservations.
-    ///
-    /// The path is converted to a Hummingbird path and the reservations are applied before
-    /// sending. Returns a [`SendWithReservationsError::Conversion`] if the path cannot be
-    /// converted or a reservation cannot be applied, and a [`SendWithReservationsError::Send`]
-    /// if the underlying send fails.
-    pub async fn send_to_via_with_reservations(
-        &self,
-        payload: &[u8],
-        destination: SocketAddr,
-        path: &Path<&[u8]>,
-        reservations: &[Reservation],
-    ) -> Result<Path, SendWithReservationsError> {
-        self.socket
-            .send_to_via_with_reservations(payload, destination, path, reservations)
-            .await
-            .inspect_err(|e| {
-                if let SendWithReservationsError::Send(e) = e {
-                    self.send_error_receivers
-                        .for_each(|receiver| receiver.report_send_error(e));
-                }
             })
     }
 

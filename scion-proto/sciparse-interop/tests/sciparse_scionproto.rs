@@ -486,10 +486,7 @@ fn compare_hbird_path(
 
     // Decode the encoded path to get info/hop fields for detailed comparison
     let mut raw = bytes::Bytes::copy_from_slice(proto_enc.raw());
-    let total_hops = proto_enc.hop_fields().count();
-    let dummy_ases: Vec<scion_proto::address::IsdAsn> =
-        vec![scion_proto::address::IsdAsn::WILDCARD; total_hops];
-    let decoded = scion_proto::path::hummingbird::HummingbirdPath::decode(&mut raw, &dummy_ases)
+    let decoded = scion_proto::path::hummingbird::EncodedHummingbirdPath::decode(&mut raw)
         .expect("Failed to decode hbird path from scion-proto");
 
     // Info fields
@@ -498,14 +495,9 @@ fn compare_hbird_path(
         decoded.segments().count(),
         "info field count mismatch"
     );
-    for (i, (sci_seg, proto_info)) in sci
-        .segments
-        .iter()
-        .zip(decoded.segments().map(|(i, _)| i))
-        .enumerate()
-    {
+    for (i, (sci_seg, proto_info)) in sci.segments.iter().zip(decoded.info_fields()).enumerate() {
         let sci_info = &sci_seg.info_field;
-        compare_info_field(sci_info, proto_info, i);
+        compare_info_field(sci_info, &proto_info.into(), i);
     }
 
     // Hop fields
@@ -516,23 +508,30 @@ fn compare_hbird_path(
         .collect();
     assert_eq!(
         sci_hops.len(),
-        decoded
-            .segments()
-            .map(|(_, hops)| hops.len())
-            .sum::<usize>(),
+        decoded.hop_fields().count(),
         "hop field count mismatch"
     );
     for (i, (&sci_hop, proto_hop)) in sci_hops
         .iter()
-        .zip(decoded.segments().flat_map(|(_, hfs)| hfs.iter().map(|(_, h)| h)))
+        .zip(decoded.hop_fields().map(|enc_hf| {
+            let raw: &[u8] = if enc_hf.is_flyover() {
+                <&scion_proto::path::hummingbird::EncodedFlyoverHopField>::try_from(enc_hf)
+                    .unwrap()
+                    .as_ref()
+            } else {
+                enc_hf.standard_hopfield_unchecked().as_ref()
+            };
+            let mut b = Bytes::copy_from_slice(raw);
+            scion_proto::path::hummingbird::HummingbirdHopField::decode(&mut b).unwrap()
+        }))
         .enumerate()
     {
-        match (sci_hop, proto_hop) {
+        match (sci_hop, proto_hop.clone()) {
             (
                 sciparse::path::hbird::model::HbirdHopField::Standard(sci_hf),
                 scion_proto::path::hummingbird::HummingbirdHopField::Standard(proto_hf),
             ) => {
-                compare_hop_field(sci_hf, proto_hf, i);
+                compare_hop_field(sci_hf, &proto_hf, i);
             }
             (
                 sciparse::path::hbird::model::HbirdHopField::Flyover(sci_hf),

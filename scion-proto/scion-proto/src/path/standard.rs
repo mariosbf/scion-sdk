@@ -27,7 +27,7 @@ use crate::{
     path::{
         PathInterface,
         hummingbird::{
-            FlyoverHopField, HummingbirdCounter, HummingbirdHopField, HummingbirdMetaHeader,
+            FlyoverHopField, HummingbirdCounter, HummingbirdMetaHeader,
             HummingbirdPath, HummingbirdPathError, calculate_flyover_mac, xor_in_place,
         },
     },
@@ -168,7 +168,7 @@ impl StandardPath {
                     .get(iface_index)
                     .ok_or(super::HummingbirdConversionError::MissingIsdAsn)?
                     .isd_asn;
-                segment_hops.push((isd_as, HummingbirdHopField::Standard(hop.clone())));
+                segment_hops.push((isd_as, hop.clone()));
 
                 if hop.cons_ingress != 0 {
                     iface_index += 1;
@@ -357,6 +357,21 @@ impl WireDecode<Bytes> for InfoField {
             seg_id,
             timestamp_epoch: timestamp,
         })
+    }
+}
+
+impl From<&encoded::EncodedInfoField> for InfoField {
+    fn from(encoded: &encoded::EncodedInfoField) -> Self {
+        let raw = encoded.as_ref();
+        let flags = raw[0];
+        let seg_id = u16::from_be_bytes([raw[2], raw[3]]);
+        let timestamp_epoch = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+        Self {
+            peer: flags & Self::FLAGS_PEER != 0,
+            cons_dir: flags & Self::FLAGS_CONS_DIR != 0,
+            seg_id,
+            timestamp_epoch,
+        }
     }
 }
 
