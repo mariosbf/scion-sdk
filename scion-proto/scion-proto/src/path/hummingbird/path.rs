@@ -523,7 +523,7 @@ pub struct ReservationInterfaces {
 /// A fully decoded Hummingbird data plane path. It can be used to build new paths
 /// or to modify existing ones. If you only need to read information, use
 /// [EncodedHummingbirdPath] instead for better performance.
-#[derive(Debug, Clone)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub struct HummingbirdPath {
     /// Path meta data.
     path_meta: HummingbirdMetaHeader,

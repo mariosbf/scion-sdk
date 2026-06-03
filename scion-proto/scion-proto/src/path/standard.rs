@@ -283,7 +283,7 @@ impl WireDecode<Bytes> for StandardPath {
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// |                           Timestamp                           |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InfoField {
     /// Peer is the peering flag. If set to true, then the forwarding path is built as a peering
     /// path, which requires special processing on the data plane.
@@ -406,7 +406,7 @@ pub trait HopField {
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               +
 /// |                              MAC                              |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StandardHopField {
     /// IngressRouterAlert flag. If the IngressRouterAlert is set, the ingress router (in
     /// construction direction) will process the L4 payload in the packet.

@@ -93,7 +93,7 @@ impl Bandwidth {
 }
 
 /// Information about a Hummingbird reservation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReservationInfo {
     /// The ISD-AS for which bandwidth was reserved.
     pub isd_as: IsdAsn,
@@ -118,7 +118,7 @@ pub struct ReservationInfo {
 }
 
 /// A full Hummingbird reservation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reservation {
     /// Information about the reservation.
     pub info: ReservationInfo,
