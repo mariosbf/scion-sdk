@@ -174,6 +174,8 @@ pub enum ScmpParameterProblemCode {
     UnknownHopByHopOption = 65,
     /// Unknown End-to-End Option.
     UnknownEndToEndOption = 66,
+    /// Reservation Expired.
+    ReservationExpired = 71,
     /// Unassigned code.
     Unassigned(u8),
 }
@@ -201,6 +203,7 @@ impl From<u8> for ScmpParameterProblemCode {
             64 => ScmpParameterProblemCode::InvalidExtensionHeader,
             65 => ScmpParameterProblemCode::UnknownHopByHopOption,
             66 => ScmpParameterProblemCode::UnknownEndToEndOption,
+            71 => ScmpParameterProblemCode::ReservationExpired,
             other => ScmpParameterProblemCode::Unassigned(other),
         }
     }
@@ -229,6 +232,7 @@ impl From<ScmpParameterProblemCode> for u8 {
             ScmpParameterProblemCode::InvalidExtensionHeader => 64,
             ScmpParameterProblemCode::UnknownHopByHopOption => 65,
             ScmpParameterProblemCode::UnknownEndToEndOption => 66,
+            ScmpParameterProblemCode::ReservationExpired => 71,
             ScmpParameterProblemCode::Unassigned(value) => value,
         }
     }
@@ -415,6 +419,7 @@ pub mod ptest {
                     ScmpParameterProblemCode::InvalidExtensionHeader,
                     ScmpParameterProblemCode::UnknownHopByHopOption,
                     ScmpParameterProblemCode::UnknownEndToEndOption,
+                    ScmpParameterProblemCode::ReservationExpired,
                 ]),
                 params.unknown => any::<u8>().prop_map(|v| {
                     let mut v = v;

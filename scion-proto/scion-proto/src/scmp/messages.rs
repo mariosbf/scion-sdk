@@ -762,7 +762,8 @@ encoded_type!(
         InvalidSegmentChange = 53,
         InvalidExtensionHeader = 64,
         UnknownHopByHopOption = 65,
-        UnknownEndToEndOption = 66;
+        UnknownEndToEndOption = 66,
+        ReservationExpired = 71;
         Unassigned = _,
     }
 );
