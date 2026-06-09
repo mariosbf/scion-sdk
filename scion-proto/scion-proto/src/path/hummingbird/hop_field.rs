@@ -475,12 +475,12 @@ impl EncodedFlyoverHopField {
     }
 
     /// Returns the bandwidth from the flyover hop field.
-    pub fn bandwidth(&self) -> u16 {
+    pub fn bandwidth(&self) -> Bandwidth {
         let res_id_and_bw = ((self.inner[12] as u32) << 24)
             | ((self.inner[13] as u32) << 16)
             | ((self.inner[14] as u32) << 8)
             | self.inner[15] as u32;
-        (res_id_and_bw & 0x3FF) as u16
+        Bandwidth::decode((res_id_and_bw & 0x3FF) as u16)
     }
 
     /// Returns the reservation start offset from the flyover hop field.
@@ -760,7 +760,7 @@ mod tests {
         let mut hop_data = [0u8; FlyoverHopField::ENCODED_SIZE];
         hop_data[14..16].copy_from_slice(&bytes);
         let hop_field = EncodedFlyoverHopField::new(&hop_data);
-        assert_eq!(hop_field.bandwidth(), expected);
+        assert_eq!(hop_field.bandwidth().encode(), expected);
     }
 
     test_case! {

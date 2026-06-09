@@ -63,7 +63,7 @@ impl Bandwidth {
     }
 
     /// Converts the bandwidth to kbps.
-    pub fn to_kpbs(&self) -> u64 {
+    pub fn to_kbps(&self) -> u64 {
         if self.exponent == 0 {
             self.significand as u64
         } else {
@@ -113,7 +113,7 @@ pub struct ReservationInfo {
     /// The start time of the reservation.
     pub start: u32,
 
-    /// The duration for which the bandwidth is reserved.
+    /// The duration for which the bandwidth is reserved in seconds.
     pub duration: u16,
 }
 
@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn zero_bandwidth() {
         let bw = Bandwidth::from_kbps(0).unwrap();
-        assert_eq!(bw.to_kpbs(), 0);
+        assert_eq!(bw.to_kbps(), 0);
     }
 
     #[test]
@@ -143,7 +143,7 @@ mod tests {
         for kbps in [1u64, 15, 31] {
             let bw = Bandwidth::from_kbps(kbps).unwrap();
             assert_eq!(bw.exponent, 0, "kbps={kbps}");
-            assert_eq!(bw.to_kpbs(), kbps, "kbps={kbps}");
+            assert_eq!(bw.to_kbps(), kbps, "kbps={kbps}");
         }
     }
 
@@ -155,7 +155,7 @@ mod tests {
 
         let bw32 = Bandwidth::from_kbps(32).unwrap();
         assert_eq!(bw32.exponent, 1);
-        assert_eq!(bw32.to_kpbs(), 32);
+        assert_eq!(bw32.to_kbps(), 32);
     }
 
     #[test]
@@ -164,7 +164,7 @@ mod tests {
         // For exponent E, only multiples of 2^(E-1) are exactly representable.
         for kbps in [32u64, 63, 64, 128, 1024] {
             let bw = Bandwidth::from_kbps(kbps).unwrap();
-            assert_eq!(bw.to_kpbs(), kbps, "roundtrip failed for {kbps} kbps");
+            assert_eq!(bw.to_kbps(), kbps, "roundtrip failed for {kbps} kbps");
         }
     }
 
@@ -173,8 +173,8 @@ mod tests {
         // For exponent=2 the stride is 2, so odd values in [64,126] are not
         // representable. 65 should encode as 64.
         let bw = Bandwidth::from_kbps(65).unwrap();
-        assert!(bw.to_kpbs() <= 65);
-        assert_eq!(bw.to_kpbs(), 64);
+        assert!(bw.to_kbps() <= 65);
+        assert_eq!(bw.to_kbps(), 64);
     }
 
     #[test]

@@ -32,7 +32,7 @@ impl From<RedemptionInfo> for v1::RedemptionInfo {
         v1::RedemptionInfo {
             ingress: info.ingress as u32,
             egress: info.egress as u32,
-            bw: info.bandwidth.to_kpbs() as u32,
+            bw: info.bandwidth.to_kbps() as u32,
             start_time: info.start_time.timestamp() as u32,
             duration: info.duration as u32,
         }

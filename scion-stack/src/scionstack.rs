@@ -226,7 +226,7 @@ use quic::{AddressTranslator, Endpoint, ScionAsyncUdpSocket};
 use scion_proto::{
     address::{Isd, IsdAsn, SocketAddr},
     packet::ScionPacketRaw,
-    path::{HummingbirdConversionError, Path},
+    path::Path,
 };
 use scion_sdk_reqwest_connect_rpc::client::CrpcClientError;
 use snap_tun::client::ConnectSnapTunSocketError;
@@ -901,17 +901,29 @@ pub enum ScionSocketSendError {
     /// Error return when send is called on a socket that is not connected.
     #[error("socket is not connected")]
     NotConnected,
+    /// The reservation is expired.
+    #[error("reservation expired")]
+    ReservationExpired,
+    /// Reserved bandwidth exceeded.
+    #[error("bandwidth exceeded")]
+    BandwidthExceeded,
 }
 
-/// Error returned by [`UdpScionSocket::send_to_via_with_reservations`].
-#[derive(Debug, thiserror::Error)]
-pub enum SendWithReservationsError {
-    /// Failed to convert the path to Hummingbird format or apply reservations.
-    #[error("hummingbird path conversion failed: {0}")]
-    Conversion(#[from] HummingbirdConversionError),
-    /// The underlying send failed.
-    #[error("send failed: {0}")]
-    Send(#[from] ScionSocketSendError),
+impl From<scion_proto::path::hummingbird::HummingbirdPathError> for ScionSocketSendError {
+    fn from(value: scion_proto::path::hummingbird::HummingbirdPathError) -> Self {
+        use scion_proto::path::hummingbird::HummingbirdPathError;
+        match value {
+            HummingbirdPathError::ReservationExpired => ScionSocketSendError::ReservationExpired,
+            HummingbirdPathError::BandwidthExceeded => ScionSocketSendError::BandwidthExceeded,
+            e => ScionSocketSendError::InvalidPacket(e.to_string().into()),
+        }
+    }
+}
+
+impl From<std::convert::Infallible> for ScionSocketSendError {
+    fn from(value: std::convert::Infallible) -> Self {
+        match value {}
+    }
 }
 
 /// Minimum size of the path buffer required by [`ScionSocketReceiveError::PathBufTooSmall`].

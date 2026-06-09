@@ -21,10 +21,7 @@ use futures::{FutureExt, TryFutureExt, future::BoxFuture};
 use scion_proto::{
     address::{ScionAddr, SocketAddr},
     datagram::UdpMessage,
-    packet::{
-        ByEndpoint, NonEncodeError, NonScmpEncodeError, ScionPacketRaw, ScionPacketScmp,
-        ScionPacketUdp,
-    },
+    packet::{ByEndpoint, ScionPacketRaw, ScionPacketScmp, ScionPacketUdp},
     path::{Path, PathProvider},
     scmp::{SCMP_PROTOCOL_NUMBER, ScmpMessage},
 };
@@ -78,7 +75,7 @@ impl PathUnawareUdpScionSocket {
         destination: SocketAddr,
         path: &Path<&[u8]>,
     ) -> BoxFuture<'a, Result<(), ScionSocketSendError>> {
-        let packet = match ScionPacketUdp::new(
+        let packet: ScionPacketRaw = match ScionPacketUdp::new(
             ByEndpoint {
                 source: self.inner.local_addr(),
                 destination,
@@ -96,19 +93,20 @@ impl PathUnawareUdpScionSocket {
             }
         }
         .into();
+
         self.inner.send(packet)
     }
 
     /// Send a SCION UDP datagram via the given Hummingbird path.
-    pub fn send_to_via_with_provider<'a, E, P>(
+    pub fn send_to_via_with_provider<'a, P>(
         &'a self,
         payload: &[u8],
         destination: SocketAddr,
         path_provider: &P,
     ) -> BoxFuture<'a, Result<Path, ScionSocketSendError>>
     where
-        E: 'a + NonEncodeError + Send,
-        P: PathProvider<Error = E>,
+        P: PathProvider,
+        P::Error: Into<ScionSocketSendError>,
     {
         let (udp_packet, path) = match ScionPacketUdp::new_with_path_provider(
             ByEndpoint {
@@ -119,12 +117,14 @@ impl PathUnawareUdpScionSocket {
             Bytes::copy_from_slice(payload),
         ) {
             Ok(pair) => pair,
+            Err(scion_proto::packet::PathProviderEncodeError::PathProviderError(e)) => {
+                return Box::pin(std::future::ready(Err(e.into())));
+            }
             Err(e) => {
-                return Box::pin(async move {
-                    Err(ScionSocketSendError::InvalidPacket(
-                        format!("error encoding packet: {e}").into(),
-                    ))
-                });
+                let msg = format!("error encoding packet: {e}");
+                return Box::pin(
+                    async move { Err(ScionSocketSendError::InvalidPacket(msg.into())) },
+                );
             }
         };
         let packet: ScionPacketRaw = udp_packet.into();
@@ -318,20 +318,20 @@ impl ScmpScionSocket {
                 });
             }
         };
-        let packet = packet.into();
+        let packet: ScionPacketRaw = packet.into();
         Box::pin(async move { self.inner.send(packet).await })
     }
 
     /// Send a SCION SCMP datagram via a path obtained from the given path provider.
-    pub fn send_to_via_with_provider<'a, P, E>(
+    pub fn send_to_via_with_provider<'a, P>(
         &'a self,
         message: ScmpMessage,
         destination: ScionAddr,
         path_provider: &P,
     ) -> BoxFuture<'a, Result<Path, ScionSocketSendError>>
     where
-        E: NonScmpEncodeError + 'a + Send,
-        P: PathProvider<Error = E>,
+        P: PathProvider,
+        P::Error: Into<ScionSocketSendError>,
     {
         let (udp_packet, path) = match ScionPacketScmp::new_with_path_provider(
             ByEndpoint {
@@ -342,12 +342,14 @@ impl ScmpScionSocket {
             message,
         ) {
             Ok(pair) => pair,
+            Err(scion_proto::packet::PathProviderScmpEncodeError::PathProviderError(e)) => {
+                return Box::pin(std::future::ready(Err(e.into())));
+            }
             Err(e) => {
-                return Box::pin(async move {
-                    Err(ScionSocketSendError::InvalidPacket(
-                        format!("error encoding packet: {e}").into(),
-                    ))
-                });
+                let msg = format!("error encoding packet: {e}");
+                return Box::pin(
+                    async move { Err(ScionSocketSendError::InvalidPacket(msg.into())) },
+                );
             }
         };
         let packet: ScionPacketRaw = udp_packet.into();
@@ -585,15 +587,15 @@ impl<P: PathManager> UdpScionSocket<P> {
 
     /// Send a datagram to the specified destination via a path obtained from the
     /// provided path provider.
-    pub async fn send_to_via_with_provider<E, PF>(
+    pub async fn send_to_via_with_provider<PF>(
         &self,
         payload: &[u8],
         destination: SocketAddr,
         path_provider: &PF,
     ) -> Result<Path, ScionSocketSendError>
     where
-        E: Send + NonEncodeError,
-        PF: PathProvider<Error = E>,
+        PF: PathProvider,
+        PF::Error: Into<ScionSocketSendError>,
     {
         self.socket
             .send_to_via_with_provider(payload, destination, path_provider)

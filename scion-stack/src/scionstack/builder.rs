@@ -15,7 +15,12 @@
 
 mod priority_connect;
 
-use std::{borrow::Cow, fmt, net, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    fmt, net,
+    sync::Arc,
+    time::Duration,
+};
 
 use endhost_api_client::client::CrpcEndhostApiClient;
 use rand::seq::IndexedRandom;
@@ -283,12 +288,10 @@ impl ScionStackBuilder {
         // the same as the interface used to reach the data planes.
         let local_ip_resolver: Arc<dyn LocalIpResolver> = match udp.local_ips {
             Some(ips) => Arc::new(ips),
-            None => {
-                Arc::new(
-                    TargetAddrLocalIpResolver::new(api_url.clone())
-                        .map_err(BuildUdpScionStackError::LocalIpResolutionError)?,
-                )
-            }
+            None => Arc::new(
+                TargetAddrLocalIpResolver::new(api_url.clone())
+                    .map_err(BuildUdpScionStackError::LocalIpResolutionError)?,
+            ),
         };
 
         let underlay_stack = UnderlayStack::new(

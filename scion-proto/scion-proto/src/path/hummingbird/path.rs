@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::ops::Deref;
+use std::sync::{Arc, Mutex};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use chrono::{DateTime, Utc};
@@ -23,6 +24,7 @@ use crate::{
             HummingbirdHopField, HummingbirdHopFields, HummingbirdHopfieldIndex,
             HummingbirdInfoFieldIndex, HummingbirdMetaHeader, HummingbirdMetaReserved,
             HummingbirdMillisTimestamp, HummingbirdSegmentLength,
+            reservation_tracker::{ReservationTracker, ReservationTrackerError},
         },
         metadata::{Metadata, PathInterface},
     },
@@ -501,10 +503,27 @@ pub enum HummingbirdPathError {
     /// i.e., it is expired, or not yet valid.
     #[error("Trying to use a reservation that is not currently valid")]
     ReservationNotValid,
+
+    /// The Hummingbird reservation has expired.
+    #[error("reservation expired")]
+    ReservationExpired,
+
+    /// The reserved bandwidth has been exceeded.
+    #[error("bandwidth exceeded")]
+    BandwidthExceeded,
 }
 
 impl NonEncodeError for HummingbirdPathError {}
 impl NonScmpEncodeError for HummingbirdPathError {}
+
+impl From<ReservationTrackerError> for HummingbirdPathError {
+    fn from(e: ReservationTrackerError) -> Self {
+        match e {
+            ReservationTrackerError::ReservationExpired => Self::ReservationExpired,
+            ReservationTrackerError::BandwidthExceeded => Self::BandwidthExceeded,
+        }
+    }
+}
 
 impl From<InadequateBufferSize> for HummingbirdPathError {
     fn from(_: InadequateBufferSize) -> Self {
@@ -523,7 +542,7 @@ pub struct ReservationInterfaces {
 /// A fully decoded Hummingbird data plane path. It can be used to build new paths
 /// or to modify existing ones. If you only need to read information, use
 /// [EncodedHummingbirdPath] instead for better performance.
-#[derive(PartialEq, Eq, Debug, Clone)]
+#[derive(Clone)]
 pub struct HummingbirdPath {
     /// Path meta data.
     path_meta: HummingbirdMetaHeader,
@@ -536,6 +555,9 @@ pub struct HummingbirdPath {
 
     /// Reservations to apply when encoding
     reservations: BTreeMap<ReservationInterfaces, Vec<Reservation>>,
+
+    /// Optional per-path reservation tracker for client-side bandwidth enforcement.
+    reservation_tracker: Option<Arc<Mutex<ReservationTracker>>>,
 }
 
 impl HummingbirdPath {
@@ -561,7 +583,20 @@ impl HummingbirdPath {
             info_fields: vec![],
             segments: vec![],
             reservations: BTreeMap::new(),
+            reservation_tracker: None,
         }
+    }
+
+    /// Attach a [`ReservationTracker`] to this path.
+    ///
+    /// When set, every call to [`PathProvider::build`] checks the tracker before
+    /// returning the encoded path. The call returns
+    /// [`HummingbirdPathError::ReservationExpired`] or
+    /// [`HummingbirdPathError::BandwidthExceeded`] if the tracker rejects the
+    /// packet.
+    pub fn with_reservation_tracker(mut self, tracker: Arc<Mutex<ReservationTracker>>) -> Self {
+        self.reservation_tracker = Some(tracker);
+        self
     }
 
     /// Returns the index of the current info field.
@@ -1022,6 +1057,7 @@ impl HummingbirdPath {
             info_fields,
             segments,
             reservations: BTreeMap::new(),
+            reservation_tracker: None,
         })
     }
 }
@@ -1032,6 +1068,29 @@ impl Default for HummingbirdPath {
     }
 }
 
+impl std::fmt::Debug for HummingbirdPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HummingbirdPath")
+            .field("path_meta", &self.path_meta)
+            .field("info_fields", &self.info_fields)
+            .field("segments", &self.segments)
+            .field("reservations", &self.reservations)
+            .field("reservation_tracker", &self.reservation_tracker.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for HummingbirdPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.path_meta == other.path_meta
+            && self.info_fields == other.info_fields
+            && self.segments == other.segments
+            && self.reservations == other.reservations
+    }
+}
+
+impl Eq for HummingbirdPath {}
+
 impl PathProvider for HummingbirdPath {
     type Error = HummingbirdPathError;
 
@@ -1041,7 +1100,21 @@ impl PathProvider for HummingbirdPath {
         payload_len: u16,
         address_header_len: u16,
     ) -> Result<Path, Self::Error> {
-        self.to_bytes_path(isd_asn, payload_len, address_header_len)
+        let path = self.to_bytes_path(isd_asn, payload_len, address_header_len)?;
+        if let Some(ref tracker) = self.reservation_tracker {
+            if let DataPlanePath::Hummingbird(ref encoded) = path.data_plane_path {
+                let pkt_size = CommonHeader::LENGTH
+                    + address_header_len as usize
+                    + encoded.raw().len()
+                    + payload_len as usize;
+                tracker
+                    .lock()
+                    .unwrap()
+                    .apply(encoded, pkt_size)
+                    .map_err(HummingbirdPathError::from)?;
+            }
+        }
+        Ok(path)
     }
 }
 
