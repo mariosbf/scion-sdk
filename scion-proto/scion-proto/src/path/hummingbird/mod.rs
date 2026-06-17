@@ -14,6 +14,7 @@ pub use crypto::*;
 
 pub(super) mod token_bucket;
 
+/// Tracks per-flow Hummingbird reservations and enforces bandwidth limits.
 pub mod reservation_tracker;
 pub use reservation_tracker::{ReservationTracker, ReservationTrackerError};
 

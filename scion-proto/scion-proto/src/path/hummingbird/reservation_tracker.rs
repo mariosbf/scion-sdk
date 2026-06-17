@@ -31,6 +31,7 @@ pub struct ReservationTracker {
 }
 
 impl ReservationTracker {
+    /// Creates a new [`ReservationTracker`].
     pub fn new() -> Self {
         Self {
             token_buckets: HashMap::new(),
@@ -91,9 +92,7 @@ impl ReservationTracker {
                 .checked_sub(hop.reservation_start_offset())
                 .ok_or(ReservationTrackerError::ReservationExpired)?;
 
-            let reservation_end = reservation_start
-                .checked_add(reservation_duration)
-                .unwrap();
+            let reservation_end = reservation_start.checked_add(reservation_duration).unwrap();
 
             let available = self
                 .token_buckets
@@ -156,8 +155,7 @@ impl ReservationTracker {
 
         // First pass: check every flyover hop's bucket without deducting.
         for (hop_idx, hop) in &flyover_hops {
-            let reservation_duration =
-                Duration::from_secs(hop.reservation_duration() as u64);
+            let reservation_duration = Duration::from_secs(hop.reservation_duration() as u64);
             if hop.reservation_start_offset() > reservation_duration {
                 return Err(ReservationTrackerError::ReservationExpired);
             }
@@ -172,9 +170,7 @@ impl ReservationTracker {
                 .checked_sub(hop.reservation_start_offset())
                 .ok_or(ReservationTrackerError::ReservationExpired)?;
 
-            let reservation_end = reservation_start
-                .checked_add(reservation_duration)
-                .unwrap();
+            let reservation_end = reservation_start.checked_add(reservation_duration).unwrap();
 
             if !self
                 .token_buckets
