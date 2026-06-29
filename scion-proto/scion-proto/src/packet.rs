@@ -29,8 +29,8 @@ pub use error::{
 
 mod headers;
 pub use headers::{
-    AddressHeader, AddressInfo, ByEndpoint, CommonHeader, FlowId, NextHeader, RawHostAddress,
-    ScionHeaders, Version,
+    AddressHeader, AddressInfo, ByEndpoint, CommonHeader, E2EExtensionHeader, ExtensionOption,
+    FlowId, NextHeader, RawHostAddress, ScionHeaders, Version,
 };
 
 mod raw;
@@ -40,7 +40,7 @@ mod scmp;
 pub use scmp::ScionPacketScmp;
 
 mod udp;
-pub use udp::ScionPacketUdp;
+pub use udp::{ScionPacketUdp, ScionPacketUdpBuilder};
 
 mod checksum;
 pub use checksum::{ChecksumDigest, MessageChecksum};

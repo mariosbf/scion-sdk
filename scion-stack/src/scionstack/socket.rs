@@ -131,6 +131,21 @@ impl PathUnawareUdpScionSocket {
         self.inner.send(packet).map_ok(|_| path).boxed()
     }
 
+    /// Send a pre-built UDP packet.
+    ///
+    /// The caller is responsible for setting the correct source address and embedding the path.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is cancel-safe. If the future is dropped before completion, the packet may
+    /// be silently lost, but no socket state is corrupted and the socket remains usable.
+    pub fn send_packet<'a>(
+        &'a self,
+        packet: ScionPacketUdp,
+    ) -> BoxFuture<'a, Result<(), ScionSocketSendError>> {
+        self.inner.send(packet.into())
+    }
+
     /// Receive a SCION packet with the sender and path.
     ///
     /// # Cancel safety
@@ -599,6 +614,27 @@ impl<P: PathManager> UdpScionSocket<P> {
     {
         self.socket
             .send_to_via_with_provider(payload, destination, path_provider)
+            .await
+            .inspect_err(|e| {
+                self.send_error_receivers
+                    .for_each(|receiver| receiver.report_send_error(e));
+            })
+    }
+
+    /// Send a pre-built UDP packet.
+    ///
+    /// The caller is responsible for setting the correct source address and embedding the path.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is cancel-safe. If the future is dropped before completion, the packet may
+    /// be silently lost, but no socket state is corrupted and the socket remains usable.
+    pub async fn send_packet(
+        &self,
+        packet: ScionPacketUdp,
+    ) -> Result<(), ScionSocketSendError> {
+        self.socket
+            .send_packet(packet)
             .await
             .inspect_err(|e| {
                 self.send_error_receivers

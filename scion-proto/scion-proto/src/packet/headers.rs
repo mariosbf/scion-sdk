@@ -19,15 +19,20 @@ mod common_header;
 use std::num::NonZeroU8;
 
 use bytes::{BufMut, Bytes};
-pub use common_header::{AddressInfo, CommonHeader, FlowId, NextHeader, Version};
+pub use common_header::{AddressInfo, CommonHeader, FlowId, Version};
 
 mod address_header;
 pub use address_header::{AddressHeader, RawHostAddress};
 
+mod e2e_extn_header;
+pub use e2e_extn_header::{E2EExtensionHeader, ExtensionOption};
+
 use super::{EncodeError, InadequateBufferSize};
 use crate::{
     address::{ScionAddr, SocketAddr},
+    datagram::UdpMessage,
     path::{DataPlanePath, Path, UnsupportedPathType},
+    scmp::SCMP_PROTOCOL_NUMBER,
     wire_encoding::WireEncode,
 };
 
@@ -40,6 +45,8 @@ pub struct ScionHeaders {
     pub address: AddressHeader,
     /// The path to the destination, when necessary.
     pub path: DataPlanePath,
+    /// The end-to-end extension header, if present.
+    pub e2e_extn_header: Option<E2EExtensionHeader>,
 }
 
 impl ScionHeaders {
@@ -56,6 +63,7 @@ impl ScionHeaders {
 
         let header_length =
             CommonHeader::LENGTH + address_header.encoded_length() + path.encoded_length();
+
         let header_length_factor = NonZeroU8::new(
             (header_length / CommonHeader::HEADER_LENGTH_MULTIPLICAND)
                 .try_into()
@@ -80,8 +88,37 @@ impl ScionHeaders {
         Ok(Self {
             common: common_header,
             address: address_header,
+            e2e_extn_header: None,
             path,
         })
+    }
+
+    /// Attaches an end-to-end extension header carrying the given options, replacing any existing
+    /// one.
+    ///
+    /// Updates `common.next_header` to 201 and recalculates `common.header_length_factor`.
+    pub(crate) fn set_e2e(&mut self, options: Vec<ExtensionOption>) -> Result<(), EncodeError> {
+        let inner_next_header = self
+            .e2e_extn_header
+            .as_ref()
+            .map(|h| h.next_header)
+            .unwrap_or(self.common.next_header);
+
+        let e2e_header = E2EExtensionHeader {
+            next_header: inner_next_header,
+            options,
+        };
+
+        let new_payload_length = u16::try_from(e2e_header.encoded_length())
+            .ok()
+            .and_then(|v| v.checked_add(self.common.payload_length))
+            .ok_or(EncodeError::PayloadTooLarge)?;
+
+        self.common.payload_length = new_payload_length;
+        self.common.next_header = NextHeader::E2E_EXTENSION_HEADER;
+        self.e2e_extn_header = Some(e2e_header);
+
+        Ok(())
     }
 
     /// Creates a new [`ScionHeaders`] object given the source and destination [`SocketAddr`],
@@ -110,13 +147,23 @@ impl WireEncode for ScionHeaders {
 
     #[inline]
     fn encoded_length(&self) -> usize {
-        CommonHeader::LENGTH + self.address.encoded_length() + self.path.encoded_length()
+        CommonHeader::LENGTH
+            + self.address.encoded_length()
+            + self.path.encoded_length()
+            + self
+                .e2e_extn_header
+                .as_ref()
+                .map(|h| h.encoded_length())
+                .unwrap_or(0)
     }
 
     fn encode_to_unchecked<T: BufMut>(&self, buffer: &mut T) {
         self.common.encode_to_unchecked(buffer);
         self.address.encode_to_unchecked(buffer);
         self.path.encode_to_unchecked(buffer);
+        self.e2e_extn_header
+            .iter()
+            .for_each(|h| h.encode_to_unchecked(buffer));
     }
 }
 
@@ -144,6 +191,17 @@ impl ScionHeaders {
     pub fn path(&self) -> Path<Bytes> {
         Path::new(self.path.clone(), self.address.ia, None)
     }
+}
+
+/// Non-exhaustive values for the next header field in SCION headers.
+pub struct NextHeader;
+impl NextHeader {
+    /// UDP protocol number
+    pub const UDP: u8 = UdpMessage::PROTOCOL_NUMBER;
+    /// SCMP protocol number
+    pub const SCMP: u8 = SCMP_PROTOCOL_NUMBER;
+    /// E2E extension header protocol number
+    pub const E2E_EXTENSION_HEADER: u8 = 201;
 }
 
 /// Instances of an object associated with both a source and destination endpoint.

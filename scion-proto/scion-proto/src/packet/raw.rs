@@ -113,6 +113,7 @@ impl<T: Buf> WireDecode<T> for ScionPacketRaw {
                     common: common_header,
                     address: address_header,
                     path: path_header,
+                    e2e_extn_header: None,
                 },
                 payload,
             })
