@@ -474,13 +474,22 @@ where
         )
     }
 
-    /// Returns a new `Path` reversing `data_plane_path` and `isd_asn`
+    /// Returns a new `Path` reversing `data_plane_path`, `isd_asn`, and the `interfaces` list
+    /// in the metadata (if present). Other metadata fields are copied as-is.
     pub fn to_reversed(&self) -> Result<Path, UnsupportedPathType> {
-        Ok(Path::new(
+        let mut path = Path::new(
             self.data_plane_path.to_reversed()?,
             self.isd_asn.into_reversed(),
             self.underlay_next_hop,
-        ))
+        );
+        path.metadata = self.metadata.as_ref().map(|m| Metadata {
+            interfaces: m.interfaces.clone().map(|mut v| {
+                v.reverse();
+                v
+            }),
+            ..Metadata::default()
+        });
+        Ok(path)
     }
 }
 
