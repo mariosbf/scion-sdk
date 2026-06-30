@@ -51,6 +51,12 @@ pub struct CrpcHbirdRedemptionClient {
 
     /// SCION service resolution client.
     svc_resolution_client: UdpScionServiceResolutionClient,
+
+    /// RSA private key used to decrypt redemption responses.
+    sk: rsa::RsaPrivateKey,
+
+    /// DER-encoded RSA public key sent with redemption requests.
+    pk_der: Vec<u8>,
 }
 
 /// A single Hummingbird flyover redemption request.
@@ -99,11 +105,25 @@ impl CrpcHbirdRedemptionClient {
         let svc_resolution_client =
             UdpScionServiceResolutionClient::new(svc_resolution_socket, None);
 
+        let sk = tokio::task::spawn_blocking(|| {
+            rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048)
+        })
+        .await
+        .map_err(|e| HbirdRedemptionError::InvalidReservation(e.to_string()))??;
+
+        let pk_der = sk
+            .to_public_key()
+            .to_pkcs1_der()
+            .map_err(|e| HbirdRedemptionError::InvalidReservation(e.to_string()))?
+            .to_vec();
+
         Ok(CrpcHbirdRedemptionClient {
             local_addr,
             scion_stack,
             local_hbird_service_url,
             svc_resolution_client,
+            sk,
+            pk_der,
         })
     }
 }
@@ -114,17 +134,10 @@ impl CrpcHbirdRedemptionClient {
         &self,
         requests: Vec<RedemptionRequestWithIsdAsn>,
     ) -> Result<Vec<Reservation>, HbirdRedemptionError> {
-        let sk = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048)?;
-        let pk_der = sk
-            .to_public_key()
-            .to_pkcs1_der()
-            .map_err(|e| HbirdRedemptionError::InvalidReservation(e.to_string()))?
-            .to_vec();
-
         let mut reservations = Vec::with_capacity(requests.len());
 
         for (target_isd_as, requests) in requests_by_as(requests) {
-            let proto_request = to_proto_requests(requests.clone(), pk_der.clone());
+            let proto_request = to_proto_requests(requests.clone(), self.pk_der.clone());
 
             let proto_response = if self.local_addr.isd_asn() == target_isd_as {
                 // Note: Service address resolution does not work currently for
@@ -181,7 +194,7 @@ impl CrpcHbirdRedemptionClient {
             };
 
             tracing::trace!(target_isd_as = %target_isd_as, "received redemption response from Hummingbird service");
-            reservations.extend(from_proto_responses(proto_response, &requests, &sk)?);
+            reservations.extend(from_proto_responses(proto_response, &requests, &self.sk)?);
         }
         Ok(reservations)
     }
