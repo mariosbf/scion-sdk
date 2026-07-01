@@ -49,6 +49,16 @@ impl TokenBucket {
         self.current_token -= size as i64;
     }
 
+    /// Deducts `size` bytes if available. Returns whether the bytes were deducted.
+    pub fn use_checked(&mut self, size: usize, now: SystemTime) -> bool {
+        if self.check(size, now) {
+            self.use_unchecked(size);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Returns the number of bytes available at `now` after replenishing, clamped to 0.
     ///
     /// Updates the replenishment clock (same side-effect as `check`).

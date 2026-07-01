@@ -558,6 +558,11 @@ pub struct HummingbirdPath {
 
     /// Optional per-path reservation tracker for client-side bandwidth enforcement.
     reservation_tracker: Option<Arc<Mutex<ReservationTracker>>>,
+
+    /// When `true`, encoding fails if any hop that has at least one matching reservation
+    /// cannot be assigned one (e.g. all buckets are exhausted). When `false`, those hops
+    /// silently fall back to standard hop fields.
+    strict_reservation: bool,
 }
 
 impl HummingbirdPath {
@@ -584,19 +589,84 @@ impl HummingbirdPath {
             segments: vec![],
             reservations: BTreeMap::new(),
             reservation_tracker: None,
+            strict_reservation: false,
         }
     }
 
     /// Attach a [`ReservationTracker`] to this path.
     ///
-    /// When set, every call to [`PathProvider::build`] checks the tracker before
-    /// returning the encoded path. The call returns
-    /// [`HummingbirdPathError::ReservationExpired`] or
-    /// [`HummingbirdPathError::BandwidthExceeded`] if the tracker rejects the
-    /// packet.
-    pub fn with_reservation_tracker(mut self, tracker: Arc<Mutex<ReservationTracker>>) -> Self {
+    /// When set, every call to [`PathProvider::build`] selects a reservation with
+    /// available bandwidth for each hop before encoding, and updates the
+    /// available bandwidth for the chosen reservations.
+    ///
+    /// If `strict` is `true`, encoding fails with
+    /// [`HummingbirdPathError::BandwidthExceeded`] whenever a hop has at least one
+    /// matching reservation but none with sufficient available bandwidth. If
+    /// `strict` is `false`, those hops silently fall back to standard hop fields.
+    pub fn with_reservation_tracker(
+        mut self,
+        tracker: Arc<Mutex<ReservationTracker>>,
+        strict: bool,
+    ) -> Self {
         self.reservation_tracker = Some(tracker);
+        self.strict_reservation = strict;
         self
+    }
+
+    /// Returns the maximum packet size (in bytes) that can be sent such that
+    /// every hop with a matching reservation has a reservation that has enough  
+    /// available bandwidth to be able to send the packet now.
+    ///
+    /// Returns `None` if no tracker is attached or if there are no reservations
+    /// attached to this path.
+    pub fn available_packet_size(&self) -> Option<usize> {
+        let tracker = self.reservation_tracker.as_ref()?;
+        let mut guard = tracker.lock().unwrap();
+
+        let mut min_available: Option<usize> = None;
+
+        for (seg_idx, (segment, info)) in self
+            .segments
+            .iter()
+            .zip(self.info_fields.iter())
+            .enumerate()
+        {
+            let next_segment = self.segments.get(seg_idx + 1);
+            let next_info = self.info_fields.get(seg_idx + 1);
+            let first_hop_of_next_segment = next_segment.and_then(|s| s.first());
+
+            for (hop_idx, (hop_isd_asn, hop_field)) in segment.iter().enumerate() {
+                let is_last_hop_of_segment = hop_idx == segment.len() - 1;
+
+                let (ingress, egress) = hop_field.interfaces(info.cons_dir);
+                let egress = if is_last_hop_of_segment {
+                    first_hop_of_next_segment
+                        .map(|(_, h)| h.interfaces(next_info.unwrap().cons_dir).1)
+                        .unwrap_or(egress)
+                } else {
+                    egress
+                };
+
+                let interfaces = ReservationInterfaces {
+                    ingress_interface: ingress,
+                    egress_interface: egress,
+                    isd_as: *hop_isd_asn,
+                };
+
+                if let Some(reservations) = self.reservations.get(&interfaces) {
+                    let max_bytes = reservations
+                        .iter()
+                        .map(|r| guard.available_bytes(&r.info))
+                        .max();
+
+                    if let Some(avail) = max_bytes {
+                        min_available = Some(min_available.map_or(avail, |m: usize| m.min(avail)));
+                    }
+                }
+            }
+        }
+
+        min_available
     }
 
     /// Returns the index of the current info field.
@@ -690,7 +760,8 @@ impl HummingbirdPath {
     /// may change the encoded length.
     pub fn encoded_length(&self) -> usize {
         let hop_fields_with_applicable_reservations = self
-            .hops_with_reservation()
+            .hops_with_reservation(0, None, false)
+            .expect("infallible: no tracker, no strict")
             .iter()
             .filter(|t| matches!(t, (_, _, Some(_))))
             .count();
@@ -707,14 +778,6 @@ impl HummingbirdPath {
                 * (FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE)
     }
 
-    /// Helper function to calculate applicable reservation
-    fn applicable_reservations(
-        &self,
-        interfaces: ReservationInterfaces,
-    ) -> impl Iterator<Item = &Reservation> {
-        self.reservations.get(&interfaces).into_iter().flatten()
-    }
-
     fn info_fields_len(&self) -> usize {
         self.info_fields
             .iter()
@@ -726,7 +789,22 @@ impl HummingbirdPath {
         self.segments.iter().map(|s| s.len()).sum::<usize>()
     }
 
-    fn hops_with_reservation(&self) -> Vec<(usize, usize, Option<Reservation>)> {
+    /// Returns each hop paired with the reservation to apply when encoding.
+    ///
+    /// When `tracker` is `Some`, the selection is bandwidth-aware:
+    /// - Candidates for a hop are reservations that pass [`ReservationTracker::check_reservation`].
+    /// - Among candidates, the one with the fewest available bytes (tightest bucket) is chosen,
+    ///   preserving headroom in larger buckets for bigger packets.
+    /// - If no candidate passes and `strict` is `true`, returns `BandwidthExceeded`.
+    /// - If no candidate passes and `strict` is `false`, the hop falls back to standard.
+    ///
+    /// When `tracker` is `None`, the first reservation in the list is chosen (no bandwidth check).
+    fn hops_with_reservation(
+        &self,
+        pkt_len: usize,
+        mut tracker: Option<&mut ReservationTracker>,
+        strict: bool,
+    ) -> Result<Vec<(usize, usize, Option<Reservation>)>, HummingbirdPathError> {
         let mut hop_fields = Vec::with_capacity(self.num_hopfields());
 
         let seg_iter = self.segments.iter();
@@ -734,10 +812,6 @@ impl HummingbirdPath {
 
         let mut seg_and_info_iter = seg_iter.zip(info_iter).enumerate().peekable();
 
-        // Create iterator over hop fields with
-        // - the segment index
-        // - the index of the hop field
-        // - reservation to apply (if such a reservation exists)
         while let Some((seg_idx, (segment, info))) = seg_and_info_iter.next() {
             let next = seg_and_info_iter.peek();
             let next_segment = next.map(|(_, (s, _))| s);
@@ -765,12 +839,51 @@ impl HummingbirdPath {
                     isd_as: *hop_isd_asn,
                 };
 
-                let reservation = self.applicable_reservations(interfaces).next().cloned();
+                let reservation = if let Some(reservations) = self.reservations.get(&interfaces) {
+                    if let Some(ref mut t) = tracker {
+                        let mut num_expired = 0;
+                        let mut selected = None;
+
+                        for r in reservations {
+                            match t.check_reservation(&r.info, pkt_len) {
+                                Err(ReservationTrackerError::BandwidthExceeded) => {
+                                    continue;
+                                }
+                                Err(ReservationTrackerError::ReservationExpired) => {
+                                    num_expired += 1;
+                                }
+                                Ok(()) => {
+                                    let available_bytes = t.available_bytes(&r.info);
+
+                                    if selected.is_none_or(|(_, bytes)| bytes > available_bytes) {
+                                        selected = Some((r, available_bytes));
+                                    }
+                                }
+                            }
+                        }
+
+                        let all_expired = num_expired == reservations.len();
+
+                        if all_expired && strict {
+                            return Err(HummingbirdPathError::ReservationExpired);
+                        }
+
+                        if selected.is_none() && strict {
+                            return Err(HummingbirdPathError::BandwidthExceeded);
+                        }
+                        selected.map(|v| v.0.clone())
+                    } else {
+                        reservations.first().cloned()
+                    }
+                } else {
+                    None
+                };
+
                 hop_fields.push((seg_idx, hop_idx, reservation));
             }
         }
 
-        hop_fields
+        Ok(hop_fields)
     }
 
     /// Apply reservations by turning applicable hop fields into flyover hop
@@ -802,9 +915,27 @@ impl HummingbirdPath {
                 time.timestamp_subsec_millis(),
             ))?;
 
-        // Calculate packet length for MAC calculation
+        // Conservative upper bound on path header length — all reservable hops as flyovers.
+        // Used only for the bandwidth check; MAC computation uses the exact length below.
+        let max_path_header_len = meta_header.encoded_length()
+            + self.info_fields_len()
+            + self.num_hopfields() * FlyoverHopField::ENCODED_SIZE;
+        let estimated_pkt_len = max_path_header_len
+            + CommonHeader::LENGTH
+            + address_header_len as usize
+            + payload_len as usize;
+
+        // Lock the tracker once for the entire check → encode → deduct sequence.
+        let mut tracker_guard = self.reservation_tracker.as_ref().map(|t| t.lock().unwrap());
+
+        let hop_fields = self.hops_with_reservation(
+            estimated_pkt_len,
+            tracker_guard.as_deref_mut(),
+            self.strict_reservation,
+        )?;
+
+        // Compute the exact packet length based on the actual selection.
         let mut curr_hf_index = meta_header.current_hop_field.byte_offset();
-        let hop_fields = self.hops_with_reservation();
         let hop_fields_with_applicable_reservations = hop_fields
             .iter()
             .filter(|t| matches!(t, (_, _, Some(_))))
@@ -830,6 +961,12 @@ impl HummingbirdPath {
         let mut hop_offset = 0;
         let mut seglens = [0; 3];
         let mut hops = Vec::with_capacity(self.num_hopfields());
+
+        // Collect reservation infos for deduction after encoding (while hop_fields is still alive).
+        let deduct_infos: Vec<_> = hop_fields
+            .iter()
+            .filter_map(|(_, _, res)| res.as_ref().map(|r| r.info.clone()))
+            .collect();
 
         for (seg_idx, hop_idx, res) in hop_fields {
             let (_, hop) = &self.segments[seg_idx][hop_idx];
@@ -869,6 +1006,13 @@ impl HummingbirdPath {
         // Adjust current hop field index in meta header.
         meta_header.current_hop_field = HummingbirdHopfieldIndex::new(curr_hf_index)
             .ok_or(HummingbirdPathError::InvalidHopFieldIndex)?;
+
+        // Deduct bandwidth from the selected buckets (still under the same tracker lock).
+        if let Some(ref mut guard) = tracker_guard {
+            for info in &deduct_infos {
+                guard.deduct_reservation(info, pkt_len as usize);
+            }
+        }
 
         Ok((meta_header, hops))
     }
@@ -1058,6 +1202,7 @@ impl HummingbirdPath {
             segments,
             reservations: BTreeMap::new(),
             reservation_tracker: None,
+            strict_reservation: false,
         })
     }
 }
@@ -1100,21 +1245,9 @@ impl PathProvider for HummingbirdPath {
         payload_len: u16,
         address_header_len: u16,
     ) -> Result<Path, Self::Error> {
-        let path = self.to_bytes_path(isd_asn, payload_len, address_header_len)?;
-        if let Some(ref tracker) = self.reservation_tracker {
-            if let DataPlanePath::Hummingbird(ref encoded) = path.data_plane_path {
-                let pkt_size = CommonHeader::LENGTH
-                    + address_header_len as usize
-                    + encoded.raw().len()
-                    + payload_len as usize;
-                tracker
-                    .lock()
-                    .unwrap()
-                    .apply(encoded, pkt_size)
-                    .map_err(HummingbirdPathError::from)?;
-            }
-        }
-        Ok(path)
+        // Bandwidth check and deduction happen inside apply_reservations (called by
+        // to_bytes_path), so no separate tracker call is needed here.
+        self.to_bytes_path(isd_asn, payload_len, address_header_len)
     }
 }
 

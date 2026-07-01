@@ -1,10 +1,9 @@
 use std::{
     collections::HashMap,
-    ops::Deref,
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::path::hummingbird::{EncodedFlyoverHopField, EncodedHummingbirdPath};
+use crate::{address::IsdAsn, hummingbird::ReservationInfo};
 
 use super::token_bucket::TokenBucket;
 
@@ -20,12 +19,9 @@ pub enum ReservationTrackerError {
 }
 
 /// Client-side token-bucket enforcer for Hummingbird reservations.
-///
-/// Keyed by `(res_id, hop_index)` so that different ASes on the path each have
-/// an independent bucket, even when they share the same reservation ID.
 #[derive(Debug)]
 pub struct ReservationTracker {
-    token_buckets: HashMap<(u32, usize), (SystemTime, TokenBucket)>,
+    token_buckets: HashMap<(IsdAsn, u32), (SystemTime, TokenBucket)>,
     last_cleanup: Instant,
     cleanup_interval: Duration,
 }
@@ -40,82 +36,6 @@ impl ReservationTracker {
         }
     }
 
-    /// Returns the number of bytes that can be sent right now along `path` without
-    /// exceeding any reservation, i.e., the minimum available tokens across all
-    /// flyover hops.
-    ///
-    /// Returns `Ok(usize::MAX)` if the path has no flyover hops (no constraint).
-    /// Returns `Err(ReservationTrackerError::ReservationExpired)` if any reservation
-    /// has expired.
-    ///
-    /// Buckets that have not been seen before are initialised to their full burst
-    /// capacity, so this method is safe to call before the first `apply`.
-    pub fn available_bytes_for_path<T: Deref<Target = [u8]>>(
-        &mut self,
-        path: &EncodedHummingbirdPath<T>,
-    ) -> Result<usize, ReservationTrackerError> {
-        self.cleanup_if_due();
-
-        let now = SystemTime::now();
-
-        let flyover_hops: Vec<(usize, &EncodedFlyoverHopField)> = path
-            .hop_fields()
-            .enumerate()
-            .filter_map(|(i, h)| {
-                if h.is_flyover() {
-                    h.try_into().ok().map(|fh| (i, fh))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        if flyover_hops.is_empty() {
-            return Ok(usize::MAX);
-        }
-
-        let mut min_available = i64::MAX;
-
-        for (hop_idx, hop) in &flyover_hops {
-            let reservation_duration = Duration::from_secs(hop.reservation_duration() as u64);
-            if hop.reservation_start_offset() > reservation_duration {
-                return Err(ReservationTrackerError::ReservationExpired);
-            }
-
-            let res_id = hop.reservation_id();
-            let bandwidth = hop.bandwidth();
-            let key = (res_id, *hop_idx);
-
-            let reservation_start = path
-                .meta_header()
-                .base_timestamp_as_system_time()
-                .checked_sub(hop.reservation_start_offset())
-                .ok_or(ReservationTrackerError::ReservationExpired)?;
-
-            let reservation_end = reservation_start.checked_add(reservation_duration).unwrap();
-
-            let available = self
-                .token_buckets
-                .entry(key)
-                .or_insert_with(|| {
-                    (
-                        reservation_end,
-                        TokenBucket::new(
-                            reservation_start,
-                            (bandwidth.to_kbps() * 125) as i64,
-                            bandwidth,
-                        ),
-                    )
-                })
-                .1
-                .available_at(now);
-
-            min_available = min_available.min(available);
-        }
-
-        Ok(min_available.max(0) as usize)
-    }
-
     fn cleanup_if_due(&mut self) {
         let now = Instant::now();
         if now.duration_since(self.last_cleanup) >= self.cleanup_interval {
@@ -125,84 +45,107 @@ impl ReservationTracker {
         }
     }
 
-    /// Check and, on success, deduct `pkt_size` bytes from each flyover hop's
-    /// token bucket.
-    ///
-    /// `pkt_size` must be the total SCION packet size in bytes (common header +
-    /// address header + path header + L4 header + L4 payload).
-    pub fn apply<T: Deref<Target = [u8]>>(
+    fn bucket_for(
         &mut self,
-        path: &EncodedHummingbirdPath<T>,
-        pkt_size: usize,
+        reservation: &ReservationInfo,
+        res_start: SystemTime,
+        res_end: SystemTime,
+    ) -> &mut TokenBucket {
+        &mut self
+            .token_buckets
+            .entry((reservation.isd_as, reservation.res_id))
+            .or_insert_with(|| {
+                (
+                    res_end,
+                    TokenBucket::new(
+                        res_start,
+                        (reservation.bandwidth.to_kbps() * 125) as i64,
+                        reservation.bandwidth,
+                    ),
+                )
+            })
+            .1
+    }
+
+    /// Check time validity and bandwidth availability without deducting tokens.
+    ///
+    /// Call [`deduct_reservation`] after a successful check to consume the tokens.
+    pub fn check_reservation(
+        &mut self,
+        reservation: &ReservationInfo,
+        num_bytes: usize,
     ) -> Result<(), ReservationTrackerError> {
         self.cleanup_if_due();
+        let res_start = std::time::UNIX_EPOCH + Duration::from_secs(reservation.start as u64);
+        let res_end = res_start + Duration::from_secs(reservation.duration as u64);
+        let now = SystemTime::now();
 
-        let pkt_timestamp = path.meta_header().timestamp();
-
-        // Collect flyover hops with their original indices so each (res_id, hop_index)
-        // pair maps to its own token bucket, even when multiple hops share a res_id.
-        let flyover_hops: Vec<(usize, &EncodedFlyoverHopField)> = path
-            .hop_fields()
-            .enumerate()
-            .filter_map(|(i, h)| {
-                if h.is_flyover() {
-                    h.try_into().ok().map(|fh| (i, fh))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // First pass: check every flyover hop's bucket without deducting.
-        for (hop_idx, hop) in &flyover_hops {
-            let reservation_duration = Duration::from_secs(hop.reservation_duration() as u64);
-            if hop.reservation_start_offset() > reservation_duration {
-                return Err(ReservationTrackerError::ReservationExpired);
-            }
-
-            let res_id = hop.reservation_id();
-            let bandwidth = hop.bandwidth();
-            let key = (res_id, *hop_idx);
-
-            let reservation_start = path
-                .meta_header()
-                .base_timestamp_as_system_time()
-                .checked_sub(hop.reservation_start_offset())
-                .ok_or(ReservationTrackerError::ReservationExpired)?;
-
-            let reservation_end = reservation_start.checked_add(reservation_duration).unwrap();
-
-            if !self
-                .token_buckets
-                .entry(key)
-                .or_insert_with(|| {
-                    (
-                        reservation_end,
-                        TokenBucket::new(
-                            reservation_start,
-                            (bandwidth.to_kbps() * 125) as i64,
-                            bandwidth,
-                        ),
-                    )
-                })
-                .1
-                .check(pkt_size, pkt_timestamp)
-            {
-                return Err(ReservationTrackerError::BandwidthExceeded);
-            }
+        if res_start > now || now > res_end {
+            return Err(ReservationTrackerError::ReservationExpired);
         }
 
-        // Second pass: deduct from every bucket that passed the check.
-        for (hop_idx, hop) in &flyover_hops {
-            let key = (hop.reservation_id(), *hop_idx);
-            self.token_buckets
-                .get_mut(&key)
-                .unwrap()
-                .1
-                .use_unchecked(pkt_size);
+        if self
+            .bucket_for(reservation, res_start, res_end)
+            .check(num_bytes, now)
+        {
+            Ok(())
+        } else {
+            Err(ReservationTrackerError::BandwidthExceeded)
+        }
+    }
+
+    /// Deduct `num_bytes` from the reservation's token bucket.
+    ///
+    /// Caller must have called [`check_reservation`] first to confirm availability.
+    /// No-op if the bucket does not exist.
+    pub fn deduct_reservation(&mut self, reservation: &ReservationInfo, num_bytes: usize) {
+        if let Some((_, bucket)) = self
+            .token_buckets
+            .get_mut(&(reservation.isd_as, reservation.res_id))
+        {
+            bucket.use_unchecked(num_bytes);
+        }
+    }
+
+    /// Returns the number of bytes currently available for `reservation` at this instant.
+    ///
+    /// Returns 0 if the reservation is expired or has no remaining tokens.
+    pub fn available_bytes(&mut self, reservation: &ReservationInfo) -> usize {
+        let res_start = std::time::UNIX_EPOCH + Duration::from_secs(reservation.start as u64);
+        let res_end = res_start + Duration::from_secs(reservation.duration as u64);
+        let now = SystemTime::now();
+
+        if res_start > now || now > res_end {
+            return 0;
         }
 
-        Ok(())
+        self.bucket_for(reservation, res_start, res_end)
+            .available_at(now)
+            .max(0) as usize
+    }
+
+    /// Check and, on success, deduct `pkt_size` bytes from the reservation's token bucket.
+    pub fn use_reservation(
+        &mut self,
+        reservation: &ReservationInfo,
+        num_bytes: usize,
+    ) -> Result<(), ReservationTrackerError> {
+        let res_start = std::time::UNIX_EPOCH + Duration::from_secs(reservation.start as u64);
+        let res_end = res_start + Duration::from_secs(reservation.duration as u64);
+        let now = SystemTime::now();
+
+        if res_start > now || now > res_end {
+            return Err(ReservationTrackerError::ReservationExpired);
+        }
+
+        if self
+            .bucket_for(reservation, res_start, res_end)
+            .use_checked(num_bytes, now)
+        {
+            Ok(())
+        } else {
+            Err(ReservationTrackerError::BandwidthExceeded)
+        }
     }
 }
 
