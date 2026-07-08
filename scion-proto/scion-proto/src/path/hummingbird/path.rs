@@ -1,6 +1,5 @@
 //! Hummingbird path type and associated encoding.
 
-use std::collections::BTreeMap;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
@@ -511,6 +510,10 @@ pub enum HummingbirdPathError {
     /// The reserved bandwidth has been exceeded.
     #[error("bandwidth exceeded")]
     BandwidthExceeded,
+
+    /// The provided hop index does not correspond to any hop on the path.
+    #[error("hop index out of range")]
+    HopIndexOutOfRange,
 }
 
 impl NonEncodeError for HummingbirdPathError {}
@@ -531,12 +534,32 @@ impl From<InadequateBufferSize> for HummingbirdPathError {
     }
 }
 
-/// A pair of ingress and egress interfaces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ReservationInterfaces {
-    isd_as: IsdAsn,
-    ingress_interface: u16,
-    egress_interface: u16,
+/// A hop on a [`HummingbirdPath`], along with any reservations that apply to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HummingbirdPathHop {
+    /// The standard hop field for this hop.
+    hop_field: StandardHopField,
+    /// Reservations that may be applied to this hop when encoding.
+    reservations: Vec<Reservation>,
+    /// The ISD-AS of this hop, if known.
+    isd_asn: Option<IsdAsn>,
+}
+
+impl HummingbirdPathHop {
+    /// Returns the standard hop field for this hop.
+    pub fn hop_field(&self) -> &StandardHopField {
+        &self.hop_field
+    }
+
+    /// Returns the reservations that may be applied to this hop when encoding.
+    pub fn reservations(&self) -> &[Reservation] {
+        &self.reservations
+    }
+
+    /// Returns the ISD-AS of this hop, if known.
+    pub fn isd_asn(&self) -> Option<IsdAsn> {
+        self.isd_asn
+    }
 }
 
 /// A fully decoded Hummingbird data plane path. It can be used to build new paths
@@ -551,10 +574,7 @@ pub struct HummingbirdPath {
     info_fields: Vec<InfoField>,
 
     /// Segments of the path.
-    segments: Vec<Vec<(IsdAsn, StandardHopField)>>,
-
-    /// Reservations to apply when encoding
-    reservations: BTreeMap<ReservationInterfaces, Vec<Reservation>>,
+    segments: Vec<Vec<HummingbirdPathHop>>,
 
     /// Optional per-path reservation tracker for client-side bandwidth enforcement.
     reservation_tracker: Option<Arc<Mutex<ReservationTracker>>>,
@@ -587,7 +607,6 @@ impl HummingbirdPath {
             path_meta: meta_header,
             info_fields: vec![],
             segments: vec![],
-            reservations: BTreeMap::new(),
             reservation_tracker: None,
             strict_reservation: false,
         }
@@ -625,44 +644,15 @@ impl HummingbirdPath {
 
         let mut min_available: Option<usize> = None;
 
-        for (seg_idx, (segment, info)) in self
-            .segments
-            .iter()
-            .zip(self.info_fields.iter())
-            .enumerate()
-        {
-            let next_segment = self.segments.get(seg_idx + 1);
-            let next_info = self.info_fields.get(seg_idx + 1);
-            let first_hop_of_next_segment = next_segment.and_then(|s| s.first());
+        for hop in self.hops() {
+            let max_bytes = hop
+                .reservations
+                .iter()
+                .map(|r| guard.available_bytes(&r.info))
+                .max();
 
-            for (hop_idx, (hop_isd_asn, hop_field)) in segment.iter().enumerate() {
-                let is_last_hop_of_segment = hop_idx == segment.len() - 1;
-
-                let (ingress, egress) = hop_field.interfaces(info.cons_dir);
-                let egress = if is_last_hop_of_segment {
-                    first_hop_of_next_segment
-                        .map(|(_, h)| h.interfaces(next_info.unwrap().cons_dir).1)
-                        .unwrap_or(egress)
-                } else {
-                    egress
-                };
-
-                let interfaces = ReservationInterfaces {
-                    ingress_interface: ingress,
-                    egress_interface: egress,
-                    isd_as: *hop_isd_asn,
-                };
-
-                if let Some(reservations) = self.reservations.get(&interfaces) {
-                    let max_bytes = reservations
-                        .iter()
-                        .map(|r| guard.available_bytes(&r.info))
-                        .max();
-
-                    if let Some(avail) = max_bytes {
-                        min_available = Some(min_available.map_or(avail, |m: usize| m.min(avail)));
-                    }
-                }
+            if let Some(avail) = max_bytes {
+                min_available = Some(min_available.map_or(avail, |m: usize| m.min(avail)));
             }
         }
 
@@ -701,27 +691,82 @@ impl HummingbirdPath {
 
     /// Returns an iterator over the reservations added to this path.
     pub fn reservations(&self) -> impl Iterator<Item = &Reservation> {
-        self.reservations.values().flatten()
+        self.segments
+            .iter()
+            .flat_map(|s| s.iter())
+            .flat_map(|h| h.reservations.iter())
+    }
+
+    /// Add a reservation to the hop at flat index `hop_idx`, counting hops
+    /// across all segments in order (segment 0 first, then segment 1, ...).
+    ///
+    /// Unlike [`Self::try_add_reservation`], this does not match the reservation
+    /// against the hop's interfaces — it is applied to the hop at `hop_idx`
+    /// unconditionally.
+    ///
+    /// Returns [`HummingbirdPathError::HopIndexOutOfRange`] if `hop_idx` is not
+    /// within the current number of hops on the path.
+    pub fn add_reservation(
+        &mut self,
+        hop_idx: u8,
+        reservation: Reservation,
+    ) -> Result<(), HummingbirdPathError> {
+        let hop = self
+            .hops_mut()
+            .nth(hop_idx as usize)
+            .ok_or(HummingbirdPathError::HopIndexOutOfRange)?;
+
+        hop.reservations.push(reservation);
+        Ok(())
     }
 
     /// Add a reservation to use with this path. Reservations added using this
     /// method will be applied to all matching regular HopFields contained
     /// in the segments.
-    pub fn add_reservation(&mut self, reservation: Reservation) {
-        let interfaces = ReservationInterfaces {
-            isd_as: reservation.info.isd_as,
-            ingress_interface: reservation.info.ingress_interface,
-            egress_interface: reservation.info.egress_interface,
-        };
+    ///
+    /// Returns whether the reservation was added to any hop.
+    pub fn try_add_reservation(&mut self, reservation: Reservation) -> bool {
+        // TODO(mariosbf): might not be correct for paths with peering links
+        let mut result = false;
+        for seg_idx in 0..self.segments.len() {
+            let next_segment = self.segments.get(seg_idx + 1);
+            let next_info = self.info_fields.get(seg_idx + 1);
+            let first_hop_of_next_segment_ifaces = next_segment
+                .and_then(|s| s.first())
+                .map(|h| h.hop_field.interfaces(next_info.unwrap().cons_dir));
 
-        self.reservations
-            .entry(interfaces)
-            .or_default()
-            .push(reservation);
+            let segment = &mut self.segments[seg_idx];
+            let segment_len = segment.len();
+            let info = self.info_fields[seg_idx];
+
+            for (hop_idx, hop) in segment.iter_mut().enumerate() {
+                let is_last_hop_of_segment = hop_idx == segment_len - 1;
+                let hop_field = &hop.hop_field;
+
+                let (ingress, egress) = hop_field.interfaces(info.cons_dir);
+                let egress = if is_last_hop_of_segment {
+                    first_hop_of_next_segment_ifaces
+                        .map(|v| v.1)
+                        .unwrap_or(egress)
+                } else {
+                    egress
+                };
+
+                if reservation.info.ingress_interface == ingress
+                    && reservation.info.egress_interface == egress
+                    && hop.isd_asn.is_some_and(|ia| ia == reservation.info.isd_as)
+                {
+                    hop.reservations.push(reservation.clone());
+                    result = true;
+                }
+            }
+        }
+
+        result
     }
 
     /// Return an iterator over the segments on this path.
-    pub fn segments(&self) -> impl Iterator<Item = (&InfoField, &[(IsdAsn, StandardHopField)])> {
+    pub fn segments(&self) -> impl Iterator<Item = (&InfoField, &[HummingbirdPathHop])> {
         self.segments
             .iter()
             .zip(self.info_fields.iter())
@@ -732,24 +777,22 @@ impl HummingbirdPath {
     pub fn add_segment(
         &mut self,
         info_field: InfoField,
-        hop_fields: Vec<(IsdAsn, StandardHopField)>,
+        hops: Vec<(Option<IsdAsn>, StandardHopField)>,
     ) -> Result<(), HummingbirdPathError> {
         if self.info_fields.len() >= 3 {
             return Err(HummingbirdPathError::TooManySegments);
         }
 
-        let segment_len = hop_fields
-            .iter()
-            .map(|(_, hop_field)| hop_field.encoded_length())
-            .sum::<usize>();
-
-        let segment_len = HummingbirdSegmentLength::new(segment_len)
-            .ok_or(HummingbirdPathError::SegmentTooLong)?;
-
-        let seg_idx = self.info_fields.len();
-        self.path_meta.segment_lengths[seg_idx] = segment_len;
         self.info_fields.push(info_field);
-        self.segments.push(hop_fields);
+        self.segments.push(
+            hops.into_iter()
+                .map(|(isd_asn, hop_field)| HummingbirdPathHop {
+                    isd_asn,
+                    hop_field,
+                    reservations: vec![],
+                })
+                .collect(),
+        );
 
         Ok(())
     }
@@ -761,7 +804,7 @@ impl HummingbirdPath {
     pub fn encoded_length(&self) -> usize {
         let hop_fields_with_applicable_reservations = self
             .hops_with_reservation(0, None, false)
-            .expect("infallible: no tracker, no strict")
+            .expect("infallible: no tracker, not strict")
             .iter()
             .filter(|t| matches!(t, (_, _, Some(_))))
             .count();
@@ -769,10 +812,8 @@ impl HummingbirdPath {
         self.path_meta.encoded_length()
             + self.info_fields_len()
             + self
-                .segments
-                .iter()
-                .flat_map(|s| s.iter())
-                .map(|(_, hop_field)| hop_field.encoded_length())
+                .hops()
+                .map(|hop| hop.hop_field.encoded_length())
                 .sum::<usize>()
             + hop_fields_with_applicable_reservations
                 * (FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE)
@@ -807,83 +848,59 @@ impl HummingbirdPath {
     ) -> Result<Vec<(usize, usize, Option<Reservation>)>, HummingbirdPathError> {
         let mut hop_fields = Vec::with_capacity(self.num_hopfields());
 
-        let seg_iter = self.segments.iter();
-        let info_iter = self.info_fields.iter();
+        for (seg_idx, segment) in self.segments.iter().enumerate() {
+            for (hop_idx, hop) in segment.iter().enumerate() {
+                let reservations = &hop.reservations;
+                let reservation = if let Some(ref mut t) = tracker
+                    && !reservations.is_empty()
+                {
+                    let mut num_expired = 0;
+                    let mut selected = None;
 
-        let mut seg_and_info_iter = seg_iter.zip(info_iter).enumerate().peekable();
+                    for r in reservations {
+                        match t.check_reservation(&r.info, pkt_len) {
+                            Err(ReservationTrackerError::BandwidthExceeded) => {
+                                continue;
+                            }
+                            Err(ReservationTrackerError::ReservationExpired) => {
+                                num_expired += 1;
+                            }
+                            Ok(()) => {
+                                let available_bytes = t.available_bytes(&r.info);
 
-        while let Some((seg_idx, (segment, info))) = seg_and_info_iter.next() {
-            let next = seg_and_info_iter.peek();
-            let next_segment = next.map(|(_, (s, _))| s);
-            let next_info = next.map(|(_, (_, i))| i);
-
-            let first_hop_of_next_segment = next_segment.and_then(|s| s.first());
-
-            for (hop_idx, (hop_isd_asn, hop_field)) in segment.iter().enumerate() {
-                let is_last_hop_of_segment = hop_idx == segment.len() - 1;
-
-                let (ingress, egress) = hop_field.interfaces(info.cons_dir);
-                let egress = if is_last_hop_of_segment {
-                    // For the last hop of a segment the effective egress is the
-                    // egress of the first hop of the next segment (segment boundary).
-                    first_hop_of_next_segment
-                        .map(|(_, h)| h.interfaces(next_info.unwrap().cons_dir).1)
-                        .unwrap_or(egress)
-                } else {
-                    egress
-                };
-
-                let interfaces = ReservationInterfaces {
-                    ingress_interface: ingress,
-                    egress_interface: egress,
-                    isd_as: *hop_isd_asn,
-                };
-
-                let reservation = if let Some(reservations) = self.reservations.get(&interfaces) {
-                    if let Some(ref mut t) = tracker {
-                        let mut num_expired = 0;
-                        let mut selected = None;
-
-                        for r in reservations {
-                            match t.check_reservation(&r.info, pkt_len) {
-                                Err(ReservationTrackerError::BandwidthExceeded) => {
-                                    continue;
-                                }
-                                Err(ReservationTrackerError::ReservationExpired) => {
-                                    num_expired += 1;
-                                }
-                                Ok(()) => {
-                                    let available_bytes = t.available_bytes(&r.info);
-
-                                    if selected.is_none_or(|(_, bytes)| bytes > available_bytes) {
-                                        selected = Some((r, available_bytes));
-                                    }
+                                if selected.is_none_or(|(_, bytes)| bytes > available_bytes) {
+                                    selected = Some((r, available_bytes));
                                 }
                             }
                         }
-
-                        let all_expired = num_expired == reservations.len();
-
-                        if all_expired && strict {
-                            return Err(HummingbirdPathError::ReservationExpired);
-                        }
-
-                        if selected.is_none() && strict {
-                            return Err(HummingbirdPathError::BandwidthExceeded);
-                        }
-                        selected.map(|v| v.0.clone())
-                    } else {
-                        reservations.first().cloned()
                     }
-                } else {
-                    None
-                };
 
+                    let all_expired = num_expired == reservations.len();
+
+                    if all_expired && strict {
+                        return Err(HummingbirdPathError::ReservationExpired);
+                    }
+
+                    if selected.is_none() && strict {
+                        return Err(HummingbirdPathError::BandwidthExceeded);
+                    }
+                    selected.map(|v| v.0.clone())
+                } else {
+                    reservations.first().cloned()
+                };
                 hop_fields.push((seg_idx, hop_idx, reservation));
             }
         }
 
         Ok(hop_fields)
+    }
+
+    fn hops(&self) -> impl Iterator<Item = &HummingbirdPathHop> {
+        self.segments.iter().flat_map(|s| s.iter())
+    }
+
+    fn hops_mut(&mut self) -> impl Iterator<Item = &mut HummingbirdPathHop> {
+        self.segments.iter_mut().flat_map(|s| s.iter_mut())
     }
 
     /// Apply reservations by turning applicable hop fields into flyover hop
@@ -928,7 +945,7 @@ impl HummingbirdPath {
         // Lock the tracker once for the entire check → encode → deduct sequence.
         let mut tracker_guard = self.reservation_tracker.as_ref().map(|t| t.lock().unwrap());
 
-        let hop_fields = self.hops_with_reservation(
+        let hops = self.hops_with_reservation(
             estimated_pkt_len,
             tracker_guard.as_deref_mut(),
             self.strict_reservation,
@@ -936,20 +953,17 @@ impl HummingbirdPath {
 
         // Compute the exact packet length based on the actual selection.
         let mut curr_hf_index = meta_header.current_hop_field.byte_offset();
-        let hop_fields_with_applicable_reservations = hop_fields
-            .iter()
-            .filter(|t| matches!(t, (_, _, Some(_))))
-            .count();
+        let hops_with_applicable_reservations =
+            hops.iter().filter(|t| matches!(t, (_, _, Some(_)))).count();
         let path_header_len = meta_header.encoded_length()
             + self.info_fields_len()
             + self
-                .segments
-                .iter()
-                .flat_map(|s| s.iter())
-                .map(|(_, hop_field)| hop_field.encoded_length())
+                .hops()
+                .map(|hop| hop.hop_field.encoded_length())
                 .sum::<usize>()
-            + hop_fields_with_applicable_reservations
+            + hops_with_applicable_reservations
                 * (FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE);
+
         let pkt_len = u16::try_from(path_header_len)
             .ok()
             .and_then(|v| v.checked_add(CommonHeader::LENGTH as u16))
@@ -960,17 +974,17 @@ impl HummingbirdPath {
         // Keep track of byte offset of hop fields as we iterate through them
         let mut hop_offset = 0;
         let mut seglens = [0; 3];
-        let mut hops = Vec::with_capacity(self.num_hopfields());
+        let mut hop_fields = Vec::with_capacity(self.num_hopfields());
 
         // Collect reservation infos for deduction after encoding (while hop_fields is still alive).
-        let deduct_infos: Vec<_> = hop_fields
+        let deduct_infos: Vec<_> = hops
             .iter()
             .filter_map(|(_, _, res)| res.as_ref().map(|r| r.info.clone()))
             .collect();
 
-        for (seg_idx, hop_idx, res) in hop_fields {
-            let (_, hop) = &self.segments[seg_idx][hop_idx];
-            let hop = if let Some(res) = res {
+        for (seg_idx, hop_idx, res) in hops {
+            let hop = &self.segments[seg_idx][hop_idx].hop_field;
+            let hop_field = if let Some(res) = res {
                 // If the matched hop field is before the current hop field, the
                 // current hop field's byte offset must be advanced by the size
                 // difference between a flyover and a standard hop field.
@@ -989,12 +1003,12 @@ impl HummingbirdPath {
             };
 
             // Advance hop offset
-            hop_offset += hop.encoded_length();
+            hop_offset += hop_field.encoded_length();
 
             // Increase segment length counters for each segment the hop field is in.
-            seglens[seg_idx] += hop.encoded_length();
+            seglens[seg_idx] += hop_field.encoded_length();
 
-            hops.push(hop);
+            hop_fields.push(hop_field);
         }
 
         // Adjust segment lengths
@@ -1014,7 +1028,7 @@ impl HummingbirdPath {
             }
         }
 
-        Ok((meta_header, hops))
+        Ok((meta_header, hop_fields))
     }
 
     /// Encode the path to a byte buffer, applying any reservations that have been added to
@@ -1066,6 +1080,7 @@ impl HummingbirdPath {
         let len = self.encoded_length();
         let mut buffer = vec![0u8; len];
         let mut slice: &mut [u8] = &mut buffer;
+
         let (meta_header, hops) =
             self.apply_reservations(destination, payload_len, address_header_len)?;
         meta_header.encode_to(&mut slice)?;
@@ -1085,10 +1100,6 @@ impl HummingbirdPath {
     /// Encodes this path (applying reservations) and returns a [`Path<Bytes>`]
     /// ready for use in a SCION packet.
     ///
-    /// The `interfaces` field of the returned path's [`Metadata`] is populated
-    /// from the decoded segments. All other metadata fields are left at their
-    /// defaults.
-    ///
     /// Parameters:
     /// - `source`: The source ISD-AS of the path.
     /// - `destination`: The destination ISD-AS of the path, used for calculating the
@@ -1102,27 +1113,33 @@ impl HummingbirdPath {
         address_header_len: u16,
     ) -> Result<Path<Bytes>, HummingbirdPathError> {
         // Build PathInterface list from segments
-        let interfaces: Vec<PathInterface> = self
-            .segments()
-            .flat_map(|(info_field, hops)| {
-                let cons_dir = info_field.cons_dir;
-                hops.iter().flat_map(move |(isd_asn, hop_field)| {
-                    let (ingress, egress) = hop_field.interfaces(cons_dir);
-                    [
-                        (ingress != 0).then(|| PathInterface::new(*isd_asn, ingress)),
-                        (egress != 0).then(|| PathInterface::new(*isd_asn, egress)),
-                    ]
-                    .into_iter()
-                    .flatten()
-                })
-            })
-            .collect();
+        let interfaces = if self.hops().all(|h| h.isd_asn.is_some()) {
+            Some(
+                self.segments()
+                    .flat_map(|(info_field, hops)| {
+                        let cons_dir = info_field.cons_dir;
+                        hops.iter().flat_map(move |hop| {
+                            let isd_asn = hop.isd_asn.unwrap();
+                            let (ingress, egress) = hop.hop_field.interfaces(cons_dir);
+                            [
+                                (ingress != 0).then(|| PathInterface::new(isd_asn, ingress)),
+                                (egress != 0).then(|| PathInterface::new(isd_asn, egress)),
+                            ]
+                            .into_iter()
+                            .flatten()
+                        })
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        };
 
         let encoded = self.to_encoded(isd_asn.destination, payload_len, address_header_len)?;
 
         let mut path = Path::new(DataPlanePath::Hummingbird(encoded), isd_asn, None);
         path.metadata = Some(Metadata {
-            interfaces: Some(interfaces),
+            interfaces,
             ..Default::default()
         });
 
@@ -1138,7 +1155,9 @@ impl HummingbirdPath {
     /// forwarding the packet to an end host.
     ///
     /// The AS list needs to contain the ISD-AS numbers of each AS along the path,
-    /// in the same order as they are traversed by the path.
+    /// in the same order as they are traversed by the path. Hops whose ISD-AS
+    /// cannot be determined from `ases` (e.g. because it does not contain enough
+    /// entries to cover every hop field in the path) are left without one.
     ///
     /// Parameters:
     /// - `data`: byte buffer containing the encoded path. The buffer will be
@@ -1181,11 +1200,12 @@ impl HummingbirdPath {
 
                 seg_len -= hop_field.encoded_length();
 
-                let isd_as = ases
-                    .get(as_idx)
-                    .copied()
-                    .ok_or(HummingbirdPathError::InsufficientAsInfo)?;
-                hop_fields.push((isd_as, hop_field));
+                let isd_asn = ases.get(as_idx).copied();
+                hop_fields.push(HummingbirdPathHop {
+                    hop_field,
+                    reservations: vec![],
+                    isd_asn,
+                });
 
                 if seg_len != 0 {
                     // Don't move to next ISD-AS after last hop of segment
@@ -1200,7 +1220,6 @@ impl HummingbirdPath {
             path_meta: meta_header,
             info_fields,
             segments,
-            reservations: BTreeMap::new(),
             reservation_tracker: None,
             strict_reservation: false,
         })
@@ -1219,7 +1238,6 @@ impl std::fmt::Debug for HummingbirdPath {
             .field("path_meta", &self.path_meta)
             .field("info_fields", &self.info_fields)
             .field("segments", &self.segments)
-            .field("reservations", &self.reservations)
             .field("reservation_tracker", &self.reservation_tracker.is_some())
             .finish()
     }
@@ -1230,7 +1248,6 @@ impl PartialEq for HummingbirdPath {
         self.path_meta == other.path_meta
             && self.info_fields == other.info_fields
             && self.segments == other.segments
-            && self.reservations == other.reservations
     }
 }
 
@@ -1789,9 +1806,9 @@ mod tests {
         }
     }
 
-    fn make_std_hop(cons_ingress: u16, cons_egress: u16) -> (IsdAsn, StandardHopField) {
+    fn make_std_hop(cons_ingress: u16, cons_egress: u16) -> (Option<IsdAsn>, StandardHopField) {
         (
-            IsdAsn::new(Isd::new(1), Asn::new(1)),
+            Some(IsdAsn::new(Isd::new(1), Asn::new(1))),
             StandardHopField {
                 ingress_router_alert: false,
                 egress_router_alert: false,
@@ -1812,7 +1829,11 @@ mod tests {
     ) -> Reservation {
         // start_offset_secs = how many seconds ago the reservation started,
         // keeping (now - start) small enough to fit in u16.
-        let start = (Utc::now().timestamp() as u32).saturating_sub(start_offset_secs);
+        let start = DateTime::from_timestamp(
+            (Utc::now().timestamp() as u32).saturating_sub(start_offset_secs) as i64,
+            0,
+        )
+        .expect("valid timestamp");
         Reservation {
             info: ReservationInfo {
                 isd_as: IsdAsn::new(Isd::new(1), Asn::new(1)),
@@ -1836,41 +1857,6 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     #[test]
-    fn add_single_segment_updates_meta() {
-        let mut path = HummingbirdPath::new();
-        path.add_segment(
-            make_info(true, 1),
-            vec![make_std_hop(1, 2), make_std_hop(3, 4)],
-        )
-        .unwrap();
-
-        assert_eq!(path.info_fields.len(), 1);
-        assert_eq!(path.segments.len(), 1);
-        assert_eq!(path.segments[0].len(), 2);
-        // 2 standard hops × 12 bytes = 24 bytes → seg_len = 24/4 = 6
-        assert_eq!(path.path_meta.segment_lengths[0].encode(), 6);
-        assert_eq!(path.path_meta.segment_lengths[1].encode(), 0);
-        assert_eq!(path.path_meta.segment_lengths[2].encode(), 0);
-    }
-
-    #[test]
-    fn add_three_segments_succeeds() {
-        let mut path = HummingbirdPath::new();
-        for i in 0..3u16 {
-            path.add_segment(
-                make_info(true, i as u32),
-                vec![make_std_hop(i * 2, i * 2 + 1)],
-            )
-            .unwrap();
-        }
-        assert_eq!(path.segments.len(), 3);
-        // Each segment has 1 standard hop → 12 bytes → seg_len = 3
-        for seg in &path.path_meta.segment_lengths {
-            assert_eq!(seg.encode(), 3);
-        }
-    }
-
-    #[test]
     fn add_fourth_segment_returns_too_many_segments() {
         let mut path = HummingbirdPath::new();
         for i in 0..3u16 {
@@ -1884,21 +1870,6 @@ mod tests {
         assert!(
             matches!(result, Err(HummingbirdPathError::TooManySegments)),
             "expected TooManySegments, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn add_segment_too_long_returns_error() {
-        // HummingbirdSegmentLength::new() caps at 508 bytes (127 * 4).
-        // 43 standard hops × 12 bytes = 516 bytes > 508 → SegmentTooLong.
-        let mut path = HummingbirdPath::new();
-        let hops = (0..43u16)
-            .map(|i| make_std_hop(i, i + 1))
-            .collect::<Vec<_>>();
-        let result = path.add_segment(make_info(true, 1), hops);
-        assert!(
-            matches!(result, Err(HummingbirdPathError::SegmentTooLong)),
-            "expected SegmentTooLong, got {result:?}"
         );
     }
 
@@ -1930,7 +1901,7 @@ mod tests {
         .unwrap();
         // Reservation applies in cons_dir=true, so ingress/egress match cons_ingress/cons_egress.
         let res = make_reservation(1, 2, 1000, 200, 1024);
-        path.add_reservation(res);
+        path.try_add_reservation(res);
         assert_eq!(path.encoded_length(), 52);
     }
 
@@ -1953,7 +1924,7 @@ mod tests {
 
         // Reservation applies in cons_dir=true, so ingress/egress match cons_ingress/cons_egress.
         let res = make_reservation(3, 4, 1000, 200, 1024);
-        path.add_reservation(res);
+        path.try_add_reservation(res);
         assert_eq!(path.encoded_length(), 84);
     }
 
@@ -1967,7 +1938,7 @@ mod tests {
         )
         .unwrap();
         let res = make_reservation(99, 100, 1000, 200, 1024); // wrong interfaces
-        path.add_reservation(res);
+        path.try_add_reservation(res);
         assert_eq!(path.encoded_length(), 44);
     }
 
@@ -2046,7 +2017,7 @@ mod tests {
         )
         .unwrap();
         let res = make_reservation(1, 2, 1000, 200, 1024);
-        path.add_reservation(res);
+        path.try_add_reservation(res);
 
         let dst = IsdAsn::new(Isd::new(2), Asn::new(2));
         let encoded_bytes = encode_path(&mut path, dst);
@@ -2081,7 +2052,7 @@ mod tests {
         .unwrap();
 
         let res = make_reservation(3, 4, 1000, 200, 1024);
-        path.add_reservation(res);
+        path.try_add_reservation(res);
 
         let dst = IsdAsn::new(Isd::new(2), Asn::new(2));
         let encoded_bytes = encode_path(&mut path, dst);
@@ -2110,7 +2081,7 @@ mod tests {
         )
         .unwrap();
         let res = make_reservation(0x0A, 0x0B, 1000, 200, 1024);
-        path.add_reservation(res);
+        path.try_add_reservation(res);
 
         let dst = IsdAsn::new(Isd::new(2), Asn::new(2));
         let encoded_bytes = encode_path(&mut path, dst);
@@ -2141,7 +2112,7 @@ mod tests {
             .unwrap();
         let reservation_start_offset = 900u32; // seconds before now
         let res = make_reservation(1, 2, reservation_start_offset, 300, 1024);
-        path.add_reservation(res);
+        path.try_add_reservation(res);
 
         let dst = IsdAsn::new(Isd::new(2), Asn::new(2));
         let encoded = path.to_encoded(dst, 100, 100).unwrap();
@@ -2170,7 +2141,7 @@ mod tests {
         path.add_segment(make_info(true, 1), vec![make_std_hop(1, 2)])
             .unwrap();
         let res = make_reservation(99, 100, 1000, 200, 1024); // wrong interfaces
-        path.add_reservation(res);
+        path.try_add_reservation(res);
 
         let dst = IsdAsn::new(Isd::new(2), Asn::new(2));
         let encoded_bytes = encode_path(&mut path, dst);
@@ -2190,7 +2161,7 @@ mod tests {
         )
         .unwrap();
         let res = make_reservation(1, 2, 1000, 200, 1024);
-        path.add_reservation(res);
+        path.try_add_reservation(res);
 
         let dst = IsdAsn::new(Isd::new(2), Asn::new(2));
         let encoded_bytes = encode_path(&mut path, dst);
@@ -2218,7 +2189,7 @@ mod tests {
         // Point current_hop_field to the third hop (byte offset 24).
         path.path_meta.current_hop_field = HummingbirdHopfieldIndex::new_unchecked(24);
         let res = make_reservation(1, 2, 1000, 200, 1024);
-        path.add_reservation(res);
+        path.try_add_reservation(res);
 
         let dst = IsdAsn::new(Isd::new(2), Asn::new(2));
         let mut buf = vec![0u8; path.encoded_length()];
@@ -2249,7 +2220,7 @@ mod tests {
         // current_hop_field = 0 (first hop).
         path.path_meta.current_hop_field = HummingbirdHopfieldIndex::new_unchecked(0);
         let res = make_reservation(5, 6, 1000, 200, 1024); // matches third hop
-        path.add_reservation(res);
+        path.try_add_reservation(res);
 
         let dst = IsdAsn::new(Isd::new(2), Asn::new(2));
         let mut buf = vec![0u8; path.encoded_length()];
@@ -2262,6 +2233,62 @@ mod tests {
             decoded.meta_header().current_hop_field.byte_offset(),
             0,
             "current_hop_field must not change when reservation is after current hop"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // add_reservation (direct by flat hop index)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn add_reservation_applies_to_hop_at_index() {
+        let mut path = HummingbirdPath::new();
+        path.add_segment(
+            make_info(true, 1),
+            vec![make_std_hop(1, 2), make_std_hop(3, 4)],
+        )
+        .unwrap();
+
+        // Interfaces don't matter for add_reservation: it targets the hop by
+        // index regardless of whether it would match by ingress/egress/isd_as.
+        let res = make_reservation(99, 100, 1000, 200, 1024);
+        path.add_reservation(1, res.clone()).unwrap();
+
+        assert_eq!(path.segments[0][0].reservations, vec![]);
+        assert_eq!(path.segments[0][1].reservations, vec![res]);
+    }
+
+    #[test]
+    fn add_reservation_counts_hops_across_segments() {
+        let mut path = HummingbirdPath::new();
+        path.add_segment(make_info(true, 1), vec![make_std_hop(1, 2)])
+            .unwrap();
+        path.add_segment(
+            make_info(true, 2),
+            vec![make_std_hop(3, 4), make_std_hop(5, 6)],
+        )
+        .unwrap();
+
+        // Flat index 2 is the second hop of the second segment.
+        let res = make_reservation(1, 2, 1000, 200, 1024);
+        path.add_reservation(2, res.clone()).unwrap();
+
+        assert_eq!(path.segments[0][0].reservations, vec![]);
+        assert_eq!(path.segments[1][0].reservations, vec![]);
+        assert_eq!(path.segments[1][1].reservations, vec![res]);
+    }
+
+    #[test]
+    fn add_reservation_out_of_range_returns_error() {
+        let mut path = HummingbirdPath::new();
+        path.add_segment(make_info(true, 1), vec![make_std_hop(1, 2)])
+            .unwrap();
+
+        let res = make_reservation(1, 2, 1000, 200, 1024);
+        let result = path.add_reservation(1, res);
+        assert!(
+            matches!(result, Err(HummingbirdPathError::HopIndexOutOfRange)),
+            "expected HopIndexOutOfRange, got {result:?}"
         );
     }
 
@@ -2296,9 +2323,9 @@ mod tests {
         assert_eq!(decoded.segments.len(), 1);
         assert_eq!(decoded.segments[0].len(), 2);
 
-        let (ing0, eg0) = decoded.segments[0][0].1.interfaces(true);
+        let (ing0, eg0) = decoded.segments[0][0].hop_field.interfaces(true);
         assert_eq!((ing0, eg0), (0x0A, 0x0B));
-        let (ing1, eg1) = decoded.segments[0][1].1.interfaces(true);
+        let (ing1, eg1) = decoded.segments[0][1].hop_field.interfaces(true);
         assert_eq!((ing1, eg1), (0x0C, 0x0D));
     }
 

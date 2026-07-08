@@ -3,6 +3,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use chrono::Utc;
+
 use crate::{address::IsdAsn, hummingbird::ReservationInfo};
 
 use super::token_bucket::TokenBucket;
@@ -45,20 +47,15 @@ impl ReservationTracker {
         }
     }
 
-    fn bucket_for(
-        &mut self,
-        reservation: &ReservationInfo,
-        res_start: SystemTime,
-        res_end: SystemTime,
-    ) -> &mut TokenBucket {
+    fn bucket_for(&mut self, reservation: &ReservationInfo) -> &mut TokenBucket {
         &mut self
             .token_buckets
             .entry((reservation.isd_as, reservation.res_id))
             .or_insert_with(|| {
                 (
-                    res_end,
+                    reservation.end().into(),
                     TokenBucket::new(
-                        res_start,
+                        reservation.start().into(),
                         (reservation.bandwidth.to_kbps() * 125) as i64,
                         reservation.bandwidth,
                     ),
@@ -76,18 +73,13 @@ impl ReservationTracker {
         num_bytes: usize,
     ) -> Result<(), ReservationTrackerError> {
         self.cleanup_if_due();
-        let res_start = std::time::UNIX_EPOCH + Duration::from_secs(reservation.start as u64);
-        let res_end = res_start + Duration::from_secs(reservation.duration as u64);
-        let now = SystemTime::now();
+        let now = Utc::now();
 
-        if res_start > now || now > res_end {
+        if reservation.start() > now || now > reservation.end() {
             return Err(ReservationTrackerError::ReservationExpired);
         }
 
-        if self
-            .bucket_for(reservation, res_start, res_end)
-            .check(num_bytes, now)
-        {
+        if self.bucket_for(reservation).check(num_bytes, now.into()) {
             Ok(())
         } else {
             Err(ReservationTrackerError::BandwidthExceeded)
@@ -111,17 +103,13 @@ impl ReservationTracker {
     ///
     /// Returns 0 if the reservation is expired or has no remaining tokens.
     pub fn available_bytes(&mut self, reservation: &ReservationInfo) -> usize {
-        let res_start = std::time::UNIX_EPOCH + Duration::from_secs(reservation.start as u64);
-        let res_end = res_start + Duration::from_secs(reservation.duration as u64);
-        let now = SystemTime::now();
+        let now = Utc::now();
 
-        if res_start > now || now > res_end {
+        if reservation.start() > now || now > reservation.end() {
             return 0;
         }
 
-        self.bucket_for(reservation, res_start, res_end)
-            .available_at(now)
-            .max(0) as usize
+        self.bucket_for(reservation).available_at(now.into()).max(0) as usize
     }
 
     /// Check and, on success, deduct `pkt_size` bytes from the reservation's token bucket.
@@ -130,17 +118,15 @@ impl ReservationTracker {
         reservation: &ReservationInfo,
         num_bytes: usize,
     ) -> Result<(), ReservationTrackerError> {
-        let res_start = std::time::UNIX_EPOCH + Duration::from_secs(reservation.start as u64);
-        let res_end = res_start + Duration::from_secs(reservation.duration as u64);
-        let now = SystemTime::now();
+        let now = Utc::now();
 
-        if res_start > now || now > res_end {
+        if reservation.start() > now || now > reservation.end() {
             return Err(ReservationTrackerError::ReservationExpired);
         }
 
         if self
-            .bucket_for(reservation, res_start, res_end)
-            .use_checked(num_bytes, now)
+            .bucket_for(reservation)
+            .use_checked(num_bytes, now.into())
         {
             Ok(())
         } else {

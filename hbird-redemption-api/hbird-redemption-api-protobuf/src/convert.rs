@@ -147,7 +147,7 @@ pub fn from_proto_reservation(
             egress_interface: req.info.egress,
             res_id: res.res_id,
             bandwidth: req.info.bandwidth,
-            start: req.info.start_time.timestamp() as u32,
+            start: req.info.start_time,
             duration: req.info.duration,
         },
         reservation_key: auth_key,

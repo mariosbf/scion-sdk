@@ -2,7 +2,15 @@
 //!
 //! See also [path::hummingbird].
 
-use crate::{address::IsdAsn, path::hummingbird::HbirdAuthKey};
+use bytes::{Buf, BufMut, Bytes};
+use chrono::{DateTime, Duration, Utc};
+
+use crate::{
+    address::IsdAsn,
+    packet::{DecodeError, InadequateBufferSize},
+    path::hummingbird::HbirdAuthKey,
+    wire_encoding::{WireDecode, WireEncode},
+};
 
 /// Bandwidth for Hummingbird reservations.  
 #[derive(Clone, PartialEq, Eq, Hash, Copy, Debug, Default)]
@@ -93,6 +101,24 @@ impl Bandwidth {
 }
 
 /// Information about a Hummingbird reservation.
+///
+/// Wire format:
+///
+///  0                   1                   2                   3
+///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |              ISD              |                               |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+              AS               +
+/// |                                                               |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |           ConsIngress         |           ConsEgress          |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                   ResID                   |        BW         |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                           ResStart                            |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |          ResDuration          |            Padding            |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReservationInfo {
     /// The ISD-AS for which bandwidth was reserved.
@@ -111,13 +137,121 @@ pub struct ReservationInfo {
     pub bandwidth: Bandwidth,
 
     /// The start time of the reservation.
-    pub start: u32,
+    pub start: DateTime<Utc>,
 
     /// The duration for which the bandwidth is reserved in seconds.
     pub duration: u16,
 }
 
+impl ReservationInfo {
+    /// The start time of the reservation.
+    pub fn start(&self) -> DateTime<Utc> {
+        self.start
+    }
+
+    /// The end time of the reservation, i.e., when the reservation expires.
+    pub fn end(&self) -> DateTime<Utc> {
+        self.start + Duration::seconds(self.duration as i64)
+    }
+
+    /// Returns whether the reservation's validity window has passed.
+    pub fn is_expired(&self) -> bool {
+        Utc::now() >= self.end()
+    }
+
+    /// Returns the encoding of the reservation start time according to the
+    /// Hummingbird specification.
+    pub fn encode_start(&self) -> u32 {
+        self.start.timestamp() as u32
+    }
+
+    /// Returns the result of decoding `value` as start time according to the
+    /// Hummingbird specification
+    pub fn decode_start(value: u32) -> DateTime<Utc> {
+        DateTime::from_timestamp(value as i64, 0).unwrap()
+    }
+}
+
+impl ReservationInfo {
+    /// Wire-encoded length of a [`ReservationInfo`] in bytes.
+    pub const ENCODED_LENGTH: usize = 24;
+}
+
+impl WireEncode for ReservationInfo {
+    type Error = InadequateBufferSize;
+
+    fn encoded_length(&self) -> usize {
+        Self::ENCODED_LENGTH
+    }
+
+    fn encode_to_unchecked<T: BufMut>(&self, buffer: &mut T) {
+        buffer.put_u64(self.isd_as.0);
+        buffer.put_u16(self.ingress_interface);
+        buffer.put_u16(self.egress_interface);
+        let res_id_and_bw = ((self.res_id & 0x3F_FFFF) << 10) | self.bandwidth.encode() as u32;
+        buffer.put_u32(res_id_and_bw);
+        buffer.put_u32(self.encode_start());
+        buffer.put_u16(self.duration);
+        buffer.put_u16(0); // padding
+    }
+}
+
+impl WireDecode<Bytes> for ReservationInfo {
+    type Error = DecodeError;
+
+    fn decode(data: &mut Bytes) -> Result<Self, Self::Error> {
+        if data.remaining() < Self::ENCODED_LENGTH {
+            return Err(DecodeError::PacketEmptyOrTruncated);
+        }
+        let isd_as = IsdAsn(data.get_u64());
+        let ingress_interface = data.get_u16();
+        let egress_interface = data.get_u16();
+        let res_id_and_bw = data.get_u32();
+        let res_id = res_id_and_bw >> 10;
+        let bandwidth = Bandwidth::decode((res_id_and_bw & 0x3FF) as u16);
+        let res_start = data.get_u32();
+        let start = ReservationInfo::decode_start(res_start);
+        let duration = data.get_u16();
+        let _ = data.get_u16(); // padding
+        Ok(Self {
+            isd_as,
+            ingress_interface,
+            egress_interface,
+            res_id,
+            bandwidth,
+            start,
+            duration,
+        })
+    }
+}
+
 /// A full Hummingbird reservation.
+///
+/// Wire format:
+///
+///  0                   1                   2                   3
+///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |              ISD              |                               |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+              AS               +
+/// |                                                               |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |           ConsIngress         |           ConsEgress          |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                   ResID                   |        BW         |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                           ResStart                            |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |          ResDuration          |            Padding            |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |                                                               |
+/// +                       ReservationKey                          +
+/// |                                                               |
+/// +                                                               +
+/// |                                                               |
+/// +                                                               +
+/// |                                                               |
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reservation {
     /// Information about the reservation.
@@ -127,9 +261,49 @@ pub struct Reservation {
     pub reservation_key: HbirdAuthKey,
 }
 
+impl Reservation {
+    /// Wire-encoded length of a [`Reservation`] in bytes.
+    pub const ENCODED_LENGTH: usize = ReservationInfo::ENCODED_LENGTH + 16;
+
+    /// Returns whether the reservation's validity window has passed.
+    pub fn is_expired(&self) -> bool {
+        self.info.is_expired()
+    }
+}
+
+impl WireEncode for Reservation {
+    type Error = InadequateBufferSize;
+
+    fn encoded_length(&self) -> usize {
+        Self::ENCODED_LENGTH
+    }
+
+    fn encode_to_unchecked<T: BufMut>(&self, buffer: &mut T) {
+        self.info.encode_to_unchecked(buffer);
+        buffer.put_slice(self.reservation_key.as_slice());
+    }
+}
+
+impl WireDecode<Bytes> for Reservation {
+    type Error = DecodeError;
+
+    fn decode(data: &mut Bytes) -> Result<Self, Self::Error> {
+        if data.remaining() < Self::ENCODED_LENGTH {
+            return Err(DecodeError::PacketEmptyOrTruncated);
+        }
+        let info = ReservationInfo::decode(data)?;
+        let reservation_key = HbirdAuthKey::clone_from_slice(&data.split_to(16));
+        Ok(Self {
+            info,
+            reservation_key,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire_encoding::{WireDecode, WireEncode};
 
     #[test]
     fn zero_bandwidth() {
@@ -208,5 +382,52 @@ mod tests {
                 "encoded value exceeds 10 bits for {kbps} kbps"
             );
         }
+    }
+
+    #[test]
+    fn reservation_info_encode_decode_roundtrip() {
+        use crate::address::IsdAsn;
+
+        let info = ReservationInfo {
+            isd_as: IsdAsn(0x1_ff00_0000_0110),
+            ingress_interface: 1,
+            egress_interface: 2,
+            res_id: 0x3FFFFF,
+            bandwidth: Bandwidth::from_kbps(1024).unwrap(),
+            start: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            duration: 3600,
+        };
+        assert_eq!(info.encoded_length(), ReservationInfo::ENCODED_LENGTH);
+
+        let encoded = info.encode_to_bytes();
+        assert_eq!(encoded.len(), ReservationInfo::ENCODED_LENGTH);
+
+        let decoded = ReservationInfo::decode(&mut encoded.clone()).unwrap();
+        assert_eq!(decoded, info);
+    }
+
+    #[test]
+    fn reservation_encode_decode_roundtrip() {
+        use crate::address::IsdAsn;
+
+        let res = Reservation {
+            info: ReservationInfo {
+                isd_as: IsdAsn(0x1_ff00_0000_0110),
+                ingress_interface: 3,
+                egress_interface: 4,
+                res_id: 42,
+                bandwidth: Bandwidth::from_kbps(64).unwrap(),
+                start: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                duration: 600,
+            },
+            reservation_key: HbirdAuthKey::from([0xABu8; 16]),
+        };
+        assert_eq!(res.encoded_length(), Reservation::ENCODED_LENGTH);
+
+        let encoded = res.encode_to_bytes();
+        assert_eq!(encoded.len(), Reservation::ENCODED_LENGTH);
+
+        let decoded = Reservation::decode(&mut encoded.clone()).unwrap();
+        assert_eq!(decoded, res);
     }
 }

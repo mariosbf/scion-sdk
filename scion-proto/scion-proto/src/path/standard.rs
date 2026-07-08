@@ -14,7 +14,7 @@
 // limitations under the License.
 //! Standard SCION path.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bytes::{Buf as _, BufMut, Bytes};
 use chrono::{DateTime, Utc};
@@ -135,22 +135,20 @@ impl StandardPath {
     }
 
     /// Turns this path into a HummingbirdPath with a default counter value.
-    pub fn to_hbird(
-        self,
-        interfaces: &[PathInterface],
-    ) -> Result<HummingbirdPath, super::HummingbirdConversionError> {
+    pub fn to_hbird(self, interfaces: &[PathInterface]) -> HummingbirdPath {
         self.to_hbird_with_counter(HummingbirdCounter::default(), interfaces)
     }
 
     /// Turns this path into a HummingbirdPath with the provided counter value.
     ///
-    /// Returns [`super::HummingbirdConversionError::MissingIsdAsn`] if `interfaces` does not
-    /// contain enough entries to cover every hop field in the path.
+    /// Hops whose ISD-AS cannot be determined from `interfaces` (e.g. because it
+    /// does not contain enough entries to cover every hop field in the path) are
+    /// left without an ISD-AS.
     pub fn to_hbird_with_counter(
         self,
         counter: HummingbirdCounter,
         interfaces: &[PathInterface],
-    ) -> Result<HummingbirdPath, super::HummingbirdConversionError> {
+    ) -> HummingbirdPath {
         let mut iface_index = 0;
 
         let mut remaining_hops = &self.hop_fields[..];
@@ -164,10 +162,7 @@ impl StandardPath {
             let mut segment_hops = Vec::with_capacity(segment_len);
 
             for hop in &remaining_hops[..segment_len] {
-                let isd_as = interfaces
-                    .get(iface_index)
-                    .ok_or(super::HummingbirdConversionError::MissingIsdAsn)?
-                    .isd_asn;
+                let isd_as = interfaces.get(iface_index).map(|iface| iface.isd_asn);
                 segment_hops.push((isd_as, hop.clone()));
 
                 if hop.cons_ingress != 0 {
@@ -190,7 +185,7 @@ impl StandardPath {
             hbird_path.add_segment(info_field, segment).unwrap();
         }
 
-        Ok(hbird_path)
+        hbird_path
     }
 }
 
@@ -473,11 +468,17 @@ impl StandardHopField {
         destination: IsdAsn,
         pkt_len: u16,
     ) -> Result<FlyoverHopField, HummingbirdPathError> {
-        let res_start_offset = meta_header
-            .base_timestamp
-            .get()
-            .checked_sub(reservation.info.start)
-            .and_then(|offset| offset.try_into().ok())
+        let base_timestamp: SystemTime = meta_header.base_timestamp.into();
+        // Truncate start to whole seconds: the protocol encodes res_start_offset as an integer,
+        // and HummingbirdBaseTimestamp has 1-second precision. Sub-second nanoseconds in
+        // reservation.info.start would cause duration_since to truncate incorrectly.
+        let start_secs =
+            SystemTime::UNIX_EPOCH + Duration::from_secs(reservation.info.start.timestamp() as u64);
+        let res_start_offset = base_timestamp
+            .duration_since(start_secs)
+            .ok()
+            .map(|d| d.as_secs())
+            .and_then(|d| u16::try_from(d).ok())
             .ok_or(HummingbirdPathError::ReservationNotValid)?;
 
         let flyover_mac = calculate_flyover_mac(

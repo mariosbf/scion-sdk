@@ -34,7 +34,7 @@
 //! - [`StandardPath`] is a structure representation of a SCION path that can be used to create or
 //!   modify SCION paths.
 
-use std::{net::SocketAddr, ops::Deref};
+use std::{error::Error, net::SocketAddr, ops::Deref};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -355,6 +355,61 @@ where
             })
         })
     }
+
+    /// Returns the hops along the path that can be reversed, if necessary
+    /// metadata is available.
+    pub fn reservable_hops(&self) -> Option<Vec<(u8, IsdAsn, u16, u16)>> {
+        // TODO (mariosbf): might be wrong when using peering links
+        let mut result = vec![];
+
+        let path = if let DataPlanePath::Standard(p) = &self.data_plane_path {
+            p
+        } else {
+            return None;
+        };
+
+        // Iterate over interfaces in pairs of two
+        let mut interfaces = vec![PathInterface {
+            isd_asn: self.source(),
+            id: 0,
+        }];
+
+        interfaces.extend(self.metadata.as_ref()?.interfaces.as_ref()?.clone());
+
+        interfaces.push(PathInterface {
+            isd_asn: self.destination(),
+            id: 0,
+        });
+
+        let mut iface_iter = interfaces.chunks(2).peekable();
+
+        for (hop_idx, (info_field, hop)) in path
+            .segments()
+            .zip(path.info_fields())
+            .flat_map(|(s, i)| s.hop_fields().map(move |h| (i, h)))
+            .enumerate()
+        {
+            let Some([ingress, egress]) = iface_iter.peek() else {
+                break;
+            };
+
+            let hop_egress = hop.egress_interface(info_field).map(u16::from).unwrap_or(0);
+            let hop_ingress = hop
+                .ingress_interface(info_field)
+                .map(u16::from)
+                .unwrap_or(0);
+
+            if ingress.id == hop_ingress && egress.id == hop_egress || hop_ingress == 0 {
+                iface_iter.next();
+            }
+
+            if (ingress.id == hop_ingress && egress.id == hop_egress) || hop_egress == 0 {
+                result.push((hop_idx as u8, ingress.isd_asn, ingress.id, egress.id));
+            }
+        }
+
+        Some(result)
+    }
 }
 
 /// Error returned when applying reservations to a path fails.
@@ -369,9 +424,6 @@ pub enum HummingbirdConversionError {
     /// Error in path Hummingbird path builder.
     #[error("failed to add reservation to path: {0}")]
     HummingbirdPathBuilderError(#[from] HummingbirdPathError),
-    /// Missing ISD ASN information in path metadata.
-    #[error("missing ISD ASN information in path metadata")]
-    MissingIsdAsn,
 }
 
 impl Path<Bytes> {
@@ -401,7 +453,7 @@ impl Path<Bytes> {
         let mut hbird_path = self.to_hbird()?;
 
         for r in reservations {
-            hbird_path.add_reservation(r);
+            hbird_path.try_add_reservation(r);
         }
 
         let encoded_p =
@@ -419,8 +471,9 @@ impl Path<Bytes> {
     /// Converts the path to a Hummingbird path.
     ///
     /// If the underlying path is a standard path or an encoded Hummingbird path,
-    /// then the interface information from the path metadata is necessary
-    /// to perform the conversion (see [`Metadata`] [`PathInterface`]).
+    /// the interface information from the path metadata (see [`Metadata`]
+    /// [`PathInterface`]) is used to determine each hop's ISD-AS, if available.
+    /// Hops whose ISD-AS cannot be determined are left without one.
     ///
     /// If the underlying path is of type `Unsupported`, then the conversion
     /// will fail.
@@ -431,16 +484,14 @@ impl Path<Bytes> {
                 let ifaces = self
                     .metadata
                     .as_ref()
-                    .and_then(|m| m.interfaces.as_ref())
-                    .ok_or(HummingbirdConversionError::MissingIsdAsn)?;
+                    .and_then(|m| m.interfaces.as_deref())
+                    .unwrap_or(&[]);
 
                 let standard_path: StandardPath = p.clone().try_into()?;
-                Ok(standard_path.to_hbird(ifaces)?)
+                Ok(standard_path.to_hbird(ifaces))
             }
             DataPlanePath::Hummingbird(p) => {
-                let ases = self
-                    .ases()
-                    .ok_or(HummingbirdConversionError::MissingIsdAsn)?;
+                let ases = self.ases().unwrap_or_default();
                 let mut bytes = p.encoded_path.clone();
                 Ok(HummingbirdPath::decode(&mut bytes, &ases)?)
             }
@@ -731,4 +782,116 @@ mod tests {
         });
         PathParseErrorKind::InvalidInterface.into()
     );
+
+    #[test]
+    fn reservable_hops_only_down_segment() {
+        use crate::address::{Asn, EndhostAddr, Isd, IsdAsn};
+        use crate::path::test_builder::TestPathBuilder;
+
+        let src = EndhostAddr::new(IsdAsn::new(Isd(1), Asn(110)), [127, 0, 0, 1].into());
+        let dst = EndhostAddr::new(IsdAsn::new(Isd(1), Asn(114)), [127, 0, 0, 1].into());
+
+        let ctx = TestPathBuilder::new(src.into(), dst.into())
+            .down()
+            .with_asn(110)
+            .add_hop(0, 1)
+            .with_asn(111)
+            .add_hop(1, 2)
+            .with_asn(114)
+            .add_hop(1, 0)
+            .build(1000);
+
+        let path = ctx.path();
+
+        let hops = path
+            .reservable_hops()
+            .expect("path should expose reservable hops");
+
+        let asn = |n: u64| IsdAsn::new(Isd(1), Asn(n));
+
+        assert_eq!(
+            hops,
+            vec![
+                (0, asn(110), 0, 1), // server: first hop of the return trip
+                (1, asn(111), 1, 2), // transit AS, same on both directions
+                (2, asn(114), 1, 0), // client: last hop of the return trip
+            ]
+        );
+    }
+
+    #[test]
+    fn reservable_hops_only_up_segment() {
+        use crate::address::{Asn, EndhostAddr, Isd, IsdAsn};
+        use crate::path::test_builder::TestPathBuilder;
+
+        let src = EndhostAddr::new(IsdAsn::new(Isd(1), Asn(114)), [127, 0, 0, 1].into());
+        let dst = EndhostAddr::new(IsdAsn::new(Isd(1), Asn(110)), [127, 0, 0, 1].into());
+
+        let ctx = TestPathBuilder::new(src.into(), dst.into())
+            .up()
+            .with_asn(114)
+            .add_hop(0, 1)
+            .with_asn(111)
+            .add_hop(2, 1)
+            .with_asn(110)
+            .add_hop(1, 0)
+            .build(1000);
+
+        let path = ctx.path();
+
+        let hops = path
+            .reservable_hops()
+            .expect("path should expose reservable hops");
+
+        let asn = |n: u64| IsdAsn::new(Isd(1), Asn(n));
+
+        assert_eq!(
+            hops,
+            vec![
+                (0, asn(114), 0, 1),
+                (1, asn(111), 2, 1),
+                (2, asn(110), 1, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn reservable_hops_up_and_down_segment() {
+        use crate::address::{Asn, EndhostAddr, Isd, IsdAsn};
+        use crate::path::test_builder::TestPathBuilder;
+
+        let src = EndhostAddr::new(IsdAsn::new(Isd(1), Asn(110)), [127, 0, 0, 1].into());
+        let dst = EndhostAddr::new(IsdAsn::new(Isd(1), Asn(112)), [127, 0, 0, 1].into());
+
+        let ctx = TestPathBuilder::new(src.into(), dst.into())
+            .using_info_timestamp(42)
+            .up()
+            .with_asn(110)
+            .add_hop(0, 1)
+            .with_asn(111)
+            .add_hop(1, 0)
+            .down()
+            .with_asn(111)
+            .add_hop(0, 2)
+            .with_asn(112)
+            .add_hop(1, 0)
+            .build(1000);
+
+        let path = ctx.path();
+
+        let hops = path
+            .reservable_hops()
+            .expect("path should expose reservable hops");
+
+        let asn = |n: u64| IsdAsn::new(Isd(1), Asn(n));
+
+        assert_eq!(
+            hops,
+            vec![
+                (0, asn(110), 0, 1),
+                (1, asn(111), 1, 2),
+                (3, asn(112), 1, 0),
+            ]
+        );
+    }
 }

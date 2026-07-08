@@ -196,6 +196,12 @@ impl From<std::time::SystemTime> for HummingbirdBaseTimestamp {
     }
 }
 
+impl From<HummingbirdBaseTimestamp> for std::time::SystemTime {
+    fn from(val: HummingbirdBaseTimestamp) -> Self {
+        std::time::UNIX_EPOCH + Duration::from_secs(val.get() as u64)
+    }
+}
+
 impl From<DateTime<Utc>> for HummingbirdBaseTimestamp {
     /// Creates a new HummingbirdBaseTimestamp from the given DateTime<Utc> by
     /// calculating the duration since the UNIX epoch and using its seconds as
