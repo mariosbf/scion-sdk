@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::{address::IsdAsn, hummingbird::ReservationInfo};
 
@@ -23,7 +23,7 @@ pub enum ReservationTrackerError {
 /// Client-side token-bucket enforcer for Hummingbird reservations.
 #[derive(Debug)]
 pub struct ReservationTracker {
-    token_buckets: HashMap<(IsdAsn, u32), (SystemTime, TokenBucket)>,
+    token_buckets: HashMap<(IsdAsn, u32, DateTime<Utc>), (SystemTime, TokenBucket)>,
     last_cleanup: Instant,
     cleanup_interval: Duration,
 }
@@ -50,7 +50,7 @@ impl ReservationTracker {
     fn bucket_for(&mut self, reservation: &ReservationInfo) -> &mut TokenBucket {
         &mut self
             .token_buckets
-            .entry((reservation.isd_as, reservation.res_id))
+            .entry((reservation.isd_as, reservation.res_id, reservation.start))
             .or_insert_with(|| {
                 (
                     reservation.end().into(),
@@ -91,10 +91,11 @@ impl ReservationTracker {
     /// Caller must have called [`check_reservation`] first to confirm availability.
     /// No-op if the bucket does not exist.
     pub fn deduct_reservation(&mut self, reservation: &ReservationInfo, num_bytes: usize) {
-        if let Some((_, bucket)) = self
-            .token_buckets
-            .get_mut(&(reservation.isd_as, reservation.res_id))
-        {
+        if let Some((_, bucket)) = self.token_buckets.get_mut(&(
+            reservation.isd_as,
+            reservation.res_id,
+            reservation.start,
+        )) {
             bucket.use_unchecked(num_bytes);
         }
     }
@@ -138,5 +139,60 @@ impl ReservationTracker {
 impl Default for ReservationTracker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Duration as ChronoDuration;
+
+    use super::*;
+    use crate::{
+        address::{Asn, Isd},
+        hummingbird::Bandwidth,
+    };
+
+    fn make_reservation(res_id: u32, start: DateTime<Utc>, bw_kbps: u64) -> ReservationInfo {
+        ReservationInfo {
+            isd_as: IsdAsn::new(Isd::new(1), Asn::new(1)),
+            ingress_interface: 1,
+            egress_interface: 2,
+            res_id,
+            bandwidth: Bandwidth::from_kbps(bw_kbps).unwrap(),
+            start,
+            duration: 60,
+        }
+    }
+
+    #[test]
+    fn different_start_times_get_independent_buckets() {
+        let mut tracker = ReservationTracker::new();
+        let now = Utc::now();
+
+        let res_a = make_reservation(42, now - ChronoDuration::seconds(10), 8);
+        let res_b = make_reservation(42, now - ChronoDuration::seconds(5), 8);
+
+        // Exhaust res_a's bucket entirely.
+        tracker.use_reservation(&res_a, 1000).unwrap();
+        assert!(tracker.use_reservation(&res_a, 1).is_err());
+
+        // res_b shares (isd_as, res_id) with res_a but has a different start time, so it
+        // must have gotten its own, untouched bucket.
+        tracker.use_reservation(&res_b, 1000).unwrap();
+    }
+
+    #[test]
+    fn same_start_time_shares_bucket() {
+        let mut tracker = ReservationTracker::new();
+        let start = Utc::now() - ChronoDuration::seconds(10);
+
+        let res_a = make_reservation(42, start, 8);
+        let res_a_again = make_reservation(42, start, 8);
+
+        tracker.use_reservation(&res_a, 1000).unwrap();
+        assert!(matches!(
+            tracker.use_reservation(&res_a_again, 1),
+            Err(ReservationTrackerError::BandwidthExceeded)
+        ));
     }
 }
