@@ -102,6 +102,18 @@ impl Bandwidth {
     }
 }
 
+impl PartialOrd for Bandwidth {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Bandwidth {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.to_kbps().cmp(&other.to_kbps())
+    }
+}
+
 /// Information about a Hummingbird reservation.
 ///
 /// Wire format:
@@ -435,6 +447,18 @@ mod tests {
     fn zero_bandwidth() {
         let bw = Bandwidth::from_kbps(0).unwrap();
         assert_eq!(bw.to_kbps(), 0);
+    }
+
+    #[test]
+    fn bandwidth_ord_matches_kbps_ordering() {
+        let low = Bandwidth::from_kbps(10).unwrap();
+        let high = Bandwidth::from_kbps(1024).unwrap();
+        assert!(low < high);
+
+        // Exponent boundary: 31 uses exponent=0, 32 uses exponent=1.
+        let boundary_low = Bandwidth::from_kbps(31).unwrap();
+        let boundary_high = Bandwidth::from_kbps(32).unwrap();
+        assert!(boundary_low < boundary_high);
     }
 
     #[test]
