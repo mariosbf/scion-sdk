@@ -802,21 +802,10 @@ impl HummingbirdPath {
     /// Note that adding segments or reservations after calling this method
     /// may change the encoded length.
     pub fn encoded_length(&self) -> usize {
-        let hop_fields_with_applicable_reservations = self
+        let hops = self
             .hops_with_reservation(0, None, false)
-            .expect("infallible: no tracker, not strict")
-            .iter()
-            .filter(|t| matches!(t, (_, _, Some(_))))
-            .count();
-
-        self.path_meta.encoded_length()
-            + self.info_fields_len()
-            + self
-                .hops()
-                .map(|hop| hop.hop_field.encoded_length())
-                .sum::<usize>()
-            + hop_fields_with_applicable_reservations
-                * (FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE)
+            .expect("infallible: no tracker, not strict");
+        self.path_header_len(&hops)
     }
 
     fn info_fields_len(&self) -> usize {
@@ -903,6 +892,26 @@ impl HummingbirdPath {
         self.segments.iter_mut().flat_map(|s| s.iter_mut())
     }
 
+    /// Computes the length in bytes of the encoded path header (meta header +
+    /// info fields + hop fields) that would result from encoding `hops`,
+    /// where a hop paired with `Some` reservation becomes a flyover hop
+    /// field and one paired with `None` stays a standard hop field.
+    ///
+    /// Shared by [`Self::apply_reservations`], [`Self::encoded_length`], and
+    /// `generate_flyover_macs` so the packet-length formula can't drift
+    /// between them.
+    fn path_header_len(&self, hops: &[(usize, usize, Option<Reservation>)]) -> usize {
+        let flyover_count = hops.iter().filter(|(_, _, res)| res.is_some()).count();
+
+        HummingbirdMetaHeader::LENGTH
+            + self.info_fields_len()
+            + self
+                .hops()
+                .map(|hop| hop.hop_field.encoded_length())
+                .sum::<usize>()
+            + flyover_count * (FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE)
+    }
+
     /// Apply reservations by turning applicable hop fields into flyover hop
     /// fields, adjusting segment lengths and current hop field index.
     fn apply_reservations(
@@ -953,16 +962,7 @@ impl HummingbirdPath {
 
         // Compute the exact packet length based on the actual selection.
         let mut curr_hf_index = meta_header.current_hop_field.byte_offset();
-        let hops_with_applicable_reservations =
-            hops.iter().filter(|t| matches!(t, (_, _, Some(_)))).count();
-        let path_header_len = meta_header.encoded_length()
-            + self.info_fields_len()
-            + self
-                .hops()
-                .map(|hop| hop.hop_field.encoded_length())
-                .sum::<usize>()
-            + hops_with_applicable_reservations
-                * (FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE);
+        let path_header_len = self.path_header_len(&hops);
 
         let pkt_len = u16::try_from(path_header_len)
             .ok()
@@ -1871,6 +1871,29 @@ mod tests {
             matches!(result, Err(HummingbirdPathError::TooManySegments)),
             "expected TooManySegments, got {result:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // path_header_len
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn path_header_len_counts_flyover_hops() {
+        let mut path = HummingbirdPath::new();
+        path.add_segment(
+            make_info(true, 1),
+            vec![make_std_hop(1, 2), make_std_hop(3, 4)],
+        )
+        .unwrap();
+
+        let hops_no_res: Vec<(usize, usize, Option<Reservation>)> =
+            vec![(0, 0, None), (0, 1, None)];
+        assert_eq!(path.path_header_len(&hops_no_res), 44);
+
+        let res = make_reservation(1, 2, 1000, 200, 1024);
+        let hops_with_res: Vec<(usize, usize, Option<Reservation>)> =
+            vec![(0, 0, Some(res)), (0, 1, None)];
+        assert_eq!(path.path_header_len(&hops_with_res), 52);
     }
 
     // ---------------------------------------------------------------------------
