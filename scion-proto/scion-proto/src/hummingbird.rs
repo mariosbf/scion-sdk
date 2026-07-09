@@ -438,6 +438,249 @@ impl FlyoverMAC {
     }
 }
 
+/// One entry within a [`FlyoverMACs`] batch — a single reservation's
+/// precomputed flyover MAC, targeting a specific hop.
+///
+/// Wire format (15 bytes total):
+/// - `mac`: 6 bytes.
+/// - `res_id` (22 bits) and `bandwidth` (10 bits) packed into 4 bytes, using
+///   the same `(res_id << 10) | bandwidth` layout as [`ReservationInfo`]'s
+///   `ResID`/`BW` field.
+/// - `res_start_offset`: 2 bytes.
+/// - `res_duration`: 2 bytes.
+/// - `hop_index`: 1 byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlyoverMACEntry {
+    /// Raw flyover MAC — not yet XORed with the underlying standard hop
+    /// field's own MAC. Mirrors [`FlyoverMAC::mac`].
+    pub mac: [u8; 6],
+    /// The reservation ID.
+    pub res_id: u32,
+    /// The reserved bandwidth.
+    pub bandwidth: Bandwidth,
+    /// Offset (seconds) between the reservation's start and the batch's
+    /// shared `base_timestamp` (see [`FlyoverMACs::base_timestamp`]).
+    pub res_start_offset: u16,
+    /// The duration for which the bandwidth is reserved, in seconds.
+    pub res_duration: u16,
+    /// Flat hop index across all segments (same numbering as
+    /// [`crate::path::Path::reservable_hops`] /
+    /// [`crate::path::Path::reservation_hop_index`]).
+    pub hop_index: u8,
+}
+
+impl FlyoverMACEntry {
+    /// Wire-encoded length of a [`FlyoverMACEntry`] in bytes.
+    pub const ENCODED_LENGTH: usize = 15;
+}
+
+impl WireEncode for FlyoverMACEntry {
+    type Error = InadequateBufferSize;
+
+    fn encoded_length(&self) -> usize {
+        Self::ENCODED_LENGTH
+    }
+
+    fn encode_to_unchecked<T: BufMut>(&self, buffer: &mut T) {
+        buffer.put_slice(&self.mac);
+        let res_id_and_bw = ((self.res_id & 0x3F_FFFF) << 10) | self.bandwidth.encode() as u32;
+        buffer.put_u32(res_id_and_bw);
+        buffer.put_u16(self.res_start_offset);
+        buffer.put_u16(self.res_duration);
+        buffer.put_u8(self.hop_index);
+    }
+}
+
+impl WireDecode<Bytes> for FlyoverMACEntry {
+    type Error = DecodeError;
+
+    fn decode(data: &mut Bytes) -> Result<Self, Self::Error> {
+        if data.remaining() < Self::ENCODED_LENGTH {
+            return Err(DecodeError::PacketEmptyOrTruncated);
+        }
+        let mac_bytes = data.split_to(6);
+        let mac: [u8; 6] = mac_bytes.as_ref().try_into().unwrap();
+        let res_id_and_bw = data.get_u32();
+        let res_id = res_id_and_bw >> 10;
+        let bandwidth = Bandwidth::decode((res_id_and_bw & 0x3FF) as u16);
+        let res_start_offset = data.get_u16();
+        let res_duration = data.get_u16();
+        let hop_index = data.get_u8();
+        Ok(Self {
+            mac,
+            res_id,
+            bandwidth,
+            res_start_offset,
+            res_duration,
+            hop_index,
+        })
+    }
+}
+
+/// Compact set of flyover MACs sharing packet-level context. Lets a
+/// component without reservation keys turn a `Standard` path into a
+/// `Hummingbird` path with flyover hops, given precomputed MACs. See
+/// `HummingbirdPath::generate_flyover_macs` and
+/// `HummingbirdPath::apply_flyover_macs`.
+///
+/// Wire format:
+/// - `dst_isd_asn`: 8 bytes.
+/// - `base_timestamp`: 4 bytes.
+/// - `millis_timestamp`: 2 bytes.
+/// - `counter`: 4 bytes.
+/// - `packet_length`: 2 bytes.
+/// - `payload_length_suggestion`: 2 bytes.
+/// - `entry_count`: 1 byte.
+/// - `entries`: `entry_count` repetitions of [`FlyoverMACEntry`] (15 bytes each).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlyoverMACs {
+    /// The destination ISD-AS these MACs were computed for.
+    pub dst_isd_asn: IsdAsn,
+    /// The path meta header base timestamp shared by every entry: a Unix
+    /// timestamp with 1-second granularity.
+    pub base_timestamp: u32,
+    /// The millis timestamp shared by every entry.
+    pub millis_timestamp: u16,
+    /// The counter value shared by every entry.
+    pub counter: u32,
+    /// The total packet length (common + address + path header + payload)
+    /// this batch of MACs was computed for. Required both for matching
+    /// (does this batch apply to the packet we're about to build) and for
+    /// deriving `payload_length_suggestion`.
+    pub packet_length: u16,
+    /// Suggested payload length: if the caller produces exactly this many
+    /// bytes of payload, and SCION adds a common header, address header, and
+    /// path header (with every hop in `entries` applied as a flyover, and no
+    /// extension headers), the resulting packet length equals
+    /// `packet_length` and the MACs remain valid.
+    pub payload_length_suggestion: u16,
+    /// The individual flyover MACs making up this batch.
+    pub entries: Vec<FlyoverMACEntry>,
+}
+
+impl FlyoverMACs {
+    fn packet_timestamp(&self) -> DateTime<Utc> {
+        ReservationInfo::decode_start(self.base_timestamp)
+            + Duration::milliseconds(i64::from(self.millis_timestamp))
+    }
+
+    /// When `entry`'s underlying reservation ends, derived from
+    /// `entry.res_start_offset`/`entry.res_duration` and this batch's shared
+    /// `base_timestamp`.
+    fn entry_reservation_end(&self, entry: &FlyoverMACEntry) -> DateTime<Utc> {
+        ReservationInfo::decode_start(self.base_timestamp)
+            - Duration::seconds(i64::from(entry.res_start_offset))
+            + Duration::seconds(i64::from(entry.res_duration))
+    }
+
+    fn entry_valid_from(&self, entry: &FlyoverMACEntry) -> DateTime<Utc> {
+        self.packet_timestamp().min(self.entry_reservation_end(entry))
+    }
+
+    fn entry_valid_until(&self, entry: &FlyoverMACEntry) -> DateTime<Utc> {
+        self.entry_reservation_end(entry)
+            .min(self.packet_timestamp() + Duration::seconds(MAX_FRESHNESS_TOLERANCE))
+    }
+
+    fn entry_is_valid_now(&self, entry: &FlyoverMACEntry, now: DateTime<Utc>) -> bool {
+        self.entry_valid_from(entry) <= now && self.entry_valid_until(entry) >= now
+    }
+
+    /// Returns the number of entries that are valid right now, i.e. whose
+    /// validity window has started but not yet passed.
+    pub fn num_valid(&self) -> usize {
+        let now = Utc::now();
+        self.entries
+            .iter()
+            .filter(|e| self.entry_is_valid_now(e, now))
+            .count()
+    }
+
+    /// Returns the number of entries whose validity window has passed.
+    pub fn num_expired(&self) -> usize {
+        let now = Utc::now();
+        self.entries
+            .iter()
+            .filter(|e| now >= self.entry_valid_until(e))
+            .count()
+    }
+
+    /// Returns whether every entry's validity window has passed.
+    pub fn all_expired(&self) -> bool {
+        self.num_expired() == self.entries.len()
+    }
+
+    /// Returns whether any entry's validity window has passed.
+    pub fn any_expired(&self) -> bool {
+        self.num_expired() > 0
+    }
+
+    /// Returns whether every entry is valid right now, i.e. each entry's
+    /// validity window has started but not yet passed.
+    pub fn all_valid(&self) -> bool {
+        self.num_valid() == self.entries.len()
+    }
+
+    /// Returns whether any entry is valid right now.
+    pub fn any_valid(&self) -> bool {
+        self.num_valid() > 0
+    }
+}
+
+impl WireEncode for FlyoverMACs {
+    type Error = InadequateBufferSize;
+
+    fn encoded_length(&self) -> usize {
+        8 + 4 + 2 + 4 + 2 + 2 + 1 + self.entries.len() * FlyoverMACEntry::ENCODED_LENGTH
+    }
+
+    fn encode_to_unchecked<T: BufMut>(&self, buffer: &mut T) {
+        buffer.put_u64(self.dst_isd_asn.0);
+        buffer.put_u32(self.base_timestamp);
+        buffer.put_u16(self.millis_timestamp);
+        buffer.put_u32(self.counter);
+        buffer.put_u16(self.packet_length);
+        buffer.put_u16(self.payload_length_suggestion);
+        buffer.put_u8(self.entries.len() as u8);
+        for entry in &self.entries {
+            entry.encode_to_unchecked(buffer);
+        }
+    }
+}
+
+impl WireDecode<Bytes> for FlyoverMACs {
+    type Error = DecodeError;
+
+    fn decode(data: &mut Bytes) -> Result<Self, Self::Error> {
+        const FIXED_LEN: usize = 8 + 4 + 2 + 4 + 2 + 2 + 1;
+        if data.remaining() < FIXED_LEN {
+            return Err(DecodeError::PacketEmptyOrTruncated);
+        }
+        let dst_isd_asn = IsdAsn(data.get_u64());
+        let base_timestamp = data.get_u32();
+        let millis_timestamp = data.get_u16();
+        let counter = data.get_u32();
+        let packet_length = data.get_u16();
+        let payload_length_suggestion = data.get_u16();
+        let entry_count = data.get_u8();
+
+        let mut entries = Vec::with_capacity(entry_count as usize);
+        for _ in 0..entry_count {
+            entries.push(FlyoverMACEntry::decode(data)?);
+        }
+
+        Ok(Self {
+            dst_isd_asn,
+            base_timestamp,
+            millis_timestamp,
+            counter,
+            packet_length,
+            payload_length_suggestion,
+            entries,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,5 +822,137 @@ mod tests {
 
         let decoded = Reservation::decode(&mut encoded.clone()).unwrap();
         assert_eq!(decoded, res);
+    }
+
+    #[test]
+    fn flyover_mac_entry_encode_decode_roundtrip() {
+        let entry = FlyoverMACEntry {
+            mac: [1, 2, 3, 4, 5, 6],
+            res_id: 0x3FFFFF,
+            bandwidth: Bandwidth::from_kbps(1024).unwrap(),
+            res_start_offset: 1000,
+            res_duration: 600,
+            hop_index: 3,
+        };
+        assert_eq!(entry.encoded_length(), FlyoverMACEntry::ENCODED_LENGTH);
+
+        let encoded = entry.encode_to_bytes();
+        assert_eq!(encoded.len(), FlyoverMACEntry::ENCODED_LENGTH);
+
+        let decoded = FlyoverMACEntry::decode(&mut encoded.clone()).unwrap();
+        assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    fn flyover_macs_encode_decode_roundtrip() {
+        use crate::address::IsdAsn;
+
+        let macs = FlyoverMACs {
+            dst_isd_asn: IsdAsn(0x1_ff00_0000_0110),
+            base_timestamp: 1_700_000_000,
+            millis_timestamp: 250,
+            counter: 7,
+            packet_length: 1000,
+            payload_length_suggestion: 900,
+            entries: vec![
+                FlyoverMACEntry {
+                    mac: [1; 6],
+                    res_id: 1,
+                    bandwidth: Bandwidth::from_kbps(64).unwrap(),
+                    res_start_offset: 10,
+                    res_duration: 20,
+                    hop_index: 0,
+                },
+                FlyoverMACEntry {
+                    mac: [2; 6],
+                    res_id: 2,
+                    bandwidth: Bandwidth::from_kbps(128).unwrap(),
+                    res_start_offset: 30,
+                    res_duration: 40,
+                    hop_index: 2,
+                },
+            ],
+        };
+
+        let encoded = macs.encode_to_bytes();
+        assert_eq!(encoded.len(), macs.encoded_length());
+
+        let decoded = FlyoverMACs::decode(&mut encoded.clone()).unwrap();
+        assert_eq!(decoded, macs);
+    }
+
+    #[test]
+    fn flyover_macs_mixed_valid_and_expired_entries() {
+        use crate::address::IsdAsn;
+
+        let now = Utc::now();
+        let base_timestamp = now.timestamp() as u32;
+
+        let macs = FlyoverMACs {
+            dst_isd_asn: IsdAsn(0x1_ff00_0000_0110),
+            base_timestamp,
+            millis_timestamp: 0,
+            counter: 0,
+            packet_length: 100,
+            payload_length_suggestion: 50,
+            entries: vec![
+                // Expired: reservation ended 50s before base_timestamp.
+                FlyoverMACEntry {
+                    mac: [0; 6],
+                    res_id: 1,
+                    bandwidth: Bandwidth::from_kbps(64).unwrap(),
+                    res_start_offset: 100,
+                    res_duration: 50,
+                    hop_index: 0,
+                },
+                // Valid: reservation still has plenty of time left.
+                FlyoverMACEntry {
+                    mac: [0; 6],
+                    res_id: 2,
+                    bandwidth: Bandwidth::from_kbps(64).unwrap(),
+                    res_start_offset: 0,
+                    res_duration: 600,
+                    hop_index: 1,
+                },
+            ],
+        };
+
+        assert_eq!(macs.num_expired(), 1);
+        assert_eq!(macs.num_valid(), 1);
+        assert!(macs.any_expired());
+        assert!(!macs.all_expired());
+        assert!(macs.any_valid());
+        assert!(!macs.all_valid());
+    }
+
+    #[test]
+    fn flyover_macs_all_expired_when_every_entry_expired() {
+        use crate::address::IsdAsn;
+
+        // base_timestamp near the epoch: any reservation ending shortly
+        // after it is long expired relative to Utc::now().
+        let macs = FlyoverMACs {
+            dst_isd_asn: IsdAsn(0x1_ff00_0000_0110),
+            base_timestamp: 1,
+            millis_timestamp: 0,
+            counter: 0,
+            packet_length: 100,
+            payload_length_suggestion: 50,
+            entries: vec![FlyoverMACEntry {
+                mac: [0; 6],
+                res_id: 1,
+                bandwidth: Bandwidth::from_kbps(64).unwrap(),
+                res_start_offset: 0,
+                res_duration: 1,
+                hop_index: 0,
+            }],
+        };
+
+        assert_eq!(macs.num_expired(), 1);
+        assert_eq!(macs.num_valid(), 0);
+        assert!(macs.all_expired());
+        assert!(macs.any_expired());
+        assert!(!macs.all_valid());
+        assert!(!macs.any_valid());
     }
 }
