@@ -410,6 +410,23 @@ where
 
         Some(result)
     }
+
+    /// Returns the hop index that `reservation` applies to on this path, if any.
+    ///
+    /// A reservation applies to a hop when the reservation's ISD-AS, ingress interface, and
+    /// egress interface match that hop's, as computed by [`Self::reservable_hops`]. Returns
+    /// `None` if no hop matches, or if `reservable_hops` itself returns `None` (e.g. the path is
+    /// not a standard path, or metadata is unavailable).
+    pub fn reservation_hop_index(&self, reservation: &Reservation) -> Option<u8> {
+        self.reservable_hops()?
+            .into_iter()
+            .find(|&(_, isd_asn, ingress, egress)| {
+                isd_asn == reservation.info.isd_as
+                    && ingress == reservation.info.ingress_interface
+                    && egress == reservation.info.egress_interface
+            })
+            .map(|(hop_idx, ..)| hop_idx)
+    }
 }
 
 /// Error returned when applying reservations to a path fails.
@@ -893,5 +910,99 @@ mod tests {
                 (3, asn(112), 1, 0),
             ]
         );
+    }
+
+    fn reservation_for(
+        isd_as: IsdAsn,
+        ingress_interface: u16,
+        egress_interface: u16,
+    ) -> Reservation {
+        use crate::{
+            hummingbird::{Bandwidth, ReservationInfo},
+            path::hummingbird::HbirdAuthKey,
+        };
+
+        Reservation {
+            info: ReservationInfo {
+                isd_as,
+                ingress_interface,
+                egress_interface,
+                res_id: 42,
+                bandwidth: Bandwidth::from_kbps(64).unwrap(),
+                start: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+                duration: 600,
+            },
+            reservation_key: HbirdAuthKey::from([0xABu8; 16]),
+        }
+    }
+
+    #[test]
+    fn reservation_hop_index_matches_hop() {
+        use crate::address::{Asn, EndhostAddr, Isd, IsdAsn};
+        use crate::path::test_builder::TestPathBuilder;
+
+        let src = EndhostAddr::new(IsdAsn::new(Isd(1), Asn(110)), [127, 0, 0, 1].into());
+        let dst = EndhostAddr::new(IsdAsn::new(Isd(1), Asn(112)), [127, 0, 0, 1].into());
+
+        let ctx = TestPathBuilder::new(src.into(), dst.into())
+            .using_info_timestamp(42)
+            .up()
+            .with_asn(110)
+            .add_hop(0, 1)
+            .with_asn(111)
+            .add_hop(1, 0)
+            .down()
+            .with_asn(111)
+            .add_hop(0, 2)
+            .with_asn(112)
+            .add_hop(1, 0)
+            .build(1000);
+
+        let path = ctx.path();
+
+        let asn = |n: u64| IsdAsn::new(Isd(1), Asn(n));
+
+        // Matches the transit hop: (1, asn(111), 1, 2).
+        let reservation = reservation_for(asn(111), 1, 2);
+        assert_eq!(path.reservation_hop_index(&reservation), Some(1));
+
+        // Matches the last hop: (3, asn(112), 1, 0).
+        let reservation = reservation_for(asn(112), 1, 0);
+        assert_eq!(path.reservation_hop_index(&reservation), Some(3));
+    }
+
+    #[test]
+    fn reservation_hop_index_no_match() {
+        use crate::address::{Asn, EndhostAddr, Isd, IsdAsn};
+        use crate::path::test_builder::TestPathBuilder;
+
+        let src = EndhostAddr::new(IsdAsn::new(Isd(1), Asn(110)), [127, 0, 0, 1].into());
+        let dst = EndhostAddr::new(IsdAsn::new(Isd(1), Asn(112)), [127, 0, 0, 1].into());
+
+        let ctx = TestPathBuilder::new(src.into(), dst.into())
+            .using_info_timestamp(42)
+            .up()
+            .with_asn(110)
+            .add_hop(0, 1)
+            .with_asn(111)
+            .add_hop(1, 0)
+            .down()
+            .with_asn(111)
+            .add_hop(0, 2)
+            .with_asn(112)
+            .add_hop(1, 0)
+            .build(1000);
+
+        let path = ctx.path();
+
+        let asn = |n: u64| IsdAsn::new(Isd(1), Asn(n));
+
+        // Right AS, wrong interfaces.
+        let reservation = reservation_for(asn(111), 9, 9);
+        assert_eq!(path.reservation_hop_index(&reservation), None);
+
+        // AS not on the path at all.
+        let reservation = reservation_for(asn(999), 1, 2);
+        assert_eq!(path.reservation_hop_index(&reservation), None);
     }
 }

@@ -8,9 +8,11 @@ use chrono::{DateTime, Duration, Utc};
 use crate::{
     address::IsdAsn,
     packet::{DecodeError, InadequateBufferSize},
-    path::hummingbird::HbirdAuthKey,
+    path::hummingbird::{HbirdAuthKey, calculate_flyover_mac},
     wire_encoding::{WireDecode, WireEncode},
 };
+
+pub const MAX_FRESHNESS_TOLERANCE: i64 = 5;
 
 /// Bandwidth for Hummingbird reservations.  
 #[derive(Clone, PartialEq, Eq, Hash, Copy, Debug, Default)]
@@ -159,6 +161,13 @@ impl ReservationInfo {
         Utc::now() >= self.end()
     }
 
+    /// Returns whether the reservation is valid right now, i.e. its validity
+    /// window has started but not yet passed.
+    pub fn is_valid_now(&self) -> bool {
+        let now = Utc::now();
+        self.start <= now && now < self.end()
+    }
+
     /// Returns the encoding of the reservation start time according to the
     /// Hummingbird specification.
     pub fn encode_start(&self) -> u32 {
@@ -169,6 +178,16 @@ impl ReservationInfo {
     /// Hummingbird specification
     pub fn decode_start(value: u32) -> DateTime<Utc> {
         DateTime::from_timestamp(value as i64, 0).unwrap()
+    }
+
+    /// Computes `ResStartOffset`: the number of whole seconds between this
+    /// reservation's start and `base_timestamp` (a path meta header's base
+    /// timestamp — a Unix timestamp with 1-second granularity).
+    ///
+    /// Returns `None` if `base_timestamp` is before the reservation's start, or
+    /// if the offset does not fit in the 16-bit wire encoding.
+    pub fn res_start_offset(&self, base_timestamp: u32) -> Option<u16> {
+        u16::try_from(i64::from(base_timestamp) - self.start.timestamp()).ok()
     }
 }
 
@@ -269,6 +288,55 @@ impl Reservation {
     pub fn is_expired(&self) -> bool {
         self.info.is_expired()
     }
+
+    /// Returns whether the reservation is valid right now, i.e. its validity
+    /// window has started but not yet passed.
+    pub fn is_valid_now(&self) -> bool {
+        self.info.is_valid_now()
+    }
+
+    /// Generates the flyover MAC for this reservation, for a packet of length
+    /// `pkt_len` bound for `destination`, sent at `timestamp`.
+    ///
+    /// `counter` defaults to `0` when `None`.
+    ///
+    /// Note: this computes only the flyover MAC, not the aggregated MAC — the
+    /// caller must XOR it with the underlying standard hop field's MAC.
+    ///
+    /// Returns `None` if `timestamp` is before this reservation's start, or if
+    /// the resulting start offset does not fit in the wire encoding.
+    pub fn generate_flyover_mac(
+        &self,
+        destination: IsdAsn,
+        pkt_len: u16,
+        timestamp: DateTime<Utc>,
+        counter: Option<u32>,
+    ) -> Option<FlyoverMAC> {
+        let base_timestamp = u32::try_from(timestamp.timestamp()).ok()?;
+        let res_start_offset = self.info.res_start_offset(base_timestamp)?;
+        let millis_timestamp = timestamp.timestamp_subsec_millis() as u16;
+        let counter = counter.unwrap_or(0);
+
+        let mac = calculate_flyover_mac(
+            destination.isd(),
+            destination.asn(),
+            pkt_len,
+            res_start_offset,
+            millis_timestamp,
+            counter,
+            &self.reservation_key,
+        );
+
+        Some(FlyoverMAC {
+            mac,
+            reservation_info: self.info.clone(),
+            dst_isd_asn: destination,
+            base_timestamp,
+            millis_timestamp,
+            counter,
+            packet_length: pkt_len,
+        })
+    }
 }
 
 impl WireEncode for Reservation {
@@ -297,6 +365,64 @@ impl WireDecode<Bytes> for Reservation {
             info,
             reservation_key,
         })
+    }
+}
+
+/// A pre-computed flyover MAC.
+///
+/// Can be used to turn a matching standard hop into a flyover hop.
+pub struct FlyoverMAC {
+    /// The actual flyover MAC.
+    pub mac: [u8; 6],
+    /// The details of the reservation corresponding to this MAC.
+    pub reservation_info: ReservationInfo,
+    /// The ISD-ASN to send packets to when using this MAC.
+    pub dst_isd_asn: IsdAsn,
+    /// The path meta header base timestamp used when calculating the MAC: a
+    /// Unix timestamp with 1-second granularity.
+    pub base_timestamp: u32,
+    /// The millis timestamp used when calculating the MAC.
+    pub millis_timestamp: u16,
+    /// The counter value used when calculating the MAC.
+    pub counter: u32,
+    /// The packet length used when calculating the MAC.
+    pub packet_length: u16,
+}
+
+impl FlyoverMAC {
+    pub fn packet_timestamp(&self) -> DateTime<Utc> {
+        ReservationInfo::decode_start(self.base_timestamp)
+            + Duration::milliseconds(i64::from(self.millis_timestamp))
+    }
+
+    /// Returns when the flyover MAC becomes valid, i.e., if a packet using this  
+    /// MAC arrives at this point in time it should be valid (but not before
+    /// then).
+    /// If the flyover MAC is never vaild, returns the end time of the
+    /// reservation.
+    pub fn valid_from(&self) -> DateTime<Utc> {
+        self.packet_timestamp().min(self.reservation_info.end())
+    }
+
+    /// Returns until when the flyover MAC is valid, i.e., the last point in time
+    /// at which the packet can arrive at the border router such that the border
+    /// router forwards the packet with priority.
+    pub fn valid_until(&self) -> DateTime<Utc> {
+        self.reservation_info
+            .end()
+            .min(self.packet_timestamp() + Duration::seconds(MAX_FRESHNESS_TOLERANCE))
+    }
+
+    /// Returns whether this flyover MAC's validity window has passed.
+    pub fn is_expired(&self) -> bool {
+        Utc::now() >= self.valid_until()
+    }
+
+    /// Returns whether the flyover MAC is valid right now, i.e. its validity
+    /// window has started but not yet passed.
+    pub fn is_valid_now(&self) -> bool {
+        let now = Utc::now();
+        self.valid_from() <= now && self.valid_until() >= now
     }
 }
 

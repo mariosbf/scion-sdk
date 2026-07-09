@@ -14,7 +14,7 @@
 // limitations under the License.
 //! Standard SCION path.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use bytes::{Buf as _, BufMut, Bytes};
 use chrono::{DateTime, Utc};
@@ -468,17 +468,9 @@ impl StandardHopField {
         destination: IsdAsn,
         pkt_len: u16,
     ) -> Result<FlyoverHopField, HummingbirdPathError> {
-        let base_timestamp: SystemTime = meta_header.base_timestamp.into();
-        // Truncate start to whole seconds: the protocol encodes res_start_offset as an integer,
-        // and HummingbirdBaseTimestamp has 1-second precision. Sub-second nanoseconds in
-        // reservation.info.start would cause duration_since to truncate incorrectly.
-        let start_secs =
-            SystemTime::UNIX_EPOCH + Duration::from_secs(reservation.info.start.timestamp() as u64);
-        let res_start_offset = base_timestamp
-            .duration_since(start_secs)
-            .ok()
-            .map(|d| d.as_secs())
-            .and_then(|d| u16::try_from(d).ok())
+        let res_start_offset = reservation
+            .info
+            .res_start_offset(meta_header.base_timestamp())
             .ok_or(HummingbirdPathError::ReservationNotValid)?;
 
         let flyover_mac = calculate_flyover_mac(
@@ -504,6 +496,34 @@ impl StandardHopField {
             res_bw: reservation.info.bandwidth,
             res_start_offset,
             res_duration: reservation.info.duration,
+        })
+    }
+
+    /// Turns this into a [`FlyoverHopField`] by applying a precomputed flyover
+    /// MAC (see [`crate::hummingbird::Reservation::generate_flyover_mac`]).
+    pub fn apply_flyover_mac(
+        &self,
+        flyover_mac: &crate::hummingbird::FlyoverMAC,
+    ) -> Result<FlyoverHopField, HummingbirdPathError> {
+        let res_start_offset = flyover_mac
+            .reservation_info
+            .res_start_offset(flyover_mac.base_timestamp)
+            .ok_or(HummingbirdPathError::ReservationNotValid)?;
+
+        let mut mac = self.mac;
+        xor_in_place(&mut mac, &flyover_mac.mac);
+
+        Ok(FlyoverHopField {
+            ingress_router_alert: self.ingress_router_alert,
+            egress_router_alert: self.egress_router_alert,
+            exp_time: self.exp_time,
+            cons_ingress: self.cons_ingress,
+            cons_egress: self.cons_egress,
+            aggregated_mac: mac,
+            res_id: flyover_mac.reservation_info.res_id,
+            res_bw: flyover_mac.reservation_info.bandwidth,
+            res_start_offset,
+            res_duration: flyover_mac.reservation_info.duration,
         })
     }
 }
