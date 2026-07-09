@@ -485,6 +485,11 @@ pub enum HummingbirdPathError {
     #[error("Invalid milliseconds timestamp")]
     InvalidMillisTimestamp(u32),
 
+    /// Invalid Hummingbird counter, i.e. the counter value does not fit in
+    /// the meta header's counter field.
+    #[error("invalid counter")]
+    InvalidCounter(u32),
+
     /// Payload to long.
     #[error("Payload too long")]
     PayloadTooLong,

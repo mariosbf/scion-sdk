@@ -12,6 +12,9 @@ pub use path::*;
 pub mod crypto;
 pub use crypto::*;
 
+pub mod flyover_mac_path;
+pub use flyover_mac_path::*;
+
 pub(super) mod token_bucket;
 
 /// Tracks per-flow Hummingbird reservations and enforces bandwidth limits.
