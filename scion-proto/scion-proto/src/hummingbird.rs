@@ -12,6 +12,8 @@ use crate::{
     wire_encoding::{WireDecode, WireEncode},
 };
 
+/// Maximum allowed clock skew, in seconds, when checking reservation/MAC
+/// freshness against the current time.
 pub const MAX_FRESHNESS_TOLERANCE: i64 = 5;
 
 /// Bandwidth for Hummingbird reservations.  
@@ -260,6 +262,7 @@ impl WireDecode<Bytes> for ReservationInfo {
 ///
 /// Wire format:
 ///
+/// ```text
 ///  0                   1                   2                   3
 ///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -283,6 +286,7 @@ impl WireDecode<Bytes> for ReservationInfo {
 /// +                                                               +
 /// |                                                               |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reservation {
     /// Information about the reservation.
@@ -402,6 +406,8 @@ pub struct FlyoverMAC {
 }
 
 impl FlyoverMAC {
+    /// Returns the timestamp encoded by this flyover MAC's `base_timestamp`
+    /// and `millis_timestamp`.
     pub fn packet_timestamp(&self) -> DateTime<Utc> {
         ReservationInfo::decode_start(self.base_timestamp)
             + Duration::milliseconds(i64::from(self.millis_timestamp))
