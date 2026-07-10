@@ -491,4 +491,115 @@ mod tests {
         provider.remove_expired();
         assert_eq!(provider.candidates.len(), 0);
     }
+
+    #[test]
+    fn end_to_end_generate_and_apply_flyover_macs_with_real_hop_macs() {
+        use crate::{
+            hummingbird::{Bandwidth, Reservation, ReservationInfo},
+            packet::CommonHeader,
+            path::hummingbird::calculate_flyover_mac,
+        };
+        use chrono::DateTime;
+
+        let src = EndhostAddr::new(IsdAsn::new(Isd(1), Asn(110)), [127, 0, 0, 1].into());
+        let dst = EndhostAddr::new(IsdAsn::new(Isd(1), Asn(112)), [127, 0, 0, 1].into());
+
+        let ctx = TestPathBuilder::new(src.into(), dst.into())
+            .using_info_timestamp(42)
+            .up()
+            .with_asn(110)
+            .add_hop(0, 1)
+            .with_asn(111)
+            .add_hop(1, 0)
+            .down()
+            .with_asn(111)
+            .add_hop(0, 2)
+            .with_asn(112)
+            .add_hop(1, 0)
+            .build(1000);
+
+        let path = ctx.path();
+        let isd_asn = path.isd_asn;
+
+        let reservation = Reservation {
+            info: ReservationInfo {
+                isd_as: IsdAsn::new(Isd(1), Asn(111)),
+                ingress_interface: 1,
+                egress_interface: 2,
+                res_id: 7,
+                bandwidth: Bandwidth::from_kbps(512).unwrap(),
+                start: DateTime::from_timestamp(Utc::now().timestamp() - 10, 0).unwrap(),
+                duration: 600,
+            },
+            reservation_key: [0x42u8; 16].into(),
+        };
+
+        let hop_idx = path.reservation_hop_index(&reservation).unwrap();
+        assert_eq!(hop_idx, 1, "sanity check: transit hop at flat index 1");
+
+        let mut hbird = path.to_hbird().unwrap();
+        hbird.add_reservation(hop_idx, reservation.clone()).unwrap();
+
+        let destination = isd_asn.destination;
+        let address_header_len = 8u16;
+        let payload_len = 50u16;
+        // path_header_len with one flyover among four standard hops:
+        // 12 (meta) + 2×8 (info) + 3×12 (standard) + 20 (flyover) = 84 bytes.
+        let path_header_len = 84u16;
+        let packet_length =
+            CommonHeader::LENGTH as u16 + address_header_len + path_header_len + payload_len;
+
+        let macs = hbird
+            .generate_flyover_macs(destination, packet_length, address_header_len)
+            .unwrap();
+        assert_eq!(macs.entries.len(), 1);
+        assert_eq!(macs.entries[0].hop_index, hop_idx);
+        assert_eq!(macs.payload_length_suggestion, payload_len);
+
+        let mut provider = FlyoverMACHbirdPath::new(path.clone());
+        provider.push(macs);
+
+        let built = provider
+            .build(isd_asn, payload_len, address_header_len)
+            .unwrap();
+        let DataPlanePath::Hummingbird(encoded) = &built.data_plane_path else {
+            panic!("expected a Hummingbird path");
+        };
+
+        assert_eq!(encoded.flyover_hop_fields().count(), 1);
+        let flyover = encoded.flyover_hop_fields().next().unwrap();
+        assert_eq!(flyover.reservation_id(), 7);
+        assert_eq!(flyover.bandwidth(), Bandwidth::from_kbps(512).unwrap());
+
+        // The flyover's aggregated MAC must equal the original standard
+        // hop's MAC XORed with a freshly computed flyover MAC, using the
+        // same reservation key, timing, and packet length that
+        // generate_flyover_macs used internally.
+        let DataPlanePath::Standard(original) = &path.data_plane_path else {
+            panic!("expected a Standard path");
+        };
+        let original_mac: [u8; 6] = original.hop_fields().nth(hop_idx as usize).unwrap().as_ref()
+            [6..12]
+            .try_into()
+            .unwrap();
+
+        let base_timestamp = encoded.meta_header().base_timestamp.get();
+        let res_start_offset = reservation.info.res_start_offset(base_timestamp).unwrap();
+        let raw_flyover_mac = calculate_flyover_mac(
+            destination.isd(),
+            destination.asn(),
+            packet_length,
+            res_start_offset,
+            encoded.meta_header().millis_timestamp.get(),
+            encoded.meta_header().counter.get(),
+            &reservation.reservation_key,
+        );
+
+        let mut expected_mac = original_mac;
+        for (a, b) in expected_mac.iter_mut().zip(raw_flyover_mac.iter()) {
+            *a ^= b;
+        }
+
+        assert_eq!(&flyover.as_ref()[6..12], &expected_mac);
+    }
 }
