@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 
 use crate::{
     address::IsdAsn,
-    hummingbird::{FlyoverMACEntry, FlyoverMACs, Reservation},
+    hummingbird::{FlyoverMACs, Reservation},
     packet::{
         ByEndpoint, CommonHeader, DecodeError, InadequateBufferSize, NonEncodeError,
         NonScmpEncodeError,
@@ -23,6 +23,9 @@ use crate::{
             HummingbirdHopField, HummingbirdHopFields, HummingbirdHopfieldIndex,
             HummingbirdInfoFieldIndex, HummingbirdMetaHeader, HummingbirdMetaReserved,
             HummingbirdMillisTimestamp, HummingbirdSegmentLength,
+            flyover_mac_path::{
+                generate_flyover_macs_from_reservations, packet_length_for_payload_with_flyovers,
+            },
             reservation_tracker::{ReservationTracker, ReservationTrackerError},
         },
         metadata::{Metadata, PathInterface},
@@ -813,6 +816,24 @@ impl HummingbirdPath {
         self.path_header_len(&hops)
     }
 
+    /// The length of the path header without applying any reservations,
+    /// assuming a regular (non-Hummingbird) meta header and only standard
+    /// hop fields — i.e. the length this path would have as a plain SCION
+    /// path.
+    ///
+    /// Used as the shared baseline for [`Self::generate_flyover_macs`] and
+    /// [`Self::packet_length_for_payload`], which each add the Hummingbird
+    /// meta header delta and any flyover deltas on top (see
+    /// `path_header_len_with_flyovers`).
+    pub fn base_encoded_length(&self) -> usize {
+        MetaHeader::LENGTH
+            + self.info_fields_len()
+            + self
+                .hops()
+                .map(|hop| hop.hop_field.encoded_length())
+                .sum::<usize>()
+    }
+
     fn info_fields_len(&self) -> usize {
         self.info_fields
             .iter()
@@ -901,10 +922,6 @@ impl HummingbirdPath {
     /// info fields + hop fields) that would result from encoding `hops`,
     /// where a hop paired with `Some` reservation becomes a flyover hop
     /// field and one paired with `None` stays a standard hop field.
-    ///
-    /// Shared by [`Self::apply_reservations`], [`Self::encoded_length`], and
-    /// `generate_flyover_macs` so the packet-length formula can't drift
-    /// between them.
     fn path_header_len(&self, hops: &[(usize, usize, Option<Reservation>)]) -> usize {
         let flyover_count = hops.iter().filter(|(_, _, res)| res.is_some()).count();
 
@@ -1036,14 +1053,55 @@ impl HummingbirdPath {
         Ok((meta_header, hop_fields))
     }
 
+    /// Computes the total packet length that would result from combining
+    /// `payload_len` bytes of payload with this path's header (given
+    /// `address_header_len`) — the inverse of
+    /// [`crate::hummingbird::FlyoverMACs::payload_length_suggestion`]. Feed
+    /// the result into [`Self::generate_flyover_macs`] as `packet_length`
+    /// when starting from a known payload size.
+    ///
+    /// Note that the term payload is used from the perspective of the SCION
+    /// header, i.e., everything encapsulated inside the SCION header is
+    /// considered payload.
+    pub fn packet_length_for_payload(
+        &self,
+        payload_len: u16,
+        address_header_len: u16,
+    ) -> Result<u16, HummingbirdPathError> {
+        let max_path_header_len = HummingbirdMetaHeader::LENGTH
+            + self.info_fields_len()
+            + self.num_hopfields() * FlyoverHopField::ENCODED_SIZE;
+        let estimated_pkt_len = max_path_header_len
+            + CommonHeader::LENGTH
+            + address_header_len as usize
+            + payload_len as usize;
+
+        let mut tracker_guard = self.reservation_tracker.as_ref().map(|t| t.lock().unwrap());
+        let hops = self.hops_with_reservation(
+            estimated_pkt_len,
+            tracker_guard.as_deref_mut(),
+            self.strict_reservation,
+        )?;
+
+        let flyover_count = hops.iter().filter(|(_, _, res)| res.is_some()).count();
+        let base_path_header_len = self.base_encoded_length();
+
+        packet_length_for_payload_with_flyovers(
+            payload_len,
+            address_header_len,
+            base_path_header_len,
+            flyover_count,
+        )
+    }
+
     /// Generates a compact, transmittable set of flyover MACs for the
     /// reservations already attached to this path (see
     /// [`Self::add_reservation`]/[`Self::try_add_reservation`]), targeting a
     /// total packet of `packet_length` bytes.
     ///
-    /// `packet_length` is a fixed input (e.g. the path MTU) rather than
-    /// something derived from a known payload length: the resulting MACs are
-    /// only valid for a packet of exactly this length.
+    /// The resulting MACs are only valid for a packet of exactly this length. Use
+    /// [`Self::packet_length_for_payload`] first if you have a target payload
+    /// length.
     ///
     /// Parameters:
     /// - `destination`: destination ISD-AS, used for the flyover MAC
@@ -1054,9 +1112,6 @@ impl HummingbirdPath {
     ///   resulting MACs are only valid for a packet of exactly this length.
     /// - `address_header_len`: not used by the MAC calculation itself —
     ///   needed solely to derive [`crate::hummingbird::FlyoverMACs::payload_length_suggestion`],
-    ///   since that's the only way to tell the caller how much of
-    ///   `packet_length` remains for payload once the common, address, and
-    ///   path headers are accounted for.
     pub fn generate_flyover_macs(
         &self,
         destination: IsdAsn,
@@ -1071,46 +1126,20 @@ impl HummingbirdPath {
             self.strict_reservation,
         )?;
 
-        let path_header_len = self.path_header_len(&hops);
-
-        let payload_length_suggestion = (packet_length as usize)
-            .checked_sub(CommonHeader::LENGTH)
-            .and_then(|v| v.checked_sub(address_header_len as usize))
-            .and_then(|v| v.checked_sub(path_header_len))
-            .and_then(|v| u16::try_from(v).ok())
-            .ok_or(HummingbirdPathError::PayloadTooLong)?;
-
-        let now = Utc::now();
-
-        let entries = hops
+        let base_path_header_len = self.base_encoded_length();
+        let reservations = hops
             .iter()
             .enumerate()
-            .filter(|(_, (_, _, res))| res.is_some())
-            .map(|(flat_idx, (_, _, res))| {
-                let reservation = res.as_ref().expect("filtered to Some above");
-                let flyover_mac = reservation
-                    .generate_flyover_mac(
-                        destination,
-                        packet_length,
-                        now,
-                        Some(self.path_meta.counter()),
-                    )
-                    .ok_or(HummingbirdPathError::ReservationNotValid)?;
-                let res_start_offset = flyover_mac
-                    .reservation_info
-                    .res_start_offset(flyover_mac.base_timestamp)
-                    .ok_or(HummingbirdPathError::ReservationNotValid)?;
+            .filter_map(|(flat_idx, (_, _, res))| res.as_ref().map(|r| (flat_idx as u8, r)));
 
-                Ok(FlyoverMACEntry {
-                    mac: flyover_mac.mac,
-                    res_id: reservation.info.res_id,
-                    bandwidth: reservation.info.bandwidth,
-                    res_start_offset,
-                    res_duration: reservation.info.duration,
-                    hop_index: flat_idx as u8,
-                })
-            })
-            .collect::<Result<Vec<_>, HummingbirdPathError>>()?;
+        let macs = generate_flyover_macs_from_reservations(
+            destination,
+            packet_length,
+            address_header_len,
+            base_path_header_len,
+            self.path_meta.counter(),
+            reservations,
+        )?;
 
         // Deduct bandwidth from the selected buckets, mirroring apply_reservations:
         // generating MACs for a packet commits to sending it.
@@ -1122,19 +1151,7 @@ impl HummingbirdPath {
             }
         }
 
-        let base_timestamp = u32::try_from(now.timestamp())
-            .map_err(|_| HummingbirdPathError::InvalidBaseTimestamp(now.timestamp()))?;
-        let millis_timestamp = now.timestamp_subsec_millis() as u16;
-
-        Ok(FlyoverMACs {
-            dst_isd_asn: destination,
-            base_timestamp,
-            millis_timestamp,
-            counter: self.path_meta.counter(),
-            packet_length,
-            payload_length_suggestion,
-            entries,
-        })
+        Ok(macs)
     }
 
     /// Encode the path to a byte buffer, applying any reservations that have been added to

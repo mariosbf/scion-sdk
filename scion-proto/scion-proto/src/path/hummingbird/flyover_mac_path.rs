@@ -2,11 +2,11 @@
 //! path, without needing per-hop metadata or a reservation key.
 
 use bytes::{Bytes, BytesMut};
-use chrono::Duration;
+use chrono::{Duration, Utc};
 
 use crate::{
     address::IsdAsn,
-    hummingbird::{FlyoverMAC, FlyoverMACEntry, FlyoverMACs, ReservationInfo},
+    hummingbird::{FlyoverMAC, FlyoverMACEntry, FlyoverMACs, Reservation, ReservationInfo},
     packet::{ByEndpoint, CommonHeader, DecodeError},
     path::{
         DataPlanePath, MetaHeader, Path, PathProvider, StandardHopField, StandardPath,
@@ -78,8 +78,7 @@ pub fn apply_flyover_macs(
 
             let hop_field = if let Some(entry) = entry {
                 if hop_offset < orig_current_hop_field_offset {
-                    curr_hf_index +=
-                        FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE;
+                    curr_hf_index += FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE;
                 }
 
                 let flyover_mac = FlyoverMAC {
@@ -146,6 +145,115 @@ pub fn apply_flyover_macs(
     })
 }
 
+/// Builds a [`FlyoverMACs`] batch from precomputed `(hop_index, reservation)`
+/// pairs — the generate-side counterpart to [`apply_flyover_macs`].
+///
+/// `base_path_header_len` is the encoded length (meta header + info fields +
+/// hop fields) this path's header would have as a plain SCION path — regular
+/// meta header, every hop a standard hop field — i.e.
+/// `HummingbirdPath::base_encoded_length()`. From it, this function derives
+/// [`FlyoverMACs::payload_length_suggestion`] by adding the Hummingbird meta
+/// header delta and the per-flyover size delta for each of `reservations`
+/// (via [`path_header_len_with_flyovers`]) and subtracting from
+/// `packet_length`.
+///
+/// Assumes `reservations` yields at most one entry per `hop_index` — passing
+/// duplicates would overcount the flyover delta and produce a wrong
+/// `payload_length_suggestion`.
+///
+/// Returns [`HummingbirdPathError::PayloadTooLong`] if `packet_length` is too
+/// small to fit the common header, `address_header_len`, and the resulting
+/// path header. Returns [`HummingbirdPathError::ReservationNotValid`] if a
+/// reservation's flyover MAC can't be generated right now (not yet started,
+/// or the resulting start offset doesn't fit the wire encoding), or
+/// [`HummingbirdPathError::InvalidBaseTimestamp`] if the current time doesn't
+/// fit a `u32` Unix timestamp.
+pub fn generate_flyover_macs_from_reservations<'a>(
+    destination: IsdAsn,
+    packet_length: u16,
+    address_header_len: u16,
+    base_path_header_len: usize,
+    counter: u32,
+    reservations: impl IntoIterator<Item = (u8, &'a Reservation)>,
+) -> Result<FlyoverMACs, HummingbirdPathError> {
+    let now = Utc::now();
+
+    let entries = reservations
+        .into_iter()
+        .map(|(hop_index, reservation)| {
+            let flyover_mac = reservation
+                .generate_flyover_mac(destination, packet_length, now, Some(counter))
+                .ok_or(HummingbirdPathError::ReservationNotValid)?;
+            let res_start_offset = flyover_mac
+                .reservation_info
+                .res_start_offset(flyover_mac.base_timestamp)
+                .ok_or(HummingbirdPathError::ReservationNotValid)?;
+
+            Ok(FlyoverMACEntry {
+                mac: flyover_mac.mac,
+                res_id: reservation.info.res_id,
+                bandwidth: reservation.info.bandwidth,
+                res_start_offset,
+                res_duration: reservation.info.duration,
+                hop_index,
+            })
+        })
+        .collect::<Result<Vec<_>, HummingbirdPathError>>()?;
+
+    let path_header_len = path_header_len_with_flyovers(base_path_header_len, entries.len());
+
+    let payload_length_suggestion = (packet_length as usize)
+        .checked_sub(CommonHeader::LENGTH)
+        .and_then(|v| v.checked_sub(address_header_len as usize))
+        .and_then(|v| v.checked_sub(path_header_len))
+        .and_then(|v| u16::try_from(v).ok())
+        .ok_or(HummingbirdPathError::PayloadTooLong)?;
+
+    let base_timestamp = u32::try_from(now.timestamp())
+        .map_err(|_| HummingbirdPathError::InvalidBaseTimestamp(now.timestamp()))?;
+    let millis_timestamp = now.timestamp_subsec_millis() as u16;
+
+    Ok(FlyoverMACs {
+        dst_isd_asn: destination,
+        base_timestamp,
+        millis_timestamp,
+        counter,
+        packet_length,
+        payload_length_suggestion,
+        entries,
+    })
+}
+
+/// Path header length once `flyover_count` of its hops become flyover hop
+/// fields, given `base_path_header_len` (the length of the path header as a
+/// plain SCION path — regular meta header and every hop is standard).
+fn path_header_len_with_flyovers(base_path_header_len: usize, flyover_count: usize) -> usize {
+    base_path_header_len
+        + (HummingbirdMetaHeader::LENGTH - MetaHeader::LENGTH)
+        + flyover_count * (FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE)
+}
+
+/// Computes the total packet length that would result from combining
+/// `payload_len` bytes of payload with a path header, given
+/// `address_header_len`, `base_path_header_len` (see
+/// [`generate_flyover_macs_from_reservations`]), and `flyover_count` (how
+/// many hops will be turned into flyovers). The inverse of the
+/// `packet_length` → `payload_length_suggestion` derivation in
+/// [`generate_flyover_macs_from_reservations`].
+pub fn packet_length_for_payload_with_flyovers(
+    payload_len: u16,
+    address_header_len: u16,
+    base_path_header_len: usize,
+    flyover_count: usize,
+) -> Result<u16, HummingbirdPathError> {
+    let path_header_len = path_header_len_with_flyovers(base_path_header_len, flyover_count);
+
+    u16::try_from(
+        CommonHeader::LENGTH + address_header_len as usize + path_header_len + payload_len as usize,
+    )
+    .map_err(|_| HummingbirdPathError::PayloadTooLong)
+}
+
 /// Returns the number of *distinct* hops `entries` will turn into flyovers
 /// when applied via [`apply_flyover_macs`].
 ///
@@ -180,10 +288,10 @@ pub struct FlyoverMACHbirdPath {
 impl FlyoverMACHbirdPath {
     /// Creates a new `FlyoverMACHbirdPath` wrapping `path`, with no
     /// candidates yet.
-    pub fn new(path: Path<Bytes>) -> Self {
+    pub fn new(path: Path<Bytes>, flyover_mac_batches: Vec<FlyoverMACs>) -> Self {
         Self {
             path,
-            candidates: Vec::new(),
+            candidates: flyover_mac_batches,
         }
     }
 
@@ -247,10 +355,7 @@ impl PathProvider for FlyoverMACHbirdPath {
             return Ok(self.path.to_bytes_path());
         };
 
-        let base_length = CommonHeader::LENGTH
-            + address_header_len as usize
-            + self.path.data_plane_path.raw().len()
-            + payload_len as usize;
+        let base_length = CommonHeader::LENGTH + address_header_len as usize + payload_len as usize;
 
         // Candidates keep entries whose reservation window has already
         // lapsed rather than being rejected outright — some flyover benefit
@@ -267,9 +372,10 @@ impl PathProvider for FlyoverMACHbirdPath {
             .filter(|c| c.dst_isd_asn == isd_asn.destination && !c.all_expired())
             .filter(|c| {
                 let projected = base_length
-                    + (HummingbirdMetaHeader::LENGTH - MetaHeader::LENGTH)
-                    + flyover_hop_count(&c.entries)
-                        * (FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE);
+                    + path_header_len_with_flyovers(
+                        self.path.data_plane_path.raw().len(),
+                        flyover_hop_count(&c.entries),
+                    );
                 u16::try_from(projected) == Ok(c.packet_length)
             })
             .max_by_key(|c| {
@@ -374,8 +480,10 @@ mod tests {
             12 /* CommonHeader */ + address_header_len as usize + 36 + payload_len as usize;
         let packet_length = (base_length + (12 - 4) + (20 - 12)) as u16;
 
-        let mut provider = FlyoverMACHbirdPath::new(path);
-        provider.push(fresh_candidate(isd_asn.destination, packet_length, 0));
+        let provider = FlyoverMACHbirdPath::new(
+            path,
+            vec![fresh_candidate(isd_asn.destination, packet_length, 0)],
+        );
 
         let built = provider
             .build(isd_asn, payload_len, address_header_len)
@@ -391,9 +499,9 @@ mod tests {
         let path = build_two_hop_path();
         let isd_asn = path.isd_asn;
 
-        let mut provider = FlyoverMACHbirdPath::new(path);
+        let provider =
+            FlyoverMACHbirdPath::new(path, vec![fresh_candidate(isd_asn.destination, 1, 0)]);
         // Wrong packet_length -> arithmetic filter rejects this candidate.
-        provider.push(fresh_candidate(isd_asn.destination, 1, 0));
 
         let built = provider.build(isd_asn, 50, 8).unwrap();
         assert!(matches!(built.data_plane_path, DataPlanePath::Standard(_)));
@@ -409,8 +517,7 @@ mod tests {
         expired.entries[0].res_start_offset = 0;
         expired.entries[0].res_duration = 1;
 
-        let mut provider = FlyoverMACHbirdPath::new(path);
-        provider.push(expired);
+        let provider = FlyoverMACHbirdPath::new(path, vec![expired]);
 
         let built = provider.build(isd_asn, 50, 8).unwrap();
         assert!(matches!(built.data_plane_path, DataPlanePath::Standard(_)));
@@ -430,8 +537,13 @@ mod tests {
         // Two flyovers applied: +8 (meta header delta) + 2×8 (flyover delta).
         let packet_length = (base_length + (12 - 4) + 2 * (20 - 12)) as u16;
 
-        let mut provider = FlyoverMACHbirdPath::new(path);
-        provider.push(partially_expired_candidate(isd_asn.destination, packet_length));
+        let provider = FlyoverMACHbirdPath::new(
+            path,
+            vec![partially_expired_candidate(
+                isd_asn.destination,
+                packet_length,
+            )],
+        );
 
         let built = provider
             .build(isd_asn, payload_len, address_header_len)
@@ -462,8 +574,7 @@ mod tests {
         duplicate.res_id = 99;
         candidate.entries.push(duplicate);
 
-        let mut provider = FlyoverMACHbirdPath::new(path);
-        provider.push(candidate);
+        let provider = FlyoverMACHbirdPath::new(path, vec![candidate]);
 
         let built = provider
             .build(isd_asn, payload_len, address_header_len)
@@ -484,8 +595,7 @@ mod tests {
         expired.entries[0].res_start_offset = 0;
         expired.entries[0].res_duration = 1;
 
-        let mut provider = FlyoverMACHbirdPath::new(path);
-        provider.push(expired);
+        let mut provider = FlyoverMACHbirdPath::new(path, vec![expired]);
         assert_eq!(provider.candidates.len(), 1);
 
         provider.remove_expired();
@@ -494,12 +604,13 @@ mod tests {
 
     #[test]
     fn end_to_end_generate_and_apply_flyover_macs_with_real_hop_macs() {
+        use chrono::DateTime;
+
         use crate::{
             hummingbird::{Bandwidth, Reservation, ReservationInfo},
             packet::CommonHeader,
             path::hummingbird::calculate_flyover_mac,
         };
-        use chrono::DateTime;
 
         let src = EndhostAddr::new(IsdAsn::new(Isd(1), Asn(110)), [127, 0, 0, 1].into());
         let dst = EndhostAddr::new(IsdAsn::new(Isd(1), Asn(112)), [127, 0, 0, 1].into());
@@ -556,8 +667,7 @@ mod tests {
         assert_eq!(macs.entries[0].hop_index, hop_idx);
         assert_eq!(macs.payload_length_suggestion, payload_len);
 
-        let mut provider = FlyoverMACHbirdPath::new(path.clone());
-        provider.push(macs);
+        let provider = FlyoverMACHbirdPath::new(path.clone(), vec![macs]);
 
         let built = provider
             .build(isd_asn, payload_len, address_header_len)
@@ -578,8 +688,11 @@ mod tests {
         let DataPlanePath::Standard(original) = &path.data_plane_path else {
             panic!("expected a Standard path");
         };
-        let original_mac: [u8; 6] = original.hop_fields().nth(hop_idx as usize).unwrap().as_ref()
-            [6..12]
+        let original_mac: [u8; 6] = original
+            .hop_fields()
+            .nth(hop_idx as usize)
+            .unwrap()
+            .as_ref()[6..12]
             .try_into()
             .unwrap();
 
