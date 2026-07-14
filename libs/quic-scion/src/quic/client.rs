@@ -37,6 +37,8 @@ pub struct QuicConnection {
     pub conn: Arc<Mutex<squiche::Connection>>,
     /// Waker for connection events.
     pub tx_notifier: Arc<tokio::sync::Notify>,
+    /// Notifier fired after each `conn.recv()` so waiters can re-poll for H3 events.
+    pub rx_notifier: Arc<tokio::sync::Notify>,
 }
 
 /// QUIC connection error.
@@ -75,6 +77,7 @@ impl QuicConnection {
             .ok_or(QuicConnectionError::InvalidRemoteAddress)?;
 
         let quic_tx_notifier = Arc::new(tokio::sync::Notify::new());
+        let quic_rx_notifier = Arc::new(tokio::sync::Notify::new());
 
         let conn = squiche::connect(
             server_name.as_deref(),
@@ -91,6 +94,7 @@ impl QuicConnection {
             socket.clone(),
             remote.isd_asn(),
             quic_tx_notifier.clone(),
+            quic_rx_notifier.clone(),
         )
         .await;
         tokio::spawn(driver.run());
@@ -104,6 +108,7 @@ impl QuicConnection {
         Ok(Self {
             conn,
             tx_notifier: quic_tx_notifier,
+            rx_notifier: quic_rx_notifier,
         })
     }
 
@@ -130,13 +135,15 @@ impl QuicConnection {
         buf: &mut [u8],
     ) -> Result<(usize, bool), squiche::Error> {
         loop {
-            let mut conn = self.conn.lock().await;
-
-            match conn.stream_recv(stream_id, buf) {
-                Ok(v) => return Ok(v),
-                Err(squiche::Error::Done) => {}
-                Err(e) => return Err(e),
-            };
+            {
+                let mut conn = self.conn.lock().await;
+                match conn.stream_recv(stream_id, buf) {
+                    Ok(v) => return Ok(v),
+                    Err(squiche::Error::Done) => {}
+                    Err(e) => return Err(e),
+                };
+            }
+            self.rx_notifier.notified().await;
         }
     }
 
@@ -162,6 +169,8 @@ pub struct QuicConnectionDriver {
     remote_isd_as: IsdAsn,
     /// Notifier to hint that there are new packets to send on the socket.
     quic_tx_notifier: Arc<tokio::sync::Notify>,
+    /// Notifier fired after each recv so H3Driver and stream_recv can re-poll.
+    quic_rx_notifier: Arc<tokio::sync::Notify>,
     /// Buffer pool for incoming packets.
     incoming_buf: PooledBuf,
 }
@@ -173,12 +182,14 @@ impl QuicConnectionDriver {
         socket: Arc<dyn GenericScionUdpSocket>,
         remote_isd_as: IsdAsn,
         quic_tx_notifier: Arc<tokio::sync::Notify>,
+        quic_rx_notifier: Arc<tokio::sync::Notify>,
     ) -> Self {
         Self {
             conn,
             socket,
             remote_isd_as,
             quic_tx_notifier,
+            quic_rx_notifier,
             incoming_buf: BufFactory::get_max_buf(),
         }
     }
@@ -284,6 +295,7 @@ impl QuicConnectionDriver {
                             );
                             return
                         }
+                        self.quic_rx_notifier.notify_one();
                     } else {
                         tracing::warn!(?src, "packet with invalid addresses ignored");
                     }

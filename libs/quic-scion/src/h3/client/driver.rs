@@ -185,6 +185,7 @@ impl H3Driver {
     /// Run the event handler loop.
     pub async fn run(mut self) {
         loop {
+            let mut idle = false;
             'poll_loop: loop {
                 let res = {
                     let mut conn = self.h3_conn.quic_conn.conn.lock().await;
@@ -197,7 +198,10 @@ impl H3Driver {
                         tracing::trace!(?stream_id, ?event, "Received H3 event");
                         self.handle_h3_event(stream_id, event).await;
                     }
-                    Err(squiche::h3::Error::Done) => break,
+                    Err(squiche::h3::Error::Done) => {
+                        idle = true;
+                        break;
+                    }
                     Err(err) => {
                         tracing::warn!(?err, "Failed to poll H3 events");
                         break 'poll_loop;
@@ -211,6 +215,10 @@ impl H3Driver {
                     tracing::debug!(stats=?conn.stats(),"Connection closed, shutting down H3 driver");
                     break;
                 }
+            }
+            // Wait for new QUIC data before polling again to avoid busy-looping.
+            if idle {
+                self.h3_conn.quic_conn.rx_notifier.notified().await;
             }
         }
 
