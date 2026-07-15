@@ -640,6 +640,25 @@ impl HummingbirdPath {
         self
     }
 
+    /// Sets the [`ReservationTracker`] on this path.
+    ///
+    /// When set, every call to [`PathProvider::build`] selects a reservation with
+    /// available bandwidth for each hop before encoding, and updates the
+    /// available bandwidth for the chosen reservations.
+    ///
+    /// If `strict` is `true`, encoding fails with
+    /// [`HummingbirdPathError::BandwidthExceeded`] whenever a hop has at least one
+    /// matching reservation but none with sufficient available bandwidth. If
+    /// `strict` is `false`, those hops silently fall back to standard hop fields.
+    pub fn set_reservation_tracker(
+        &mut self,
+        tracker: Arc<Mutex<ReservationTracker>>,
+        strict: bool,
+    ) {
+        self.reservation_tracker = Some(tracker);
+        self.strict_reservation = strict;
+    }
+
     /// Returns the maximum packet size (in bytes) that can be sent such that
     /// every hop with a matching reservation has a reservation that has enough  
     /// available bandwidth to be able to send the packet now.
@@ -1200,12 +1219,15 @@ impl HummingbirdPath {
         payload_len: u16,
         address_header_len: u16,
     ) -> Result<EncodedHummingbirdPath<Bytes>, HummingbirdPathError> {
-        let len = self.encoded_length();
+        let (meta_header, hops) =
+            self.apply_reservations(destination, payload_len, address_header_len)?;
+
+        let len = meta_header.encoded_length()
+            + self.info_fields_len()
+            + hops.iter().map(|hop| hop.encoded_length()).sum::<usize>();
         let mut buffer = vec![0u8; len];
         let mut slice: &mut [u8] = &mut buffer;
 
-        let (meta_header, hops) =
-            self.apply_reservations(destination, payload_len, address_header_len)?;
         meta_header.encode_to(&mut slice)?;
         for info in self.info_fields.iter() {
             info.encode_to(&mut slice)?;
