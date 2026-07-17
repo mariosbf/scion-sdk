@@ -16,7 +16,13 @@ use crate::{
 /// freshness against the current time.
 pub const MAX_FRESHNESS_TOLERANCE: i64 = 5;
 
-/// Bandwidth for Hummingbird reservations.  
+/// Bandwidth for Hummingbird reservations, in bytes per second.
+///
+/// Stored as a 10-bit floating-point encoding (5-bit exponent, 5-bit
+/// significand), matching the data-plane wire format from the Hummingbird
+/// paper. The encoded value travels end-to-end unmodified: it is what the
+/// redemption service derives the authentication key from and what the border
+/// router decodes (as bytes per second) to enforce the bandwidth restriction.
 #[derive(Clone, PartialEq, Eq, Hash, Copy, Debug, Default)]
 pub struct Bandwidth {
     /// Exponent
@@ -39,34 +45,33 @@ impl Bandwidth {
     /// The maximum value of the bandwidth encoding, which is 2^10 - 1 = 1023.
     pub const MASK: u16 = (1 << Self::ENCODED_LENGTH) - 1;
 
-    /// Creates a new Bandwidth from a given bandwidth in kbps. Returns an error
-    /// if the bandwidth is too large to be represented in the 10-bit encoding.
-    /// If the bandwidth cannot be represented in the 10-bit encoding, the
-    /// function will create the closest possible representation that is less than
-    /// the provided bandwidth.
-    pub fn from_kbps(kbps: u64) -> Result<Self, String> {
+    /// Creates a new Bandwidth from a given bandwidth in bytes per second.
+    /// Returns an error if the bandwidth is too large to be represented in the
+    /// 10-bit encoding. If the value is not exactly representable, the closest
+    /// representation that is less than the provided bandwidth is used.
+    pub fn from_bytes_per_sec(bytes_per_sec: u64) -> Result<Self, String> {
         let max_significand = (1 << Self::SIGNIFICAND_BITS) - 1;
         let max_exponent = (1 << Self::EXPONENT_BITS) - 1;
 
         // Special case: exponent = 0
-        if kbps <= max_significand {
+        if bytes_per_sec <= max_significand {
             return Ok(Self {
                 exponent: 0,
-                significand: kbps as u8,
+                significand: bytes_per_sec as u8,
             });
         }
 
-        let exponent = 64 - (kbps.leading_zeros() as usize) - Self::SIGNIFICAND_BITS;
+        let exponent = 64 - (bytes_per_sec.leading_zeros() as usize) - Self::SIGNIFICAND_BITS;
         if exponent > max_exponent {
             return Err(format!(
-                "bandwidth too large, cannot convert to wire format: {} kbps",
-                kbps
+                "bandwidth too large, cannot convert to wire format: {} bytes/s",
+                bytes_per_sec
             ));
         }
 
         // Compute significand: shift right by (exponent - 1), then subtract the
         // implicit prepended '1'.
-        let significand = (kbps >> (exponent - 1)) - (1 << Self::SIGNIFICAND_BITS);
+        let significand = (bytes_per_sec >> (exponent - 1)) - (1 << Self::SIGNIFICAND_BITS);
 
         Ok(Self {
             exponent: exponent as u8,
@@ -74,8 +79,8 @@ impl Bandwidth {
         })
     }
 
-    /// Converts the bandwidth to kbps.
-    pub fn to_kbps(&self) -> u64 {
+    /// Converts the bandwidth to bytes per second.
+    pub fn to_bytes_per_sec(&self) -> u64 {
         if self.exponent == 0 {
             self.significand as u64
         } else {
@@ -112,7 +117,7 @@ impl PartialOrd for Bandwidth {
 
 impl Ord for Bandwidth {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.to_kbps().cmp(&other.to_kbps())
+        self.to_bytes_per_sec().cmp(&other.to_bytes_per_sec())
     }
 }
 
@@ -694,50 +699,54 @@ mod tests {
 
     #[test]
     fn zero_bandwidth() {
-        let bw = Bandwidth::from_kbps(0).unwrap();
-        assert_eq!(bw.to_kbps(), 0);
+        let bw = Bandwidth::from_bytes_per_sec(0).unwrap();
+        assert_eq!(bw.to_bytes_per_sec(), 0);
     }
 
     #[test]
-    fn bandwidth_ord_matches_kbps_ordering() {
-        let low = Bandwidth::from_kbps(10).unwrap();
-        let high = Bandwidth::from_kbps(1024).unwrap();
+    fn bandwidth_ord_matches_bytes_per_sec_ordering() {
+        let low = Bandwidth::from_bytes_per_sec(10).unwrap();
+        let high = Bandwidth::from_bytes_per_sec(1024).unwrap();
         assert!(low < high);
 
         // Exponent boundary: 31 uses exponent=0, 32 uses exponent=1.
-        let boundary_low = Bandwidth::from_kbps(31).unwrap();
-        let boundary_high = Bandwidth::from_kbps(32).unwrap();
+        let boundary_low = Bandwidth::from_bytes_per_sec(31).unwrap();
+        let boundary_high = Bandwidth::from_bytes_per_sec(32).unwrap();
         assert!(boundary_low < boundary_high);
     }
 
     #[test]
     fn small_bandwidth_uses_exponent_zero() {
         // Values 0..=31 are stored directly as the significand (exponent = 0).
-        for kbps in [1u64, 15, 31] {
-            let bw = Bandwidth::from_kbps(kbps).unwrap();
-            assert_eq!(bw.exponent, 0, "kbps={kbps}");
-            assert_eq!(bw.to_kbps(), kbps, "kbps={kbps}");
+        for bytes_per_sec in [1u64, 15, 31] {
+            let bw = Bandwidth::from_bytes_per_sec(bytes_per_sec).unwrap();
+            assert_eq!(bw.exponent, 0, "bytes_per_sec={bytes_per_sec}");
+            assert_eq!(bw.to_bytes_per_sec(), bytes_per_sec, "bytes_per_sec={bytes_per_sec}");
         }
     }
 
     #[test]
     fn boundary_between_exponent_zero_and_one() {
         // 31 fits in exponent=0; 32 requires exponent=1.
-        let bw31 = Bandwidth::from_kbps(31).unwrap();
+        let bw31 = Bandwidth::from_bytes_per_sec(31).unwrap();
         assert_eq!(bw31.exponent, 0);
 
-        let bw32 = Bandwidth::from_kbps(32).unwrap();
+        let bw32 = Bandwidth::from_bytes_per_sec(32).unwrap();
         assert_eq!(bw32.exponent, 1);
-        assert_eq!(bw32.to_kbps(), 32);
+        assert_eq!(bw32.to_bytes_per_sec(), 32);
     }
 
     #[test]
     fn roundtrip_various_values() {
         // Values that are exactly representable should survive a roundtrip.
         // For exponent E, only multiples of 2^(E-1) are exactly representable.
-        for kbps in [32u64, 63, 64, 128, 1024] {
-            let bw = Bandwidth::from_kbps(kbps).unwrap();
-            assert_eq!(bw.to_kbps(), kbps, "roundtrip failed for {kbps} kbps");
+        for bytes_per_sec in [32u64, 63, 64, 128, 1024] {
+            let bw = Bandwidth::from_bytes_per_sec(bytes_per_sec).unwrap();
+            assert_eq!(
+                bw.to_bytes_per_sec(),
+                bytes_per_sec,
+                "roundtrip failed for {bytes_per_sec} bytes/s"
+            );
         }
     }
 
@@ -745,40 +754,40 @@ mod tests {
     fn non_representable_value_rounds_down() {
         // For exponent=2 the stride is 2, so odd values in [64,126] are not
         // representable. 65 should encode as 64.
-        let bw = Bandwidth::from_kbps(65).unwrap();
-        assert!(bw.to_kbps() <= 65);
-        assert_eq!(bw.to_kbps(), 64);
+        let bw = Bandwidth::from_bytes_per_sec(65).unwrap();
+        assert!(bw.to_bytes_per_sec() <= 65);
+        assert_eq!(bw.to_bytes_per_sec(), 64);
     }
 
     #[test]
     fn too_large_returns_error() {
         // Max exponent is 31. An error is triggered when the required exponent
-        // would be 32, which first happens at 2^36 kbps.
+        // would be 32, which first happens at 2^36 bytes/s.
         let just_fits: u64 = (1 << 36) - 1;
-        assert!(Bandwidth::from_kbps(just_fits).is_ok());
-        assert!(Bandwidth::from_kbps(1u64 << 36).is_err());
+        assert!(Bandwidth::from_bytes_per_sec(just_fits).is_ok());
+        assert!(Bandwidth::from_bytes_per_sec(1u64 << 36).is_err());
     }
 
     #[test]
     fn encode_decode_roundtrip() {
-        for kbps in [0u64, 1, 31, 32, 64, 1024, 1_000_000] {
-            let bw = Bandwidth::from_kbps(kbps).unwrap();
+        for bytes_per_sec in [0u64, 1, 31, 32, 64, 1024, 1_000_000] {
+            let bw = Bandwidth::from_bytes_per_sec(bytes_per_sec).unwrap();
             let decoded = Bandwidth::decode(bw.encode());
             assert_eq!(
                 bw, decoded,
-                "encode/decode roundtrip failed for {kbps} kbps"
+                "encode/decode roundtrip failed for {bytes_per_sec} bytes/s"
             );
         }
     }
 
     #[test]
     fn encode_fits_in_10_bits() {
-        for kbps in [0u64, 1, 31, 32, 64, 1_000_000] {
-            let encoded = Bandwidth::from_kbps(kbps).unwrap().encode();
+        for bytes_per_sec in [0u64, 1, 31, 32, 64, 1_000_000] {
+            let encoded = Bandwidth::from_bytes_per_sec(bytes_per_sec).unwrap().encode();
             assert_eq!(
                 encoded & !Bandwidth::MASK,
                 0,
-                "encoded value exceeds 10 bits for {kbps} kbps"
+                "encoded value exceeds 10 bits for {bytes_per_sec} bytes/s"
             );
         }
     }
@@ -792,7 +801,7 @@ mod tests {
             ingress_interface: 1,
             egress_interface: 2,
             res_id: 0x3FFFFF,
-            bandwidth: Bandwidth::from_kbps(1024).unwrap(),
+            bandwidth: Bandwidth::from_bytes_per_sec(1024).unwrap(),
             start: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
             duration: 3600,
         };
@@ -815,7 +824,7 @@ mod tests {
                 ingress_interface: 3,
                 egress_interface: 4,
                 res_id: 42,
-                bandwidth: Bandwidth::from_kbps(64).unwrap(),
+                bandwidth: Bandwidth::from_bytes_per_sec(64).unwrap(),
                 start: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
                 duration: 600,
             },
@@ -835,7 +844,7 @@ mod tests {
         let entry = FlyoverMACEntry {
             mac: [1, 2, 3, 4, 5, 6],
             res_id: 0x3FFFFF,
-            bandwidth: Bandwidth::from_kbps(1024).unwrap(),
+            bandwidth: Bandwidth::from_bytes_per_sec(1024).unwrap(),
             res_start_offset: 1000,
             res_duration: 600,
             hop_index: 3,
@@ -864,7 +873,7 @@ mod tests {
                 FlyoverMACEntry {
                     mac: [1; 6],
                     res_id: 1,
-                    bandwidth: Bandwidth::from_kbps(64).unwrap(),
+                    bandwidth: Bandwidth::from_bytes_per_sec(64).unwrap(),
                     res_start_offset: 10,
                     res_duration: 20,
                     hop_index: 0,
@@ -872,7 +881,7 @@ mod tests {
                 FlyoverMACEntry {
                     mac: [2; 6],
                     res_id: 2,
-                    bandwidth: Bandwidth::from_kbps(128).unwrap(),
+                    bandwidth: Bandwidth::from_bytes_per_sec(128).unwrap(),
                     res_start_offset: 30,
                     res_duration: 40,
                     hop_index: 2,
@@ -906,7 +915,7 @@ mod tests {
                 FlyoverMACEntry {
                     mac: [0; 6],
                     res_id: 1,
-                    bandwidth: Bandwidth::from_kbps(64).unwrap(),
+                    bandwidth: Bandwidth::from_bytes_per_sec(64).unwrap(),
                     res_start_offset: 100,
                     res_duration: 50,
                     hop_index: 0,
@@ -915,7 +924,7 @@ mod tests {
                 FlyoverMACEntry {
                     mac: [0; 6],
                     res_id: 2,
-                    bandwidth: Bandwidth::from_kbps(64).unwrap(),
+                    bandwidth: Bandwidth::from_bytes_per_sec(64).unwrap(),
                     res_start_offset: 0,
                     res_duration: 600,
                     hop_index: 1,
@@ -947,7 +956,7 @@ mod tests {
             entries: vec![FlyoverMACEntry {
                 mac: [0; 6],
                 res_id: 1,
-                bandwidth: Bandwidth::from_kbps(64).unwrap(),
+                bandwidth: Bandwidth::from_bytes_per_sec(64).unwrap(),
                 res_start_offset: 0,
                 res_duration: 1,
                 hop_index: 0,

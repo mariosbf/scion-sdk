@@ -56,7 +56,7 @@
 //!         info: RedemptionInfo {
 //!             ingress: 1,
 //!             egress: 2,
-//!             bandwidth: Bandwidth::from_kbps(1000).unwrap(),
+//!             bandwidth: Bandwidth::from_bytes_per_sec(1024).unwrap(),
 //!             start_time: Utc::now(),
 //!             duration: 60,
 //!         },

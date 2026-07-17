@@ -56,7 +56,7 @@ impl ReservationTracker {
                     reservation.end().into(),
                     TokenBucket::new(
                         reservation.start().into(),
-                        (reservation.bandwidth.to_kbps() * 125) as i64,
+                        reservation.bandwidth.to_bytes_per_sec() as i64,
                         reservation.bandwidth,
                     ),
                 )
@@ -152,13 +152,17 @@ mod tests {
         hummingbird::Bandwidth,
     };
 
-    fn make_reservation(res_id: u32, start: DateTime<Utc>, bw_kbps: u64) -> ReservationInfo {
+    fn make_reservation(
+        res_id: u32,
+        start: DateTime<Utc>,
+        bw_bytes_per_sec: u64,
+    ) -> ReservationInfo {
         ReservationInfo {
             isd_as: IsdAsn::new(Isd::new(1), Asn::new(1)),
             ingress_interface: 1,
             egress_interface: 2,
             res_id,
-            bandwidth: Bandwidth::from_kbps(bw_kbps).unwrap(),
+            bandwidth: Bandwidth::from_bytes_per_sec(bw_bytes_per_sec).unwrap(),
             start,
             duration: 60,
         }
@@ -169,16 +173,16 @@ mod tests {
         let mut tracker = ReservationTracker::new();
         let now = Utc::now();
 
-        let res_a = make_reservation(42, now - ChronoDuration::seconds(10), 8);
-        let res_b = make_reservation(42, now - ChronoDuration::seconds(5), 8);
+        let res_a = make_reservation(42, now - ChronoDuration::seconds(10), 1024);
+        let res_b = make_reservation(42, now - ChronoDuration::seconds(5), 1024);
 
         // Exhaust res_a's bucket entirely.
-        tracker.use_reservation(&res_a, 1000).unwrap();
+        tracker.use_reservation(&res_a, 1024).unwrap();
         assert!(tracker.use_reservation(&res_a, 1).is_err());
 
         // res_b shares (isd_as, res_id) with res_a but has a different start time, so it
         // must have gotten its own, untouched bucket.
-        tracker.use_reservation(&res_b, 1000).unwrap();
+        tracker.use_reservation(&res_b, 1024).unwrap();
     }
 
     #[test]
@@ -186,10 +190,10 @@ mod tests {
         let mut tracker = ReservationTracker::new();
         let start = Utc::now() - ChronoDuration::seconds(10);
 
-        let res_a = make_reservation(42, start, 8);
-        let res_a_again = make_reservation(42, start, 8);
+        let res_a = make_reservation(42, start, 1024);
+        let res_a_again = make_reservation(42, start, 1024);
 
-        tracker.use_reservation(&res_a, 1000).unwrap();
+        tracker.use_reservation(&res_a, 1024).unwrap();
         assert!(matches!(
             tracker.use_reservation(&res_a_again, 1),
             Err(ReservationTrackerError::BandwidthExceeded)

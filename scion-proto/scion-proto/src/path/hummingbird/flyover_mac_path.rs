@@ -427,7 +427,7 @@ mod tests {
             entries: vec![FlyoverMACEntry {
                 mac: [0xAB; 6],
                 res_id: 1,
-                bandwidth: Bandwidth::from_kbps(64).unwrap(),
+                bandwidth: Bandwidth::from_bytes_per_sec(64).unwrap(),
                 res_start_offset: 0,
                 res_duration: 600,
                 hop_index,
@@ -452,7 +452,7 @@ mod tests {
                     mac: [0xAB; 6],
                     res_id: 1,
                     // Reservation ended 50s before base_timestamp.
-                    bandwidth: Bandwidth::from_kbps(64).unwrap(),
+                    bandwidth: Bandwidth::from_bytes_per_sec(64).unwrap(),
                     res_start_offset: 100,
                     res_duration: 50,
                     hop_index: 0,
@@ -460,7 +460,7 @@ mod tests {
                 FlyoverMACEntry {
                     mac: [0xCD; 6],
                     res_id: 2,
-                    bandwidth: Bandwidth::from_kbps(64).unwrap(),
+                    bandwidth: Bandwidth::from_bytes_per_sec(64).unwrap(),
                     res_start_offset: 0,
                     res_duration: 600,
                     hop_index: 1,
@@ -638,7 +638,7 @@ mod tests {
                 ingress_interface: 1,
                 egress_interface: 2,
                 res_id: 7,
-                bandwidth: Bandwidth::from_kbps(512).unwrap(),
+                bandwidth: Bandwidth::from_bytes_per_sec(512).unwrap(),
                 start: DateTime::from_timestamp(Utc::now().timestamp() - 10, 0).unwrap(),
                 duration: 600,
             },
@@ -679,7 +679,7 @@ mod tests {
         assert_eq!(encoded.flyover_hop_fields().count(), 1);
         let flyover = encoded.flyover_hop_fields().next().unwrap();
         assert_eq!(flyover.reservation_id(), 7);
-        assert_eq!(flyover.bandwidth(), Bandwidth::from_kbps(512).unwrap());
+        assert_eq!(flyover.bandwidth(), Bandwidth::from_bytes_per_sec(512).unwrap());
 
         // The flyover's aggregated MAC must equal the original standard
         // hop's MAC XORed with a freshly computed flyover MAC, using the

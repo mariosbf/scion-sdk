@@ -928,7 +928,7 @@ mod tests {
                 ingress_interface,
                 egress_interface,
                 res_id: 42,
-                bandwidth: Bandwidth::from_kbps(64).unwrap(),
+                bandwidth: Bandwidth::from_bytes_per_sec(64).unwrap(),
                 start: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
                 duration: 600,
             },
