@@ -1675,7 +1675,7 @@ mod tests {
         egress: u16,
         start_offset_secs: u32,
         duration: u16,
-        bw_kbps: u64,
+        bw_bytes_per_sec: u64,
     ) -> Reservation {
         // start_offset_secs = how many seconds ago the reservation started,
         // keeping (now - start) small enough to fit in u16.
@@ -1686,7 +1686,7 @@ mod tests {
                 ingress_interface: ingress,
                 egress_interface: egress,
                 res_id: 42,
-                bandwidth: Bandwidth::from_kbps(bw_kbps).unwrap(),
+                bandwidth: Bandwidth::from_bytes_per_sec(bw_bytes_per_sec).unwrap(),
                 start,
                 duration,
             },

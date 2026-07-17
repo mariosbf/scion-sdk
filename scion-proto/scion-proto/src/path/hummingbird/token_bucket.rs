@@ -70,7 +70,7 @@ impl TokenBucket {
 }
 
 fn bandwidth_to_bytes_per_sec(bw: Bandwidth) -> i64 {
-    bw.to_kbps() as i64 * 125
+    bw.to_bytes_per_sec() as i64
 }
 
 #[cfg(test)]
@@ -82,51 +82,51 @@ mod tests {
         SystemTime::UNIX_EPOCH + Duration::from_nanos(nanos)
     }
 
-    const RATE_8KBPS: u64 = 8;
-    const RATE_8KBPS_BYTES: i64 = 1000;
+    // 1024 bytes/s is exactly representable in the 10-bit encoding.
+    const RATE_BYTES_PER_SEC: i64 = 1024;
 
-    fn bw_kbps(kbps: u64) -> Bandwidth {
-        Bandwidth::from_kbps(kbps).unwrap()
+    fn bw(bytes_per_sec: u64) -> Bandwidth {
+        Bandwidth::from_bytes_per_sec(bytes_per_sec).unwrap()
     }
 
     #[test]
     fn apply_allows_arrival_behind_last_arrival() {
-        let mut bucket = TokenBucket::new(t(1), RATE_8KBPS_BYTES, bw_kbps(RATE_8KBPS));
+        let mut bucket = TokenBucket::new(t(1), RATE_BYTES_PER_SEC, bw(RATE_BYTES_PER_SEC as u64));
         assert!(bucket.check(1, SystemTime::UNIX_EPOCH));
         bucket.use_unchecked(1);
     }
 
     #[test]
     fn full_bandwidth_consumed_at_once() {
-        let mut bucket = TokenBucket::new(t(0), RATE_8KBPS_BYTES, bw_kbps(RATE_8KBPS));
-        assert!(bucket.check(RATE_8KBPS_BYTES as usize, t(0)));
-        bucket.use_unchecked(RATE_8KBPS_BYTES as usize);
+        let mut bucket = TokenBucket::new(t(0), RATE_BYTES_PER_SEC, bw(RATE_BYTES_PER_SEC as u64));
+        assert!(bucket.check(RATE_BYTES_PER_SEC as usize, t(0)));
+        bucket.use_unchecked(RATE_BYTES_PER_SEC as usize);
         assert!(!bucket.check(1, t(0)));
     }
 
     #[test]
     fn full_bandwidth_consumed_over_multiple_packets() {
-        let mut bucket = TokenBucket::new(t(0), RATE_8KBPS_BYTES, bw_kbps(RATE_8KBPS));
-        assert!(bucket.check(500, t(0)));
-        bucket.use_unchecked(500);
-        assert!(bucket.check(500, t(0)));
-        bucket.use_unchecked(500);
+        let mut bucket = TokenBucket::new(t(0), RATE_BYTES_PER_SEC, bw(RATE_BYTES_PER_SEC as u64));
+        assert!(bucket.check(512, t(0)));
+        bucket.use_unchecked(512);
+        assert!(bucket.check(512, t(0)));
+        bucket.use_unchecked(512);
         assert!(!bucket.check(1, t(0)));
     }
 
     #[test]
     fn current_tokens_regenerate() {
-        let mut bucket = TokenBucket::new(t(0), RATE_8KBPS_BYTES, bw_kbps(RATE_8KBPS));
-        assert!(bucket.check(RATE_8KBPS_BYTES as usize, t(0)));
-        bucket.use_unchecked(RATE_8KBPS_BYTES as usize);
-        assert!(bucket.check(500, t(500_000_000)));
-        bucket.use_unchecked(500);
+        let mut bucket = TokenBucket::new(t(0), RATE_BYTES_PER_SEC, bw(RATE_BYTES_PER_SEC as u64));
+        assert!(bucket.check(RATE_BYTES_PER_SEC as usize, t(0)));
+        bucket.use_unchecked(RATE_BYTES_PER_SEC as usize);
+        assert!(bucket.check(512, t(500_000_000)));
+        bucket.use_unchecked(512);
         assert!(!bucket.check(1, t(500_000_000)));
     }
 
     #[test]
     fn current_tokens_limited_by_cbs() {
-        let mut bucket = TokenBucket::new(t(0), 2000, bw_kbps(RATE_8KBPS));
+        let mut bucket = TokenBucket::new(t(0), 2000, bw(RATE_BYTES_PER_SEC as u64));
         let t1 = t(1_000_000_000);
         assert!(!bucket.check(2001, t1));
         assert!(bucket.check(2000, t1));

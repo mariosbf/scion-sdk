@@ -102,7 +102,7 @@ impl ReservationTracker {
                         reservation_end,
                         TokenBucket::new(
                             reservation_start,
-                            (bandwidth.to_kbps() * 125) as i64,
+                            bandwidth.to_bytes_per_sec() as i64,
                             bandwidth,
                         ),
                     )
@@ -180,7 +180,7 @@ impl ReservationTracker {
                         reservation_end,
                         TokenBucket::new(
                             reservation_start,
-                            (bandwidth.to_kbps() * 125) as i64,
+                            bandwidth.to_bytes_per_sec() as i64,
                             bandwidth,
                         ),
                     )
