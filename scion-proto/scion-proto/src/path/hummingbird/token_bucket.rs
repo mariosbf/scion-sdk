@@ -29,11 +29,14 @@ impl TokenBucket {
     pub fn check(&mut self, size: usize, now: SystemTime) -> bool {
         let size = size as i64;
         if let Ok(elapsed) = now.duration_since(self.last_time_applied) {
+            // Saturating on purpose: elapsed_nanos * rate overflows i64 once
+            // elapsed > i64::MAX / rate — at high reservation rates (e.g.
+            // 66.6 GB/s, near the encoding max) that is only ~138 ms of
+            // idle time. Saturation is semantically a full bucket: the token
+            // count is clamped to committed_burst_size right below anyway.
             let new_nano_tokens = (elapsed.as_nanos() as i64)
-                .checked_mul(self.committed_information_rate)
-                .unwrap()
-                .checked_add(self.current_nano_tokens)
-                .unwrap();
+                .saturating_mul(self.committed_information_rate)
+                .saturating_add(self.current_nano_tokens);
 
             let new_full_tokens = new_nano_tokens / 1_000_000_000;
             self.current_nano_tokens = new_nano_tokens % 1_000_000_000;
@@ -64,11 +67,10 @@ impl TokenBucket {
     /// Updates the replenishment clock (same side-effect as `check`).
     pub(super) fn available_at(&mut self, now: SystemTime) -> i64 {
         if let Ok(elapsed) = now.duration_since(self.last_time_applied) {
+            // Saturating for the same overflow reason as in `check`.
             let new_nano_tokens = (elapsed.as_nanos() as i64)
-                .checked_mul(self.committed_information_rate)
-                .unwrap()
-                .checked_add(self.current_nano_tokens)
-                .unwrap();
+                .saturating_mul(self.committed_information_rate)
+                .saturating_add(self.current_nano_tokens);
             let new_full_tokens = new_nano_tokens / 1_000_000_000;
             self.current_nano_tokens = new_nano_tokens % 1_000_000_000;
             self.current_token =
@@ -97,6 +99,21 @@ mod tests {
 
     fn bw(bytes_per_sec: u64) -> Bandwidth {
         Bandwidth::from_bytes_per_sec(bytes_per_sec).unwrap()
+    }
+
+    #[test]
+    fn high_rate_long_gap_does_not_overflow() {
+        // Regression: at rates near the encoding max (~66.6 GB/s),
+        // elapsed_nanos * rate overflows i64 after ~138 ms of idle time.
+        // The old checked_mul().unwrap() panicked here; saturation must
+        // instead leave a (clamped) full bucket.
+        let rate = 66_571_993_088u64; // 31 * 2^31 B/s, the 10-bit encoding max
+        let mut bucket = TokenBucket::new(t(0), rate as i64, bw(rate));
+        // One second of idle time: far past the overflow horizon.
+        assert!(bucket.check(1500, t(1_000_000_000)));
+        bucket.use_unchecked(1500);
+        // Bucket is clamped to burst size, not saturated garbage.
+        assert!(bucket.available_at(t(1_000_000_001)) <= rate as i64);
     }
 
     #[test]
