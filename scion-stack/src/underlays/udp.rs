@@ -260,6 +260,40 @@ impl UnderlaySocket for UdpUnderlaySocket {
         })
     }
 
+    fn send_with_next_hop<'a>(
+        &'a self,
+        packet: ScionPacketRaw,
+        next_hop_override: Option<net::SocketAddr>,
+    ) -> BoxFuture<'a, Result<(), ScionSocketSendError>> {
+        let Some(next_hop) = next_hop_override else {
+            return self.send(packet);
+        };
+        let source_ia = packet.headers.address.ia.source;
+        let packet_bytes = packet.encode_to_bytes_vec().concat();
+        Box::pin(async move {
+            self.socket
+                .send_to(&packet_bytes, next_hop)
+                .await
+                .map_err(|e| Self::map_send_io_error(e, source_ia, 0, next_hop))?;
+            Ok(())
+        })
+    }
+
+    fn try_send_with_next_hop(
+        &self,
+        packet: ScionPacketRaw,
+        next_hop_override: Option<net::SocketAddr>,
+    ) -> Result<(), ScionSocketSendError> {
+        let Some(next_hop) = next_hop_override else {
+            return self.try_send(packet);
+        };
+        let source_ia = packet.headers.address.ia.source;
+        self.socket
+            .try_send_to(&packet.encode_to_bytes_vec().concat(), next_hop)
+            .map_err(|e| Self::map_send_io_error(e, source_ia, 0, next_hop))?;
+        Ok(())
+    }
+
     /// Try to send a raw packet immediately. Takes a ScionPacketRaw because it needs to read the
     /// path to resolve the underlay next hop.
     fn try_send(&self, packet: ScionPacketRaw) -> Result<(), ScionSocketSendError> {
@@ -450,6 +484,27 @@ impl AsyncUdpUnderlaySocket for UdpAsyncUdpUnderlaySocket {
         Ok(())
     }
 
+    fn try_send_with_next_hop(
+        &self,
+        raw_packet: ScionPacketRaw,
+        next_hop_override: Option<net::SocketAddr>,
+    ) -> Result<(), std::io::Error> {
+        let Some(next_hop) = next_hop_override else {
+            return self.try_send(raw_packet);
+        };
+        let packet_bytes = raw_packet.encode_to_bytes_vec().concat();
+        // Ignore all errors except for WouldBlock, matching try_send: the
+        // sender should retransmit.
+        match self.inner.try_send_to(&packet_bytes, next_hop) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
+            Err(e) => {
+                tracing::warn!(err = ?e, "Error sending packet");
+                Ok(())
+            }
+        }
+    }
+
     fn poll_recv_from_with_path(
         &self,
         cx: &mut std::task::Context,
@@ -534,5 +589,106 @@ impl AsyncUdpUnderlaySocket for UdpAsyncUdpUnderlaySocket {
 
     fn snap_data_plane(&self) -> Option<net::SocketAddr> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use bytes::Bytes;
+    use scion_proto::address::{ScionAddrV4, SocketAddrV4};
+
+    use super::*;
+    use crate::underlays::discovery::UnderlayInfo;
+
+    /// Discovery stub: resolves EVERY interface to the given decoy address.
+    struct DecoyDiscovery(net::SocketAddr);
+
+    impl UnderlayDiscovery for DecoyDiscovery {
+        fn underlays(&self, _isd_as: IsdAsn) -> Vec<(IsdAsn, UnderlayInfo)> {
+            vec![]
+        }
+        fn isd_ases(&self) -> HashSet<IsdAsn> {
+            HashSet::new()
+        }
+        fn resolve_udp_underlay_next_hop(
+            &self,
+            _interface: PathInterface,
+        ) -> Option<net::SocketAddr> {
+            Some(self.0)
+        }
+    }
+
+    fn test_packet() -> ScionPacketRaw {
+        let src: SocketAddr = SocketAddr::V4(SocketAddrV4::new(
+            ScionAddrV4::new("1-ff00:0:110".parse().unwrap(), "10.0.0.1".parse().unwrap()),
+            1234,
+        ));
+        let dst: SocketAddr = SocketAddr::V4(SocketAddrV4::new(
+            ScionAddrV4::new("1-ff00:0:111".parse().unwrap(), "10.0.0.2".parse().unwrap()),
+            5678,
+        ));
+        ScionPacketUdp::new(
+            ByEndpoint {
+                source: src,
+                destination: dst,
+            },
+            scion_proto::path::DataPlanePath::EmptyPath,
+            Bytes::from_static(b"hello"),
+        )
+        .expect("build test packet")
+        .into()
+    }
+
+    #[tokio::test]
+    async fn send_with_next_hop_overrides_resolution() {
+        let listener = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let decoy = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let decoy_addr = decoy.local_addr().unwrap();
+
+        let bind_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(
+            ScionAddrV4::new("1-ff00:0:110".parse().unwrap(), "127.0.0.1".parse().unwrap()),
+            0,
+        ));
+        let underlay = UdpUnderlaySocket::new(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            bind_addr,
+            Arc::new(DecoyDiscovery(decoy_addr)),
+        );
+
+        UnderlaySocket::send_with_next_hop(&underlay, test_packet(), Some(listener_addr))
+            .await
+            .expect("override send must succeed");
+
+        let mut buf = [0u8; 2048];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            listener.recv_from(&mut buf),
+        )
+        .await
+        .expect("datagram must arrive at the override address")
+        .unwrap();
+        assert!(n > 0);
+    }
+
+    #[tokio::test]
+    async fn send_without_override_is_unchanged() {
+        // EmptyPath has no first interface, so the legacy path must still
+        // fail with InvalidPacket — proving the None branch is untouched.
+        let bind_addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(
+            ScionAddrV4::new("1-ff00:0:110".parse().unwrap(), "127.0.0.1".parse().unwrap()),
+            0,
+        ));
+        let underlay = UdpUnderlaySocket::new(
+            UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+            bind_addr,
+            Arc::new(DecoyDiscovery("127.0.0.1:9".parse().unwrap())),
+        );
+        let err = UnderlaySocket::send_with_next_hop(&underlay, test_packet(), None)
+            .await
+            .expect_err("empty path without override must still error");
+        assert!(matches!(err, ScionSocketSendError::InvalidPacket(_)));
     }
 }

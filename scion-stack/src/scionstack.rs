@@ -962,6 +962,31 @@ pub(crate) trait UnderlaySocket: 'static + Send + Sync {
     /// path to resolve the underlay next hop.
     fn try_send(&self, packet: ScionPacketRaw) -> Result<(), ScionSocketSendError>;
 
+    /// Send a raw packet, honoring an explicit underlay next-hop override.
+    /// `Some(addr)` sends the encoded packet directly to `addr`, skipping
+    /// interface-based next-hop resolution (the local-datapath contract of
+    /// `Path::underlay_next_hop`). `None` behaves exactly like `send`.
+    /// Only the UDP underlay overrides this; all other underlays ignore the
+    /// override via this default.
+    fn send_with_next_hop<'a>(
+        &'a self,
+        packet: ScionPacketRaw,
+        next_hop_override: Option<net::SocketAddr>,
+    ) -> BoxFuture<'a, Result<(), ScionSocketSendError>> {
+        let _ = next_hop_override;
+        self.send(packet)
+    }
+
+    /// `try_send` twin of [`Self::send_with_next_hop`].
+    fn try_send_with_next_hop(
+        &self,
+        packet: ScionPacketRaw,
+        next_hop_override: Option<net::SocketAddr>,
+    ) -> Result<(), ScionSocketSendError> {
+        let _ = next_hop_override;
+        self.try_send(packet)
+    }
+
     /// Receive a raw SCION packet.
     fn recv<'a>(&'a self) -> BoxFuture<'a, Result<ScionPacketRaw, ScionSocketReceiveError>>;
 
@@ -981,6 +1006,16 @@ pub(crate) trait AsyncUdpUnderlaySocket: Send + Sync {
     /// This function should return std::io::ErrorKind::WouldBlock if the packet cannot be sent
     /// immediately.
     fn try_send(&self, raw_packet: ScionPacketRaw) -> Result<(), std::io::Error>;
+    /// `try_send`, honoring an explicit underlay next-hop override (see
+    /// `UnderlaySocket::send_with_next_hop`).
+    fn try_send_with_next_hop(
+        &self,
+        raw_packet: ScionPacketRaw,
+        next_hop_override: Option<net::SocketAddr>,
+    ) -> Result<(), std::io::Error> {
+        let _ = next_hop_override;
+        self.try_send(raw_packet)
+    }
     /// Poll for receiving a SCION packet with sender and path.
     /// This function will only return valid UDP packets.
     /// SCMP packets will be handled internally.
