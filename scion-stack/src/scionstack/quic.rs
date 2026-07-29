@@ -339,6 +339,7 @@ impl AsyncUdpSocket for ScionAsyncUdpSocket {
             Some(path) => path,
             None => return Ok(()),
         };
+        let next_hop_override = path.underlay_next_hop;
 
         let packet = ScionPacketUdp::new(
             ByEndpoint {
@@ -350,7 +351,10 @@ impl AsyncUdpSocket for ScionAsyncUdpSocket {
         )
         .map_err(|_| std::io::Error::other("failed to encode packet"))?;
 
-        match self.socket.try_send(packet.into()) {
+        match self
+            .socket
+            .try_send_with_next_hop(packet.into(), next_hop_override)
+        {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == ErrorKind::WouldBlock => Err(e),
             Err(e) => {

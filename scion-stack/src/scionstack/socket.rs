@@ -75,6 +75,7 @@ impl PathUnawareUdpScionSocket {
         destination: SocketAddr,
         path: &Path<&[u8]>,
     ) -> BoxFuture<'a, Result<(), ScionSocketSendError>> {
+        let next_hop_override = path.underlay_next_hop;
         let packet: ScionPacketRaw = match ScionPacketUdp::new(
             ByEndpoint {
                 source: self.inner.local_addr(),
@@ -94,7 +95,7 @@ impl PathUnawareUdpScionSocket {
         }
         .into();
 
-        self.inner.send(packet)
+        self.inner.send_with_next_hop(packet, next_hop_override)
     }
 
     /// Send a SCION UDP datagram via the given Hummingbird path.
@@ -127,8 +128,12 @@ impl PathUnawareUdpScionSocket {
                 );
             }
         };
+        let next_hop_override = path.underlay_next_hop;
         let packet: ScionPacketRaw = udp_packet.into();
-        self.inner.send(packet).map_ok(|_| path).boxed()
+        self.inner
+            .send_with_next_hop(packet, next_hop_override)
+            .map_ok(|_| path)
+            .boxed()
     }
 
     /// Send a pre-built UDP packet.
@@ -1096,6 +1101,121 @@ mod cancel_safety_tests {
             &buf[..len],
             payload,
             "buffer must contain the real payload after Ok return"
+        );
+    }
+
+    // ─── underlay_next_hop plumbing ────────────────────────────────────────────
+
+    /// Underlay socket that records, for every send, the `next_hop_override` it was
+    /// called with (`None` for `send`/`try_send`, `Some(_)`/`None` for
+    /// `send_with_next_hop`).
+    struct CapturingUnderlaySocket {
+        local: SocketAddr,
+        sent: Mutex<Vec<Option<std::net::SocketAddr>>>,
+    }
+
+    impl UnderlaySocket for CapturingUnderlaySocket {
+        fn send<'a>(
+            &'a self,
+            _packet: ScionPacketRaw,
+        ) -> BoxFuture<'a, Result<(), ScionSocketSendError>> {
+            self.sent.lock().expect("poisoned").push(None);
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn try_send(&self, _packet: ScionPacketRaw) -> Result<(), ScionSocketSendError> {
+            self.sent.lock().expect("poisoned").push(None);
+            Ok(())
+        }
+
+        fn send_with_next_hop<'a>(
+            &'a self,
+            _packet: ScionPacketRaw,
+            next_hop_override: Option<std::net::SocketAddr>,
+        ) -> BoxFuture<'a, Result<(), ScionSocketSendError>> {
+            self.sent.lock().expect("poisoned").push(next_hop_override);
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn recv<'a>(&'a self) -> BoxFuture<'a, Result<ScionPacketRaw, ScionSocketReceiveError>> {
+            Box::pin(async move { std::future::pending().await })
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            self.local
+        }
+
+        fn snap_data_plane(&self) -> Option<std::net::SocketAddr> {
+            None
+        }
+    }
+
+    /// Thin forwarding wrapper so a `Box<dyn UnderlaySocket>` (owned by
+    /// `PathUnawareUdpScionSocket`) can share an `Arc<CapturingUnderlaySocket>` that the
+    /// test keeps around to inspect afterwards.
+    struct Fwd(Arc<CapturingUnderlaySocket>);
+
+    impl UnderlaySocket for Fwd {
+        fn send<'a>(
+            &'a self,
+            packet: ScionPacketRaw,
+        ) -> BoxFuture<'a, Result<(), ScionSocketSendError>> {
+            self.0.send(packet)
+        }
+
+        fn try_send(&self, packet: ScionPacketRaw) -> Result<(), ScionSocketSendError> {
+            self.0.try_send(packet)
+        }
+
+        fn send_with_next_hop<'a>(
+            &'a self,
+            packet: ScionPacketRaw,
+            next_hop_override: Option<std::net::SocketAddr>,
+        ) -> BoxFuture<'a, Result<(), ScionSocketSendError>> {
+            self.0.send_with_next_hop(packet, next_hop_override)
+        }
+
+        fn recv<'a>(&'a self) -> BoxFuture<'a, Result<ScionPacketRaw, ScionSocketReceiveError>> {
+            self.0.recv()
+        }
+
+        fn local_addr(&self) -> SocketAddr {
+            self.0.local_addr()
+        }
+
+        fn snap_data_plane(&self) -> Option<std::net::SocketAddr> {
+            self.0.snap_data_plane()
+        }
+    }
+
+    /// `send_to_via` must forward `path.underlay_next_hop` down to the underlay's
+    /// `send_with_next_hop`, instead of routing through the plain `send` (which loses the
+    /// override).
+    #[tokio::test]
+    async fn send_to_via_forwards_underlay_next_hop() {
+        let local = local_addr();
+        let dst = remote_addr();
+
+        let capture = Arc::new(CapturingUnderlaySocket {
+            local,
+            sent: Mutex::new(Vec::new()),
+        });
+
+        let socket = PathUnawareUdpScionSocket::new(Box::new(Fwd(capture.clone())), vec![]);
+
+        let override_addr: std::net::SocketAddr = "127.0.0.1:4242".parse().unwrap();
+        let mut path = Path::local(local.isd_asn());
+        path.underlay_next_hop = Some(override_addr);
+
+        socket
+            .send_to_via(b"hi", dst, &path.to_slice_path())
+            .await
+            .expect("send must succeed");
+
+        assert_eq!(
+            capture.sent.lock().expect("poisoned").as_slice(),
+            &[Some(override_addr)],
+            "send_to_via must forward the path's underlay_next_hop"
         );
     }
 }
