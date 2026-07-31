@@ -180,6 +180,22 @@ where
             .filter_map(|hop_field| hop_field.try_into().ok())
     }
 
+    /// Returns the interface through which a packet originating in this path's
+    /// first AS leaves that AS.
+    ///
+    /// See [`EncodedStandardPath::first_egress_interface`] for why this is not
+    /// the first item of [`Self::iter_interfaces`].
+    pub fn first_egress_interface(&self) -> Option<std::num::NonZeroU16> {
+        let segment = self.segments().next()?;
+        let hop_field = segment.hop_fields().next()?;
+
+        if segment.info_field().is_constructed_dir() {
+            hop_field.cons_egress_interface()
+        } else {
+            hop_field.cons_ingress_interface()
+        }
+    }
+
     /// Returns an iterator over the path's interfaces in order of traversal.
     pub fn iter_interfaces(&self) -> impl Iterator<Item = std::num::NonZeroU16> {
         self.segments().flat_map(|seg| {

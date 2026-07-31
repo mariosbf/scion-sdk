@@ -168,11 +168,16 @@ where
         }
     }
 
-    /// Returns the first interface on the path, if it exists.
+    /// Returns the first interface a packet sent along this path crosses, if it
+    /// exists.
+    ///
+    /// This is the egress interface of the first hop field — the interface a
+    /// locally originated packet leaves the source AS through, and so the one
+    /// that identifies the border router the packet must be handed to.
     pub fn first_interface(&self) -> Option<NonZero<u16>> {
         match self {
-            DataPlanePath::Standard(standard_path) => standard_path.iter_interfaces().next(),
-            DataPlanePath::Hummingbird(hbird_path) => hbird_path.iter_interfaces().next(),
+            DataPlanePath::Standard(standard_path) => standard_path.first_egress_interface(),
+            DataPlanePath::Hummingbird(hbird_path) => hbird_path.first_egress_interface(),
             _ => None,
         }
     }

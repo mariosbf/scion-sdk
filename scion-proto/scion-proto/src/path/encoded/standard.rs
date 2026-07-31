@@ -194,6 +194,28 @@ where
         }
     }
 
+    /// Returns the interface through which a packet originating in this path's
+    /// first AS leaves that AS.
+    ///
+    /// This is the egress interface of the first hop field, relative to the
+    /// segment's construction direction. It is deliberately *not* the first
+    /// item of [`Self::iter_interfaces`]: that iterator yields the full
+    /// traversal sequence including the first hop field's ingress interface,
+    /// which a locally originated packet never crosses. The two agree only
+    /// when that ingress interface is 0 — i.e. when the path starts at a
+    /// segment boundary — and disagree on shortcut paths, where the source AS
+    /// sits in the middle of a segment and carries a non-zero ingress.
+    pub fn first_egress_interface(&self) -> Option<std::num::NonZeroU16> {
+        let segment = self.segments().next()?;
+        let hop_field = segment.hop_fields().next()?;
+
+        if segment.info_field().is_constructed_dir() {
+            hop_field.cons_egress_interface()
+        } else {
+            hop_field.cons_ingress_interface()
+        }
+    }
+
     /// Returns an iterator over the path's interfaces in order of traversal.
     pub fn iter_interfaces(&self) -> impl Iterator<Item = std::num::NonZeroU16> {
         self.segments().flat_map(|seg| {
@@ -670,6 +692,63 @@ mod tests {
             interfaces: vec![
                 0x2558, 0xa9b7, 0xc2b6, 0x9199, 0xea67, 0x3902, 0x27bf, 0xd1f7, 0xa6b0, 0x78ca, 0xdf39, 0x08de,
             ]
+        }
+    }
+
+    mod first_egress_interface {
+        use super::*;
+
+        /// Builds a one-segment, two-hop path whose first hop field has the
+        /// given interfaces. `cons_dir` sets the segment's construction
+        /// direction flag.
+        fn two_hop_path(
+            cons_dir: bool, cons_ingress: u16, cons_egress: u16,
+        ) -> EncodedStandardPath<Bytes> {
+            let mut data = Vec::new();
+            // Meta: CurrINF=0, CurrHF=0, Seg0Len=2.
+            data.put_u32(2 << 12);
+            // Info field: flags, then reserved/segID/timestamp (arbitrary).
+            data.put_u8(if cons_dir {
+                InfoField::FLAGS_CONS_DIR
+            } else {
+                0
+            });
+            data.put_slice(&[0, 0, 0, 0, 0, 0, 0]);
+            // Hop 1: flags, expiry, interfaces, MAC.
+            data.put_slice(&[0, 0x3f]);
+            data.put_u16(cons_ingress);
+            data.put_u16(cons_egress);
+            data.put_slice(&[0; 6]);
+            // Hop 2: terminates the segment.
+            data.put_slice(&[0, 0x3f]);
+            data.put_u16(1);
+            data.put_u16(0);
+            data.put_slice(&[0; 6]);
+
+            EncodedStandardPath::decode(&mut Bytes::from(data)).expect("valid path")
+        }
+
+        /// Regression test: on a shortcut path the source AS sits in the middle
+        /// of a segment, so its hop field carries a non-zero ingress interface
+        /// that the packet never crosses. Returning it instead of the egress
+        /// sends the packet to the wrong border router, which rejects it with
+        /// SCMP ParameterProblem/UnknownHopFieldConsEgressInterface.
+        #[test]
+        fn skips_unused_ingress_of_first_hop_in_cons_dir() {
+            let path = two_hop_path(true, 1, 2);
+
+            assert_eq!(path.first_egress_interface(), NonZeroU16::new(2));
+            // The full traversal sequence still starts with the ingress.
+            assert_eq!(path.iter_interfaces().next(), NonZeroU16::new(1));
+        }
+
+        /// Against construction direction the roles are swapped: the packet
+        /// leaves through the hop field's *ingress* interface.
+        #[test]
+        fn uses_ingress_against_cons_dir() {
+            let path = two_hop_path(false, 1, 0);
+
+            assert_eq!(path.first_egress_interface(), NonZeroU16::new(1));
         }
     }
 }
