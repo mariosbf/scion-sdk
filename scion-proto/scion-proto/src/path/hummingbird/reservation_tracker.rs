@@ -38,7 +38,12 @@ impl ReservationTracker {
         }
     }
 
-    fn cleanup_if_due(&mut self) {
+    /// Drops expired token buckets, if the cleanup interval has elapsed.
+    ///
+    /// [`Self::check_reservation`] does this itself. Callers that use the
+    /// `_at` variants in a loop should call this once per batch instead, so
+    /// that the monotonic clock is read once rather than per reservation.
+    pub fn cleanup_if_due(&mut self) {
         let now = Instant::now();
         if now.duration_since(self.last_cleanup) >= self.cleanup_interval {
             let sys_now = SystemTime::now();
@@ -73,13 +78,27 @@ impl ReservationTracker {
         num_bytes: usize,
     ) -> Result<(), ReservationTrackerError> {
         self.cleanup_if_due();
-        let now = Utc::now();
+        self.check_reservation_at(reservation, num_bytes, SystemTime::now())
+    }
 
-        if reservation.start() > now || now > reservation.end() {
+    /// Same as [`Self::check_reservation`], but takes the current time instead
+    /// of reading the clock, and skips the periodic cleanup.
+    ///
+    /// Checking several reservations for one packet should read the clock once
+    /// and call this, both to avoid the repeated clock reads and so that every
+    /// reservation is judged at the same instant. Pair with one
+    /// [`Self::cleanup_if_due`] call per batch.
+    pub fn check_reservation_at(
+        &mut self,
+        reservation: &ReservationInfo,
+        num_bytes: usize,
+        now: SystemTime,
+    ) -> Result<(), ReservationTrackerError> {
+        if !is_valid_at(reservation, now) {
             return Err(ReservationTrackerError::ReservationExpired);
         }
 
-        if self.bucket_for(reservation).check(num_bytes, now.into()) {
+        if self.bucket_for(reservation).check(num_bytes, now) {
             Ok(())
         } else {
             Err(ReservationTrackerError::BandwidthExceeded)
@@ -104,13 +123,17 @@ impl ReservationTracker {
     ///
     /// Returns 0 if the reservation is expired or has no remaining tokens.
     pub fn available_bytes(&mut self, reservation: &ReservationInfo) -> usize {
-        let now = Utc::now();
+        self.available_bytes_at(reservation, SystemTime::now())
+    }
 
-        if reservation.start() > now || now > reservation.end() {
+    /// Same as [`Self::available_bytes`], but takes the current time instead of
+    /// reading the clock.
+    pub fn available_bytes_at(&mut self, reservation: &ReservationInfo, now: SystemTime) -> usize {
+        if !is_valid_at(reservation, now) {
             return 0;
         }
 
-        self.bucket_for(reservation).available_at(now.into()).max(0) as usize
+        self.bucket_for(reservation).available_at(now).max(0) as usize
     }
 
     /// Check and, on success, deduct `pkt_size` bytes from the reservation's token bucket.
@@ -119,21 +142,30 @@ impl ReservationTracker {
         reservation: &ReservationInfo,
         num_bytes: usize,
     ) -> Result<(), ReservationTrackerError> {
-        let now = Utc::now();
+        let now = SystemTime::now();
 
-        if reservation.start() > now || now > reservation.end() {
+        if !is_valid_at(reservation, now) {
             return Err(ReservationTrackerError::ReservationExpired);
         }
 
-        if self
-            .bucket_for(reservation)
-            .use_checked(num_bytes, now.into())
-        {
+        if self.bucket_for(reservation).use_checked(num_bytes, now) {
             Ok(())
         } else {
             Err(ReservationTrackerError::BandwidthExceeded)
         }
     }
+}
+
+/// Whether `reservation`'s validity window contains `now`.
+///
+/// Both bounds are inclusive, matching the checks this tracker has always
+/// performed — unlike [`ReservationInfo::is_valid_now`], whose upper bound is
+/// exclusive.
+fn is_valid_at(reservation: &ReservationInfo, now: SystemTime) -> bool {
+    let start: SystemTime = reservation.start().into();
+    let end: SystemTime = reservation.end().into();
+
+    start <= now && now <= end
 }
 
 impl Default for ReservationTracker {

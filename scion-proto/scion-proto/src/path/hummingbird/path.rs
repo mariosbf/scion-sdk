@@ -690,13 +690,14 @@ impl HummingbirdPath {
         let tracker = self.reservation_tracker.as_ref()?;
         let mut guard = tracker.lock().unwrap();
 
+        let now = SystemTime::now();
         let mut min_available: Option<usize> = None;
 
         for hop in self.hops() {
             let max_bytes = hop
                 .reservations
                 .iter()
-                .map(|r| guard.available_bytes(&r.info))
+                .map(|r| guard.available_bytes_at(&r.info, now))
                 .max();
 
             if let Some(avail) = max_bytes {
@@ -895,25 +896,37 @@ impl HummingbirdPath {
     /// - If no candidate passes and `strict` is `false`, the hop falls back to standard.
     ///
     /// When `tracker` is `None`, the first reservation in the list is chosen (no bandwidth check).
+    ///
+    /// The tracker is paired with the time to judge the reservations at, so
+    /// that one clock read covers the whole packet and every reservation is
+    /// judged at the same instant.
     fn hops_with_reservation(
         &self,
         pkt_len: usize,
-        mut tracker: Option<&mut ReservationTracker>,
+        mut tracker: Option<(&mut ReservationTracker, SystemTime)>,
         strict: bool,
     ) -> Result<Vec<HopWithReservation<'_>>, HummingbirdPathError> {
         let mut hop_fields = Vec::with_capacity(self.num_hopfields());
+        // Deferred until a reservation is actually examined, so that a path
+        // without reservations reads no clock at all.
+        let mut cleaned_up = false;
 
         for (seg_idx, segment) in self.segments.iter().enumerate() {
             for (hop_idx, hop) in segment.iter().enumerate() {
                 let reservations = &hop.reservations;
-                let reservation = if let Some(ref mut t) = tracker
+                let reservation = if let Some((t, now)) = tracker.as_mut()
                     && !reservations.is_empty()
                 {
+                    let now = *now;
+                    if !cleaned_up {
+                        t.cleanup_if_due();
+                        cleaned_up = true;
+                    }
                     let mut num_expired = 0;
                     let mut selected = None;
 
                     for r in reservations {
-                        match t.check_reservation(&r.info, pkt_len) {
+                        match t.check_reservation_at(&r.info, pkt_len, now) {
                             Err(ReservationTrackerError::BandwidthExceeded) => {
                                 continue;
                             }
@@ -921,7 +934,7 @@ impl HummingbirdPath {
                                 num_expired += 1;
                             }
                             Ok(()) => {
-                                let available_bytes = t.available_bytes(&r.info);
+                                let available_bytes = t.available_bytes_at(&r.info, now);
 
                                 if selected.is_none_or(|(_, bytes)| bytes > available_bytes) {
                                     selected = Some((r, available_bytes));
@@ -994,7 +1007,8 @@ impl HummingbirdPath {
         // Create a copy of the meta header
         let mut meta_header = self.path_meta;
 
-        let time = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| {
+        let now = SystemTime::now();
+        let time = now.duration_since(UNIX_EPOCH).map_err(|e| {
             HummingbirdPathError::InvalidBaseTimestamp(-(e.duration().as_secs() as i64))
         })?;
         meta_header.base_timestamp = time
@@ -1030,7 +1044,7 @@ impl HummingbirdPath {
 
         let hops = self.hops_with_reservation(
             estimated_pkt_len,
-            tracker_guard.as_deref_mut(),
+            tracker_guard.as_deref_mut().map(|t| (t, now)),
             self.strict_reservation,
         )?;
 
@@ -1140,10 +1154,11 @@ impl HummingbirdPath {
             + address_header_len as usize
             + payload_len as usize;
 
+        let now = SystemTime::now();
         let mut tracker_guard = self.reservation_tracker.as_ref().map(|t| t.lock().unwrap());
         let hops = self.hops_with_reservation(
             estimated_pkt_len,
-            tracker_guard.as_deref_mut(),
+            tracker_guard.as_deref_mut().map(|t| (t, now)),
             self.strict_reservation,
         )?;
 
@@ -1182,11 +1197,12 @@ impl HummingbirdPath {
         packet_length: u16,
         address_header_len: u16,
     ) -> Result<FlyoverMACs, HummingbirdPathError> {
+        let now = SystemTime::now();
         let mut tracker_guard = self.reservation_tracker.as_ref().map(|t| t.lock().unwrap());
 
         let hops = self.hops_with_reservation(
             packet_length as usize,
-            tracker_guard.as_deref_mut(),
+            tracker_guard.as_deref_mut().map(|t| (t, now)),
             self.strict_reservation,
         )?;
 
