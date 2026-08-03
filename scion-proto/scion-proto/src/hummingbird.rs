@@ -2,13 +2,16 @@
 //!
 //! See also [path::hummingbird].
 
+use std::sync::{Arc, OnceLock};
+
+use aes::{Aes128Enc, cipher::KeyInit};
 use bytes::{Buf, BufMut, Bytes};
 use chrono::{DateTime, Duration, Utc};
 
 use crate::{
     address::IsdAsn,
     packet::{DecodeError, InadequateBufferSize},
-    path::hummingbird::{HbirdAuthKey, calculate_flyover_mac},
+    path::hummingbird::{HbirdAuthKey, calculate_flyover_mac_with_cipher},
     wire_encoding::{WireDecode, WireEncode},
 };
 
@@ -292,18 +295,61 @@ impl WireDecode<Bytes> for ReservationInfo {
 /// |                                                               |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Reservation {
     /// Information about the reservation.
     pub info: ReservationInfo,
 
-    /// The path for which bandwidth was reserved.
-    pub reservation_key: HbirdAuthKey,
+    /// The key used to authenticate use of this reservation.
+    ///
+    /// Kept private so it cannot change after construction: [`Self::cipher`]
+    /// caches the AES key schedule derived from it.
+    reservation_key: HbirdAuthKey,
+
+    /// AES key schedule for `reservation_key`, expanded lazily on first MAC
+    /// computation and reused for the lifetime of the reservation.
+    ///
+    /// Behind an [`Arc`] so that the reservation stays small (it is moved and
+    /// cloned per packet on the encoding hot path) and so that clones share
+    /// the cache: the encoder clones the stored reservation before computing
+    /// MACs, and the expansion done through a clone must warm the original.
+    cipher: Arc<OnceLock<Aes128Enc>>,
 }
+
+impl PartialEq for Reservation {
+    fn eq(&self, other: &Self) -> bool {
+        // The cipher is a pure function of `reservation_key`; its cache state
+        // must not affect equality.
+        self.info == other.info && self.reservation_key == other.reservation_key
+    }
+}
+
+impl Eq for Reservation {}
 
 impl Reservation {
     /// Wire-encoded length of a [`Reservation`] in bytes.
     pub const ENCODED_LENGTH: usize = ReservationInfo::ENCODED_LENGTH + 16;
+
+    /// Creates a new reservation from its info and authentication key.
+    pub fn new(info: ReservationInfo, reservation_key: HbirdAuthKey) -> Self {
+        Self {
+            info,
+            reservation_key,
+            cipher: Arc::new(OnceLock::new()),
+        }
+    }
+
+    /// The key used to authenticate use of this reservation.
+    pub fn reservation_key(&self) -> &HbirdAuthKey {
+        &self.reservation_key
+    }
+
+    /// The AES key schedule for [`Self::reservation_key`], expanded on first
+    /// use and cached.
+    pub(crate) fn cipher(&self) -> &Aes128Enc {
+        self.cipher
+            .get_or_init(|| Aes128Enc::new(&self.reservation_key))
+    }
 
     /// Returns whether the reservation's validity window has passed.
     pub fn is_expired(&self) -> bool {
@@ -338,14 +384,14 @@ impl Reservation {
         let millis_timestamp = timestamp.timestamp_subsec_millis() as u16;
         let counter = counter.unwrap_or(0);
 
-        let mac = calculate_flyover_mac(
+        let mac = calculate_flyover_mac_with_cipher(
             destination.isd(),
             destination.asn(),
             pkt_len,
             res_start_offset,
             millis_timestamp,
             counter,
-            &self.reservation_key,
+            self.cipher(),
         );
 
         Some(FlyoverMAC {
@@ -382,10 +428,7 @@ impl WireDecode<Bytes> for Reservation {
         }
         let info = ReservationInfo::decode(data)?;
         let reservation_key = HbirdAuthKey::clone_from_slice(&data.split_to(16));
-        Ok(Self {
-            info,
-            reservation_key,
-        })
+        Ok(Self::new(info, reservation_key))
     }
 }
 
@@ -815,11 +858,19 @@ mod tests {
     }
 
     #[test]
+    fn reservation_stays_small() {
+        // Reservations are moved and cloned per packet on the encoding hot
+        // path (see `HummingbirdPath::hops_with_reservation`), so the cached
+        // AES key schedule must live behind a pointer, not inline.
+        assert!(std::mem::size_of::<Reservation>() <= 96);
+    }
+
+    #[test]
     fn reservation_encode_decode_roundtrip() {
         use crate::address::IsdAsn;
 
-        let res = Reservation {
-            info: ReservationInfo {
+        let res = Reservation::new(
+            ReservationInfo {
                 isd_as: IsdAsn(0x1_ff00_0000_0110),
                 ingress_interface: 3,
                 egress_interface: 4,
@@ -828,8 +879,8 @@ mod tests {
                 start: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
                 duration: 600,
             },
-            reservation_key: HbirdAuthKey::from([0xABu8; 16]),
-        };
+            HbirdAuthKey::from([0xABu8; 16]),
+        );
         assert_eq!(res.encoded_length(), Reservation::ENCODED_LENGTH);
 
         let encoded = res.encode_to_bytes();

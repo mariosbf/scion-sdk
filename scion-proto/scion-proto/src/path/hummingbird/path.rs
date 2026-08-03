@@ -1995,8 +1995,8 @@ mod tests {
             0,
         )
         .expect("valid timestamp");
-        Reservation {
-            info: ReservationInfo {
+        Reservation::new(
+            ReservationInfo {
                 isd_as: IsdAsn::new(Isd::new(1), Asn::new(1)),
                 ingress_interface: ingress,
                 egress_interface: egress,
@@ -2005,8 +2005,8 @@ mod tests {
                 start,
                 duration,
             },
-            reservation_key: [0u8; 16].into(),
-        }
+            [0u8; 16].into(),
+        )
     }
 
     // ---------------------------------------------------------------------------

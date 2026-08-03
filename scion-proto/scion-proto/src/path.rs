@@ -922,8 +922,8 @@ mod tests {
             path::hummingbird::HbirdAuthKey,
         };
 
-        Reservation {
-            info: ReservationInfo {
+        Reservation::new(
+            ReservationInfo {
                 isd_as,
                 ingress_interface,
                 egress_interface,
@@ -932,8 +932,8 @@ mod tests {
                 start: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
                 duration: 600,
             },
-            reservation_key: HbirdAuthKey::from([0xABu8; 16]),
-        }
+            HbirdAuthKey::from([0xABu8; 16]),
+        )
     }
 
     #[test]

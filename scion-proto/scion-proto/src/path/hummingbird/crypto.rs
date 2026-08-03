@@ -43,6 +43,35 @@ pub fn calculate_flyover_mac(
     counter: u32,
     key: &HbirdAuthKey,
 ) -> [u8; 6] {
+    use aes::cipher::KeyInit;
+
+    let cipher = aes::Aes128Enc::new(key);
+    calculate_flyover_mac_with_cipher(
+        dst_isd,
+        dst_as,
+        pkt_len,
+        res_start_offset,
+        millis_timestamp,
+        counter,
+        &cipher,
+    )
+}
+
+/// Same as [`calculate_flyover_mac`], but takes a pre-expanded AES key
+/// schedule instead of expanding the key on every call.
+///
+/// Key expansion dominates the cost of a single-block AES computation, so
+/// callers that compute MACs repeatedly for the same reservation (e.g. once
+/// per packet) should expand the key once and use this function.
+pub fn calculate_flyover_mac_with_cipher(
+    dst_isd: Isd,
+    dst_as: Asn,
+    pkt_len: u16,
+    res_start_offset: u16,
+    millis_timestamp: u16,
+    counter: u32,
+    cipher: &aes::Aes128Enc,
+) -> [u8; 6] {
     // Input data format (all fields are BE):
     //
     //	 0                   1                   2                   3
@@ -66,9 +95,6 @@ pub fn calculate_flyover_mac(
     mac_input_data[10..12].copy_from_slice(&res_start_offset.to_be_bytes());
     mac_input_data[12..16].copy_from_slice(&millis_and_counter.to_be_bytes());
 
-    use aes::cipher::KeyInit;
-
-    let cipher = aes::Aes128::new(key);
     let mut block = GenericArray::from(mac_input_data);
     cipher.encrypt_block(&mut block);
 

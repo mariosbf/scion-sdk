@@ -56,8 +56,8 @@ fn hop_field(idx: u16) -> StandardHopField {
 }
 
 fn reservation(hop_idx: u8) -> Reservation {
-    Reservation {
-        info: ReservationInfo {
+    Reservation::new(
+        ReservationInfo {
             isd_as: destination(),
             ingress_interface: hop_idx as u16,
             egress_interface: hop_idx as u16 + 1,
@@ -66,8 +66,8 @@ fn reservation(hop_idx: u8) -> Reservation {
             start: Utc::now() - Duration::seconds(60),
             duration: u16::MAX,
         },
-        reservation_key: HbirdAuthKey::from([0xAB; 16]),
-    }
+        HbirdAuthKey::from([0xAB; 16]),
+    )
 }
 
 /// Builds a single-segment path with `num_hops` hops, the first `num_flyovers`

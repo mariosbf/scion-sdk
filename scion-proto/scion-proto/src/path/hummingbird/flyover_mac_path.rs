@@ -632,8 +632,8 @@ mod tests {
         let path = ctx.path();
         let isd_asn = path.isd_asn;
 
-        let reservation = Reservation {
-            info: ReservationInfo {
+        let reservation = Reservation::new(
+            ReservationInfo {
                 isd_as: IsdAsn::new(Isd(1), Asn(111)),
                 ingress_interface: 1,
                 egress_interface: 2,
@@ -642,8 +642,8 @@ mod tests {
                 start: DateTime::from_timestamp(Utc::now().timestamp() - 10, 0).unwrap(),
                 duration: 600,
             },
-            reservation_key: [0x42u8; 16].into(),
-        };
+            [0x42u8; 16].into(),
+        );
 
         let hop_idx = path.reservation_hop_index(&reservation).unwrap();
         assert_eq!(hop_idx, 1, "sanity check: transit hop at flat index 1");
@@ -705,7 +705,7 @@ mod tests {
             res_start_offset,
             encoded.meta_header().millis_timestamp.get(),
             encoded.meta_header().counter.get(),
-            &reservation.reservation_key,
+            reservation.reservation_key(),
         );
 
         let mut expected_mac = original_mac;

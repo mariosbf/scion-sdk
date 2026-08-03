@@ -142,8 +142,8 @@ pub fn from_proto_reservation(
     }
     let auth_key = HbirdAuthKey::clone_from_slice(&auth_key);
 
-    Ok(Reservation {
-        info: ReservationInfo {
+    Ok(Reservation::new(
+        ReservationInfo {
             isd_as: IsdAsn::from(res.ia),
             ingress_interface: req.info.ingress,
             egress_interface: req.info.egress,
@@ -152,8 +152,8 @@ pub fn from_proto_reservation(
             start: req.info.start_time,
             duration: req.info.duration,
         },
-        reservation_key: auth_key,
-    })
+        auth_key,
+    ))
 }
 
 /// Converts proto [`v1::RedemptionResponses`] combined with the originating requests
@@ -182,7 +182,7 @@ impl From<Reservation> for v1::Reservation {
         v1::Reservation {
             ia: r.info.isd_as.into(),
             res_id: r.info.res_id,
-            auth_key: r.reservation_key.to_vec(),
+            auth_key: r.reservation_key().to_vec(),
         }
     }
 }

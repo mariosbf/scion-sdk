@@ -27,8 +27,8 @@ use crate::{
     path::{
         PathInterface,
         hummingbird::{
-            FlyoverHopField, HummingbirdCounter, HummingbirdMetaHeader,
-            HummingbirdPath, HummingbirdPathError, calculate_flyover_mac, xor_in_place,
+            FlyoverHopField, HummingbirdCounter, HummingbirdMetaHeader, HummingbirdPath,
+            HummingbirdPathError, calculate_flyover_mac_with_cipher, xor_in_place,
         },
     },
     wire_encoding::{WireDecode, WireEncode},
@@ -473,14 +473,14 @@ impl StandardHopField {
             .res_start_offset(meta_header.base_timestamp())
             .ok_or(HummingbirdPathError::ReservationNotValid)?;
 
-        let flyover_mac = calculate_flyover_mac(
+        let flyover_mac = calculate_flyover_mac_with_cipher(
             destination.isd(),
             destination.asn(),
             pkt_len,
             res_start_offset,
             meta_header.millis_timestamp(),
             meta_header.counter(),
-            &reservation.reservation_key,
+            reservation.cipher(),
         );
         let mut mac = self.mac;
         xor_in_place(&mut mac, &flyover_mac);
