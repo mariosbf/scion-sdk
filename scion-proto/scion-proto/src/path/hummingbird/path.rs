@@ -974,14 +974,23 @@ impl HummingbirdPath {
             + flyover_count * (FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE)
     }
 
-    /// Apply reservations by turning applicable hop fields into flyover hop
-    /// fields, adjusting segment lengths and current hop field index.
-    fn apply_reservations(
+    /// Applies reservations and encodes the complete path header (meta
+    /// header, info fields, hop fields) in a single pass, turning hop fields
+    /// with a selected reservation into flyover hop fields and adjusting
+    /// segment lengths and current hop field index.
+    ///
+    /// Encodes through a slice cursor over an exactly-sized buffer: per-field
+    /// writes on a slice compile down to pointer-bump copies, unlike generic
+    /// [`BufMut`] targets such as [`BytesMut`] which pay a capacity branch on
+    /// every write.
+    ///
+    /// Returns the finalized meta header and the encoded bytes.
+    fn encode_with_reservations(
         &self,
         destination: IsdAsn,
         payload_len: u16,
         address_header_len: u16,
-    ) -> Result<(HummingbirdMetaHeader, Vec<HummingbirdHopField>), HummingbirdPathError> {
+    ) -> Result<(HummingbirdMetaHeader, Bytes), HummingbirdPathError> {
         // Create a copy of the meta header
         let mut meta_header = self.path_meta;
 
@@ -1025,25 +1034,22 @@ impl HummingbirdPath {
             self.strict_reservation,
         )?;
 
-        // Compute the exact packet length based on the actual selection.
+        // Pre-pass over the selection: validate reservations and compute the
+        // exact hop-field byte layout, so the meta header can be finalized —
+        // and the packet length known for the flyover MACs — before encoding
+        // starts.
         let mut curr_hf_index = meta_header.current_hop_field.byte_offset();
-        let path_header_len = self.path_header_len(&hops);
-
-        let pkt_len = u16::try_from(path_header_len)
-            .ok()
-            .and_then(|v| v.checked_add(CommonHeader::LENGTH as u16))
-            .and_then(|v| v.checked_add(address_header_len))
-            .and_then(|v| v.checked_add(payload_len))
-            .ok_or(HummingbirdPathError::PayloadTooLong)?;
-
-        // Keep track of byte offset of hop fields as we iterate through them
         let mut hop_offset = 0;
         let mut seglens = [0; 3];
-        let mut hop_fields = Vec::with_capacity(self.num_hopfields());
 
-        for &(seg_idx, hop_idx, res) in &hops {
-            let hop = &self.segments[seg_idx][hop_idx].hop_field;
-            let hop_field = if let Some(res) = res {
+        for &(seg_idx, _, res) in &hops {
+            let hop_len = if let Some(res) = res {
+                // Same check apply_reservation performs below; done here so
+                // that no error can occur after bytes have been written.
+                res.info
+                    .res_start_offset(meta_header.base_timestamp())
+                    .ok_or(HummingbirdPathError::ReservationNotValid)?;
+
                 // If the matched hop field is before the current hop field, the
                 // current hop field's byte offset must be advanced by the size
                 // difference between a flyover and a standard hop field.
@@ -1051,23 +1057,13 @@ impl HummingbirdPath {
                     curr_hf_index += FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE;
                 }
 
-                HummingbirdHopField::Flyover(hop.apply_reservation(
-                    meta_header,
-                    res,
-                    destination,
-                    pkt_len,
-                )?)
+                FlyoverHopField::ENCODED_SIZE
             } else {
-                HummingbirdHopField::Standard(hop.clone())
+                StandardHopField::ENCODED_SIZE
             };
 
-            // Advance hop offset
-            hop_offset += hop_field.encoded_length();
-
-            // Increase segment length counters for each segment the hop field is in.
-            seglens[seg_idx] += hop_field.encoded_length();
-
-            hop_fields.push(hop_field);
+            hop_offset += hop_len;
+            seglens[seg_idx] += hop_len;
         }
 
         // Adjust segment lengths
@@ -1080,6 +1076,35 @@ impl HummingbirdPath {
         meta_header.current_hop_field = HummingbirdHopfieldIndex::new(curr_hf_index)
             .ok_or(HummingbirdPathError::InvalidHopFieldIndex)?;
 
+        // Compute the exact packet length based on the actual selection.
+        let path_header_len = meta_header.encoded_length() + self.info_fields_len() + hop_offset;
+        let pkt_len = u16::try_from(path_header_len)
+            .ok()
+            .and_then(|v| v.checked_add(CommonHeader::LENGTH as u16))
+            .and_then(|v| v.checked_add(address_header_len))
+            .and_then(|v| v.checked_add(payload_len))
+            .ok_or(HummingbirdPathError::PayloadTooLong)?;
+
+        // Encode pass: build each hop field on the stack and write it out
+        // immediately through a slice cursor. The buffer is exactly sized and
+        // the reservations validated above, so no write can fail.
+        let mut buffer = vec![0u8; path_header_len];
+        let mut slice: &mut [u8] = &mut buffer;
+
+        meta_header.encode_to_unchecked(&mut slice);
+        for info in self.info_fields.iter() {
+            info.encode_to_unchecked(&mut slice);
+        }
+        for &(seg_idx, hop_idx, res) in &hops {
+            let hop = &self.segments[seg_idx][hop_idx].hop_field;
+            if let Some(res) = res {
+                hop.apply_reservation(meta_header, res, destination, pkt_len)?
+                    .encode_to_unchecked(&mut slice);
+            } else {
+                hop.encode_to_unchecked(&mut slice);
+            }
+        }
+
         // Deduct bandwidth from the selected buckets (still under the same tracker lock).
         if let Some(ref mut guard) = tracker_guard {
             for (_, _, res) in &hops {
@@ -1089,7 +1114,7 @@ impl HummingbirdPath {
             }
         }
 
-        Ok((meta_header, hop_fields))
+        Ok((meta_header, buffer.into()))
     }
 
     /// Computes the total packet length that would result from combining
@@ -1211,18 +1236,12 @@ impl HummingbirdPath {
         address_header_len: u16,
         buffer: &mut T,
     ) -> Result<(), HummingbirdPathError> {
-        let (meta_header, hops) =
-            self.apply_reservations(destination, payload_len, address_header_len)?;
-
-        // Encode fields to buffer
-        meta_header.encode_to(buffer)?;
-        for info in self.info_fields.iter() {
-            info.encode_to(buffer)?;
+        let (_, encoded) =
+            self.encode_with_reservations(destination, payload_len, address_header_len)?;
+        if buffer.remaining_mut() < encoded.len() {
+            return Err(InadequateBufferSize.into());
         }
-        for hop in hops {
-            hop.encode_to(buffer)?;
-        }
-
+        buffer.put_slice(&encoded);
         Ok(())
     }
 
@@ -1239,26 +1258,12 @@ impl HummingbirdPath {
         payload_len: u16,
         address_header_len: u16,
     ) -> Result<EncodedHummingbirdPath<Bytes>, HummingbirdPathError> {
-        let (meta_header, hops) =
-            self.apply_reservations(destination, payload_len, address_header_len)?;
-
-        let len = meta_header.encoded_length()
-            + self.info_fields_len()
-            + hops.iter().map(|hop| hop.encoded_length()).sum::<usize>();
-        let mut buffer = vec![0u8; len];
-        let mut slice: &mut [u8] = &mut buffer;
-
-        meta_header.encode_to(&mut slice)?;
-        for info in self.info_fields.iter() {
-            info.encode_to(&mut slice)?;
-        }
-        for hop in hops {
-            hop.encode_to(&mut slice)?;
-        }
+        let (meta_header, encoded_path) =
+            self.encode_with_reservations(destination, payload_len, address_header_len)?;
 
         Ok(EncodedHummingbirdPath {
             meta_header,
-            encoded_path: buffer.into(),
+            encoded_path,
         })
     }
 
