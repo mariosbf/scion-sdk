@@ -586,6 +586,10 @@ impl HummingbirdPathHop {
     }
 }
 
+/// A hop's flat position (segment index, hop index within the segment) paired
+/// with the reservation selected for it when encoding, if any.
+type HopWithReservation<'a> = (usize, usize, Option<&'a Reservation>);
+
 /// A fully decoded Hummingbird data plane path. It can be used to build new paths
 /// or to modify existing ones. If you only need to read information, use
 /// [EncodedHummingbirdPath] instead for better performance.
@@ -895,7 +899,7 @@ impl HummingbirdPath {
         pkt_len: usize,
         mut tracker: Option<&mut ReservationTracker>,
         strict: bool,
-    ) -> Result<Vec<(usize, usize, Option<Reservation>)>, HummingbirdPathError> {
+    ) -> Result<Vec<HopWithReservation<'_>>, HummingbirdPathError> {
         let mut hop_fields = Vec::with_capacity(self.num_hopfields());
 
         for (seg_idx, segment) in self.segments.iter().enumerate() {
@@ -934,9 +938,9 @@ impl HummingbirdPath {
                     if selected.is_none() && strict {
                         return Err(HummingbirdPathError::BandwidthExceeded);
                     }
-                    selected.map(|v| v.0.clone())
+                    selected.map(|v| v.0)
                 } else {
-                    reservations.first().cloned()
+                    reservations.first()
                 };
                 hop_fields.push((seg_idx, hop_idx, reservation));
             }
@@ -957,7 +961,7 @@ impl HummingbirdPath {
     /// info fields + hop fields) that would result from encoding `hops`,
     /// where a hop paired with `Some` reservation becomes a flyover hop
     /// field and one paired with `None` stays a standard hop field.
-    fn path_header_len(&self, hops: &[(usize, usize, Option<Reservation>)]) -> usize {
+    fn path_header_len(&self, hops: &[HopWithReservation]) -> usize {
         let flyover_count = hops.iter().filter(|(_, _, res)| res.is_some()).count();
 
         HummingbirdMetaHeader::LENGTH
@@ -1033,13 +1037,7 @@ impl HummingbirdPath {
         let mut seglens = [0; 3];
         let mut hop_fields = Vec::with_capacity(self.num_hopfields());
 
-        // Collect reservation infos for deduction after encoding (while hop_fields is still alive).
-        let deduct_infos: Vec<_> = hops
-            .iter()
-            .filter_map(|(_, _, res)| res.as_ref().map(|r| r.info.clone()))
-            .collect();
-
-        for (seg_idx, hop_idx, res) in hops {
+        for &(seg_idx, hop_idx, res) in &hops {
             let hop = &self.segments[seg_idx][hop_idx].hop_field;
             let hop_field = if let Some(res) = res {
                 // If the matched hop field is before the current hop field, the
@@ -1051,7 +1049,7 @@ impl HummingbirdPath {
 
                 HummingbirdHopField::Flyover(hop.apply_reservation(
                     meta_header,
-                    &res,
+                    res,
                     destination,
                     pkt_len,
                 )?)
@@ -1080,8 +1078,10 @@ impl HummingbirdPath {
 
         // Deduct bandwidth from the selected buckets (still under the same tracker lock).
         if let Some(ref mut guard) = tracker_guard {
-            for info in &deduct_infos {
-                guard.deduct_reservation(info, pkt_len as usize);
+            for (_, _, res) in &hops {
+                if let Some(reservation) = res {
+                    guard.deduct_reservation(&reservation.info, pkt_len as usize);
+                }
             }
         }
 
@@ -1165,7 +1165,7 @@ impl HummingbirdPath {
         let reservations = hops
             .iter()
             .enumerate()
-            .filter_map(|(flat_idx, (_, _, res))| res.as_ref().map(|r| (flat_idx as u8, r)));
+            .filter_map(|(flat_idx, &(_, _, res))| res.map(|r| (flat_idx as u8, r)));
 
         let macs = generate_flyover_macs_from_reservations(
             destination,
@@ -2047,13 +2047,13 @@ mod tests {
         )
         .unwrap();
 
-        let hops_no_res: Vec<(usize, usize, Option<Reservation>)> =
+        let hops_no_res: Vec<(usize, usize, Option<&Reservation>)> =
             vec![(0, 0, None), (0, 1, None)];
         assert_eq!(path.path_header_len(&hops_no_res), 44);
 
         let res = make_reservation(1, 2, 1000, 200, 1024);
-        let hops_with_res: Vec<(usize, usize, Option<Reservation>)> =
-            vec![(0, 0, Some(res)), (0, 1, None)];
+        let hops_with_res: Vec<(usize, usize, Option<&Reservation>)> =
+            vec![(0, 0, Some(&res)), (0, 1, None)];
         assert_eq!(path.path_header_len(&hops_with_res), 52);
     }
 
