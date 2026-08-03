@@ -44,5 +44,9 @@ tokio = { version = "1.45.1", features = [
 name = "checksum"
 harness = false
 
+[[bench]]
+name = "hummingbird_path"
+harness = false
+
 [lints]
 workspace = true
