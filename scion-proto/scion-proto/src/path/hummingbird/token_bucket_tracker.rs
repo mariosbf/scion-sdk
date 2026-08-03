@@ -8,7 +8,7 @@ use std::{
 use chrono::{DateTime, Utc};
 
 use super::{
-    reservation_tracker::{ReservationTracker, ReservationTrackerError, Selected},
+    reservation_tracker::{ReservationTracker, ReservationTrackerError, Selected, Ticket},
     token_bucket::TokenBucket,
 };
 use crate::{
@@ -16,15 +16,36 @@ use crate::{
     hummingbird::{Reservation, ReservationInfo},
 };
 
+/// Identifies the bucket a reservation draws from. Reservations sharing an
+/// ISD-AS, reservation ID and start time share a bucket.
+type BucketKey = (IsdAsn, u32, DateTime<Utc>);
+
+/// A token bucket together with the key it is indexed by and the instant after
+/// which it may be dropped.
+#[derive(Debug)]
+struct BucketEntry {
+    key: BucketKey,
+    end: SystemTime,
+    bucket: TokenBucket,
+}
+
 /// Client-side token-bucket enforcer for Hummingbird reservations.
 ///
 /// Keeps one bucket per reservation and refuses hops whose reservations are all
 /// expired or out of tokens, which fails the encode. Wrap in
 /// [`Lenient`][super::reservation_tracker::Lenient] to fall back to standard hop
 /// fields instead.
+///
+/// Buckets live in a slab rather than directly in the map, so that a selection
+/// can hand its slot to the matching commit through a [`Ticket`] instead of
+/// hashing the key a second time.
 #[derive(Debug)]
 pub struct TokenBucketTracker {
-    token_buckets: HashMap<(IsdAsn, u32, DateTime<Utc>), (SystemTime, TokenBucket)>,
+    buckets: Vec<BucketEntry>,
+    slots: HashMap<BucketKey, usize>,
+    /// Bumped whenever cleanup moves buckets within the slab, invalidating every
+    /// ticket issued before it.
+    generation: u32,
     last_cleanup: Instant,
     cleanup_interval: Duration,
 }
@@ -33,7 +54,9 @@ impl TokenBucketTracker {
     /// Creates a new [`TokenBucketTracker`].
     pub fn new() -> Self {
         Self {
-            token_buckets: HashMap::new(),
+            buckets: Vec::new(),
+            slots: HashMap::new(),
+            generation: 0,
             last_cleanup: Instant::now(),
             cleanup_interval: Duration::from_secs(60),
         }
@@ -48,27 +71,72 @@ impl TokenBucketTracker {
     pub fn cleanup_if_due(&mut self) {
         let now = Instant::now();
         if now.duration_since(self.last_cleanup) >= self.cleanup_interval {
-            let sys_now = SystemTime::now();
-            self.token_buckets.retain(|_, (end, _)| *end > sys_now);
+            self.cleanup(SystemTime::now());
             self.last_cleanup = now;
         }
     }
 
+    /// Drops every bucket whose reservation ended before `now`, reindexing the
+    /// slab if anything was removed.
+    fn cleanup(&mut self, now: SystemTime) {
+        let before = self.buckets.len();
+        self.buckets.retain(|entry| entry.end > now);
+
+        if self.buckets.len() == before {
+            return;
+        }
+
+        // Retaining shifted the surviving buckets down, so every slot recorded
+        // in the map — and in any ticket already issued — now points elsewhere.
+        self.slots.clear();
+        for (slot, entry) in self.buckets.iter().enumerate() {
+            self.slots.insert(entry.key, slot);
+        }
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Returns the slot of `reservation`'s bucket, creating it if needed.
+    fn slot_for(&mut self, reservation: &ReservationInfo) -> usize {
+        let key = (reservation.isd_as, reservation.res_id, reservation.start);
+
+        if let Some(&slot) = self.slots.get(&key) {
+            return slot;
+        }
+
+        let slot = self.buckets.len();
+        self.buckets.push(BucketEntry {
+            key,
+            end: reservation.end().into(),
+            bucket: TokenBucket::new(
+                reservation.start().into(),
+                reservation.bandwidth.to_bytes_per_sec() as i64,
+                reservation.bandwidth,
+            ),
+        });
+        self.slots.insert(key, slot);
+        slot
+    }
+
     fn bucket_for(&mut self, reservation: &ReservationInfo) -> &mut TokenBucket {
-        &mut self
-            .token_buckets
-            .entry((reservation.isd_as, reservation.res_id, reservation.start))
-            .or_insert_with(|| {
-                (
-                    reservation.end().into(),
-                    TokenBucket::new(
-                        reservation.start().into(),
-                        reservation.bandwidth.to_bytes_per_sec() as i64,
-                        reservation.bandwidth,
-                    ),
-                )
-            })
-            .1
+        let slot = self.slot_for(reservation);
+        &mut self.buckets[slot].bucket
+    }
+
+    /// Issues a ticket for `slot`, valid until the next cleanup that moves buckets.
+    fn ticket_for(&self, slot: usize) -> Ticket {
+        Ticket::new((u64::from(self.generation) << 32) | slot as u64)
+    }
+
+    /// Resolves a ticket back to a slot, or `None` if it was not issued by this
+    /// tracker's current generation.
+    fn slot_of(&self, ticket: Ticket) -> Option<usize> {
+        let value = ticket.value();
+        if value == Ticket::NONE.value() || (value >> 32) as u32 != self.generation {
+            return None;
+        }
+
+        let slot = (value & u64::from(u32::MAX)) as usize;
+        (slot < self.buckets.len()).then_some(slot)
     }
 
     /// Check time validity and bandwidth availability without deducting tokens.
@@ -113,11 +181,11 @@ impl TokenBucketTracker {
     /// Caller must have called [`check_reservation`][Self::check_reservation]
     /// first to confirm availability. No-op if the bucket does not exist.
     pub fn deduct_reservation(&mut self, reservation: &ReservationInfo, num_bytes: usize) {
-        if let Some((_, bucket)) =
-            self.token_buckets
-                .get_mut(&(reservation.isd_as, reservation.res_id, reservation.start))
+        if let Some(&slot) =
+            self.slots
+                .get(&(reservation.isd_as, reservation.res_id, reservation.start))
         {
-            bucket.use_unchecked(num_bytes);
+            self.buckets[slot].bucket.use_unchecked(num_bytes);
         }
     }
 
@@ -176,24 +244,36 @@ impl ReservationTracker for TokenBucketTracker {
         }
 
         let mut num_expired = 0;
-        let mut selected: Option<(&Reservation, usize)> = None;
+        let mut selected: Option<(&Reservation, i64, usize)> = None;
 
         for reservation in reservations {
-            match self.check_reservation_at(&reservation.info, max_pkt_len, now) {
-                Err(ReservationTrackerError::BandwidthExceeded) => continue,
-                Err(ReservationTrackerError::ReservationExpired) => num_expired += 1,
-                Ok(()) => {
-                    let available_bytes = self.available_bytes_at(&reservation.info, now);
+            if !is_valid_at(&reservation.info, now) {
+                num_expired += 1;
+                continue;
+            }
 
-                    if selected.is_none_or(|(_, bytes)| bytes > available_bytes) {
-                        selected = Some((reservation, available_bytes));
-                    }
-                }
+            // One lookup and one replenishment answer both questions: whether
+            // the bucket can carry the packet, and how much room it has left
+            // for the tie-break below.
+            let slot = self.slot_for(&reservation.info);
+            let tokens = self.buckets[slot].bucket.replenish_at(now);
+
+            if tokens < max_pkt_len as i64 {
+                continue;
+            }
+
+            if selected.is_none_or(|(_, other, _)| other > tokens) {
+                selected = Some((reservation, tokens, slot));
             }
         }
 
         match selected {
-            Some((reservation, _)) => Ok(Some(Selected::untracked(reservation))),
+            Some((reservation, _, slot)) => {
+                Ok(Some(Selected {
+                    reservation,
+                    ticket: self.ticket_for(slot),
+                }))
+            }
             // Report expiry over exhaustion: if nothing was even in its validity
             // window, that is the more useful diagnosis.
             None if num_expired == reservations.len() => {
@@ -204,7 +284,13 @@ impl ReservationTracker for TokenBucketTracker {
     }
 
     fn commit(&mut self, selected: &Selected<'_>, pkt_len: usize) {
-        self.deduct_reservation(&selected.reservation.info, pkt_len);
+        match self.slot_of(selected.ticket) {
+            Some(slot) => self.buckets[slot].bucket.use_unchecked(pkt_len),
+            // The ticket predates a cleanup, or came from another tracker.
+            // Fall back to the keyed lookup rather than deducting from a
+            // bucket that is no longer the one that was selected.
+            None => self.deduct_reservation(&selected.reservation.info, pkt_len),
+        }
     }
 
     fn available_bytes_for(
@@ -261,6 +347,18 @@ mod tests {
             bandwidth: Bandwidth::from_bytes_per_sec(bw_bytes_per_sec).unwrap(),
             start,
             duration: 60,
+        }
+    }
+
+    fn make_reservation_lasting(
+        res_id: u32,
+        start: DateTime<Utc>,
+        bw_bytes_per_sec: u64,
+        duration: u16,
+    ) -> ReservationInfo {
+        ReservationInfo {
+            duration,
+            ..make_reservation(res_id, start, bw_bytes_per_sec)
         }
     }
 
@@ -389,4 +487,55 @@ mod tests {
         assert!(before >= after + 512);
     }
 
+    #[test]
+    fn commit_with_a_ticket_from_another_tracker_still_deducts() {
+        let start = Utc::now() - ChronoDuration::seconds(1);
+        let now = SystemTime::now();
+        let candidates = vec![reservation(make_reservation(1, start, 1024))];
+
+        // A tracker that has never seen this reservation issues slot 0 for it;
+        // pointing that ticket at a different tracker must not silently deduct
+        // from whatever happens to sit in that tracker's slot 0.
+        let mut other = TokenBucketTracker::new();
+        let selected = other.select(&candidates, now, 1024).unwrap().unwrap();
+
+        let mut tracker = TokenBucketTracker::new();
+        tracker.commit(&selected, 512);
+        let after = tracker.available_bytes_at(&candidates[0].info, now);
+
+        // The fallback found no bucket for this reservation, so nothing was
+        // deducted and a fresh bucket reads as full.
+        assert_eq!(after, 1024);
+    }
+
+    #[test]
+    fn cleanup_invalidates_tickets_that_would_point_at_another_bucket() {
+        let start = Utc::now() - ChronoDuration::seconds(30);
+        let now = SystemTime::now();
+
+        // The first reservation expires well before the others, so dropping it
+        // shifts every later bucket down one slot.
+        let short = reservation(make_reservation_lasting(1, start, 1024, 60));
+        let long = |res_id| reservation(make_reservation_lasting(res_id, start, 1024, u16::MAX));
+        let (b, c, d) = (long(2), long(3), long(4));
+
+        let mut tracker = TokenBucketTracker::new();
+        for candidate in [&short, &b, &c, &d] {
+            let candidates = std::slice::from_ref(candidate);
+            tracker.select(candidates, now, 1).unwrap().unwrap();
+        }
+
+        // Select c, which currently sits in slot 2.
+        let candidates = vec![c.clone()];
+        let selected = tracker.select(&candidates, now, 1024).unwrap().unwrap();
+
+        // Drop the short reservation: c moves to slot 1, and slot 2 becomes d.
+        tracker.cleanup(now + Duration::from_secs(120));
+
+        tracker.commit(&selected, 512);
+
+        // The deduction must have followed c, not the bucket now in slot 2.
+        assert!(tracker.available_bytes_at(&c.info, now) <= 1024 - 512);
+        assert_eq!(tracker.available_bytes_at(&d.info, now), 1024);
+    }
 }

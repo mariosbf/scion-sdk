@@ -23,11 +23,12 @@ impl TokenBucket {
         }
     }
 
-    /// Returns `true` if enough tokens are available and updates the replenishment clock.
+    /// Replenishes up to `now` and returns the resulting token count, which may
+    /// be negative if the bucket was overdrawn.
     ///
-    /// Does NOT deduct tokens; call `use_unchecked` after a successful check.
-    pub fn check(&mut self, size: usize, now: SystemTime) -> bool {
-        let size = size as i64;
+    /// Both `check` and `available_at` are thin wrappers over this, so a caller
+    /// that wants both answers can replenish once and derive them itself.
+    pub(super) fn replenish_at(&mut self, now: SystemTime) -> i64 {
         if let Ok(elapsed) = now.duration_since(self.last_time_applied) {
             // Saturating on purpose: elapsed_nanos * rate overflows i64 once
             // elapsed > i64::MAX / rate — at high reservation rates (e.g.
@@ -44,7 +45,14 @@ impl TokenBucket {
                 (self.current_token + new_full_tokens).min(self.committed_burst_size);
             self.last_time_applied = now;
         }
-        self.current_token >= size
+        self.current_token
+    }
+
+    /// Returns `true` if enough tokens are available and updates the replenishment clock.
+    ///
+    /// Does NOT deduct tokens; call `use_unchecked` after a successful check.
+    pub fn check(&mut self, size: usize, now: SystemTime) -> bool {
+        self.replenish_at(now) >= size as i64
     }
 
     /// Deducts `size` bytes. Call only after `check` returns `true`.
@@ -66,18 +74,7 @@ impl TokenBucket {
     ///
     /// Updates the replenishment clock (same side-effect as `check`).
     pub(super) fn available_at(&mut self, now: SystemTime) -> i64 {
-        if let Ok(elapsed) = now.duration_since(self.last_time_applied) {
-            // Saturating for the same overflow reason as in `check`.
-            let new_nano_tokens = (elapsed.as_nanos() as i64)
-                .saturating_mul(self.committed_information_rate)
-                .saturating_add(self.current_nano_tokens);
-            let new_full_tokens = new_nano_tokens / 1_000_000_000;
-            self.current_nano_tokens = new_nano_tokens % 1_000_000_000;
-            self.current_token =
-                (self.current_token + new_full_tokens).min(self.committed_burst_size);
-            self.last_time_applied = now;
-        }
-        self.current_token.max(0)
+        self.replenish_at(now).max(0)
     }
 }
 
@@ -87,8 +84,9 @@ fn bandwidth_to_bytes_per_sec(bw: Bandwidth) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
 
     fn t(nanos: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_nanos(nanos)
