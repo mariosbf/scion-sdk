@@ -27,3 +27,6 @@ pub use reservation_tracker::{
 pub mod token_bucket_tracker;
 pub use token_bucket_tracker::TokenBucketTracker;
 
+/// Spreads traffic across reservations by bandwidth, without enforcing limits.
+pub mod probabilistic_tracker;
+pub use probabilistic_tracker::ProbabilisticTracker;

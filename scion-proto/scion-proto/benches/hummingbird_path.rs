@@ -23,10 +23,12 @@
 //!
 //! The untracked group attaches no reservation tracker, so no token-bucket
 //! state is consumed and repeated encoding of the same path is stable across
-//! iterations. The tracked group attaches a [`ReservationTracker`] in strict
-//! mode, measuring the bandwidth-enforcement cost real senders pay; the
-//! reservations' bandwidth (near the encoding maximum) refills the buckets
-//! much faster than the benchmark drains them, so encoding never falls back.
+//! iterations. The tracked group attaches a [`TokenBucketTracker`], measuring
+//! the bandwidth-enforcement cost real senders pay; the reservations'
+//! bandwidth (near the encoding maximum) refills the buckets much faster than
+//! the benchmark drains them, so encoding never falls back. The probabilistic
+//! group attaches a [`ProbabilisticTracker`], which selects by bandwidth but
+//! enforces nothing — the gap between the two is the price of enforcement.
 
 use std::{
     hint::black_box,
@@ -40,7 +42,7 @@ use scion_proto::{
     hummingbird::{Bandwidth, Reservation, ReservationInfo},
     path::{
         InfoField, StandardHopField,
-        hummingbird::{HbirdAuthKey, HummingbirdPath, TokenBucketTracker},
+        hummingbird::{HbirdAuthKey, HummingbirdPath, ProbabilisticTracker, TokenBucketTracker},
     },
 };
 
@@ -127,10 +129,10 @@ fn bench_to_encoded(c: &mut Criterion) {
     group.finish()
 }
 
-/// Same as [`bench_to_encoded`], but with a strict [`ReservationTracker`]
-/// attached — the configuration real senders run with. Measures the added
-/// cost of bandwidth enforcement: tracker lock, per-reservation expiry
-/// checks, and token-bucket accounting. Strict mode makes the benchmark fail
+/// Same as [`bench_to_encoded`], but with a [`TokenBucketTracker`] attached —
+/// the configuration real senders run with. Measures the added cost of
+/// bandwidth enforcement: tracker lock, per-reservation expiry checks, and
+/// token-bucket accounting. The tracker is strict, so the benchmark fails
 /// loudly (instead of silently encoding standard hops) if a bucket ever runs
 /// dry.
 fn bench_to_encoded_tracked(c: &mut Criterion) {
@@ -140,6 +142,46 @@ fn bench_to_encoded_tracked(c: &mut Criterion) {
     for (num_hops, num_flyovers) in [(2, 2), (6, 0), (6, 3), (6, 6)] {
         let path = path(num_hops, num_flyovers)
             .with_reservation_tracker(Arc::new(Mutex::new(TokenBucketTracker::new())));
+
+        // Sanity check outside the timed loop: every reservation must
+        // actually be applied, otherwise the benchmark measures fallback.
+        let encoded = path
+            .to_encoded(destination, PAYLOAD_LEN, ADDRESS_HEADER_LEN)
+            .unwrap();
+        assert_eq!(encoded.flyover_hop_fields().count(), num_flyovers as usize);
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{num_hops}hops_{num_flyovers}flyovers")),
+            &path,
+            |b, path| {
+                b.iter(|| {
+                    path.to_encoded(
+                        black_box(destination),
+                        black_box(PAYLOAD_LEN),
+                        black_box(ADDRESS_HEADER_LEN),
+                    )
+                    .unwrap()
+                })
+            },
+        );
+    }
+
+    group.finish()
+}
+
+/// Same as [`bench_to_encoded_tracked`], but with a [`ProbabilisticTracker`],
+/// which spreads traffic across reservations by bandwidth without enforcing
+/// any limit. The difference to the tracked group is what client-side
+/// bandwidth enforcement costs per packet.
+fn bench_to_encoded_probabilistic(c: &mut Criterion) {
+    let mut group = c.benchmark_group("HummingbirdPath::to_encoded (probabilistic)");
+    let destination = destination();
+
+    for (num_hops, num_flyovers) in [(2, 2), (6, 0), (6, 3), (6, 6)] {
+        // Fixed seed: selection must not vary between benchmark runs.
+        let path = path(num_hops, num_flyovers).with_reservation_tracker(Arc::new(Mutex::new(
+            ProbabilisticTracker::with_seed(0x5EED),
+        )));
 
         // Sanity check outside the timed loop: every reservation must
         // actually be applied, otherwise the benchmark measures fallback.
@@ -212,6 +254,7 @@ criterion_group!(
     benches,
     bench_to_encoded,
     bench_to_encoded_tracked,
+    bench_to_encoded_probabilistic,
     bench_standard_reference
 );
 criterion_main!(benches);
