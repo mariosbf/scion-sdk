@@ -40,7 +40,7 @@ use scion_proto::{
     hummingbird::{Bandwidth, Reservation, ReservationInfo},
     path::{
         InfoField, StandardHopField,
-        hummingbird::{HbirdAuthKey, HummingbirdPath, ReservationTracker},
+        hummingbird::{HbirdAuthKey, HummingbirdPath, TokenBucketTracker},
     },
 };
 
@@ -138,10 +138,8 @@ fn bench_to_encoded_tracked(c: &mut Criterion) {
     let destination = destination();
 
     for (num_hops, num_flyovers) in [(2, 2), (6, 0), (6, 3), (6, 6)] {
-        let path = path(num_hops, num_flyovers).with_reservation_tracker(
-            Arc::new(Mutex::new(ReservationTracker::new())),
-            true,
-        );
+        let path = path(num_hops, num_flyovers)
+            .with_reservation_tracker(Arc::new(Mutex::new(TokenBucketTracker::new())));
 
         // Sanity check outside the timed loop: every reservation must
         // actually be applied, otherwise the benchmark measures fallback.

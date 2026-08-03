@@ -1,13 +1,19 @@
-use std::{
-    collections::HashMap,
-    time::{Duration, Instant, SystemTime},
-};
+//! The reservation tracker interface used when encoding Hummingbird paths.
+//!
+//! Encoding a packet consults the tracker twice per hop: [`ReservationTracker::select`]
+//! picks which of the hop's reservations to use, and [`ReservationTracker::commit`]
+//! accounts for the packet once its exact length is known. The two are separate
+//! because reservation selection determines how many hop fields become flyovers,
+//! which in turn determines the packet length — so selection necessarily runs
+//! against an upper bound, and only the commit sees the real figure.
+//!
+//! Implementations decide their own enforcement policy. A tracker that returns an
+//! error makes encoding fail; wrap it in [`Lenient`] to have unusable hops fall
+//! back to standard hop fields instead.
 
-use chrono::{DateTime, Utc};
+use std::time::SystemTime;
 
-use crate::{address::IsdAsn, hummingbird::ReservationInfo};
-
-use super::token_bucket::TokenBucket;
+use crate::hummingbird::Reservation;
 
 /// Error returned by a Hummingbird reservation tracker.
 #[derive(Debug, thiserror::Error)]
@@ -20,215 +26,139 @@ pub enum ReservationTrackerError {
     BandwidthExceeded,
 }
 
-/// Client-side token-bucket enforcer for Hummingbird reservations.
-#[derive(Debug)]
-pub struct ReservationTracker {
-    token_buckets: HashMap<(IsdAsn, u32, DateTime<Utc>), (SystemTime, TokenBucket)>,
-    last_cleanup: Instant,
-    cleanup_interval: Duration,
-}
-
-impl ReservationTracker {
-    /// Creates a new [`ReservationTracker`].
-    pub fn new() -> Self {
-        Self {
-            token_buckets: HashMap::new(),
-            last_cleanup: Instant::now(),
-            cleanup_interval: Duration::from_secs(60),
-        }
-    }
-
-    /// Drops expired token buckets, if the cleanup interval has elapsed.
-    ///
-    /// [`Self::check_reservation`] does this itself. Callers that use the
-    /// `_at` variants in a loop should call this once per batch instead, so
-    /// that the monotonic clock is read once rather than per reservation.
-    pub fn cleanup_if_due(&mut self) {
-        let now = Instant::now();
-        if now.duration_since(self.last_cleanup) >= self.cleanup_interval {
-            let sys_now = SystemTime::now();
-            self.token_buckets.retain(|_, (end, _)| *end > sys_now);
-            self.last_cleanup = now;
-        }
-    }
-
-    fn bucket_for(&mut self, reservation: &ReservationInfo) -> &mut TokenBucket {
-        &mut self
-            .token_buckets
-            .entry((reservation.isd_as, reservation.res_id, reservation.start))
-            .or_insert_with(|| {
-                (
-                    reservation.end().into(),
-                    TokenBucket::new(
-                        reservation.start().into(),
-                        reservation.bandwidth.to_bytes_per_sec() as i64,
-                        reservation.bandwidth,
-                    ),
-                )
-            })
-            .1
-    }
-
-    /// Check time validity and bandwidth availability without deducting tokens.
-    ///
-    /// Call [`deduct_reservation`] after a successful check to consume the tokens.
-    pub fn check_reservation(
-        &mut self,
-        reservation: &ReservationInfo,
-        num_bytes: usize,
-    ) -> Result<(), ReservationTrackerError> {
-        self.cleanup_if_due();
-        self.check_reservation_at(reservation, num_bytes, SystemTime::now())
-    }
-
-    /// Same as [`Self::check_reservation`], but takes the current time instead
-    /// of reading the clock, and skips the periodic cleanup.
-    ///
-    /// Checking several reservations for one packet should read the clock once
-    /// and call this, both to avoid the repeated clock reads and so that every
-    /// reservation is judged at the same instant. Pair with one
-    /// [`Self::cleanup_if_due`] call per batch.
-    pub fn check_reservation_at(
-        &mut self,
-        reservation: &ReservationInfo,
-        num_bytes: usize,
-        now: SystemTime,
-    ) -> Result<(), ReservationTrackerError> {
-        if !is_valid_at(reservation, now) {
-            return Err(ReservationTrackerError::ReservationExpired);
-        }
-
-        if self.bucket_for(reservation).check(num_bytes, now) {
-            Ok(())
-        } else {
-            Err(ReservationTrackerError::BandwidthExceeded)
-        }
-    }
-
-    /// Deduct `num_bytes` from the reservation's token bucket.
-    ///
-    /// Caller must have called [`check_reservation`] first to confirm availability.
-    /// No-op if the bucket does not exist.
-    pub fn deduct_reservation(&mut self, reservation: &ReservationInfo, num_bytes: usize) {
-        if let Some((_, bucket)) = self.token_buckets.get_mut(&(
-            reservation.isd_as,
-            reservation.res_id,
-            reservation.start,
-        )) {
-            bucket.use_unchecked(num_bytes);
-        }
-    }
-
-    /// Returns the number of bytes currently available for `reservation` at this instant.
-    ///
-    /// Returns 0 if the reservation is expired or has no remaining tokens.
-    pub fn available_bytes(&mut self, reservation: &ReservationInfo) -> usize {
-        self.available_bytes_at(reservation, SystemTime::now())
-    }
-
-    /// Same as [`Self::available_bytes`], but takes the current time instead of
-    /// reading the clock.
-    pub fn available_bytes_at(&mut self, reservation: &ReservationInfo, now: SystemTime) -> usize {
-        if !is_valid_at(reservation, now) {
-            return 0;
-        }
-
-        self.bucket_for(reservation).available_at(now).max(0) as usize
-    }
-
-    /// Check and, on success, deduct `pkt_size` bytes from the reservation's token bucket.
-    pub fn use_reservation(
-        &mut self,
-        reservation: &ReservationInfo,
-        num_bytes: usize,
-    ) -> Result<(), ReservationTrackerError> {
-        let now = SystemTime::now();
-
-        if !is_valid_at(reservation, now) {
-            return Err(ReservationTrackerError::ReservationExpired);
-        }
-
-        if self.bucket_for(reservation).use_checked(num_bytes, now) {
-            Ok(())
-        } else {
-            Err(ReservationTrackerError::BandwidthExceeded)
-        }
-    }
-}
-
-/// Whether `reservation`'s validity window contains `now`.
+/// An opaque reference to whatever state a tracker resolved while selecting a
+/// reservation, handed back to [`ReservationTracker::commit`] so that the tracker
+/// need not look it up a second time.
 ///
-/// Both bounds are inclusive, matching the checks this tracker has always
-/// performed — unlike [`ReservationInfo::is_valid_now`], whose upper bound is
-/// exclusive.
-fn is_valid_at(reservation: &ReservationInfo, now: SystemTime) -> bool {
-    let start: SystemTime = reservation.start().into();
-    let end: SystemTime = reservation.end().into();
+/// The meaning of the value is entirely up to the tracker that issued it — no
+/// other code may interpret it. Trackers that keep no per-reservation state
+/// issue [`Ticket::NONE`] and ignore it on commit.
+///
+/// This is deliberately a concrete type rather than an associated type on the
+/// trait: [`HummingbirdPath`] stores its tracker as a trait object, and an
+/// associated type would make the trait unusable as `dyn`.
+///
+/// [`HummingbirdPath`]: crate::path::hummingbird::HummingbirdPath
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ticket(u64);
 
-    start <= now && now <= end
-}
+impl Ticket {
+    /// The ticket issued by trackers that carry no state between select and commit.
+    pub const NONE: Ticket = Ticket(u64::MAX);
 
-impl Default for ReservationTracker {
-    fn default() -> Self {
-        Self::new()
+    /// Creates a ticket carrying `value`.
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the value this ticket carries.
+    pub fn value(self) -> u64 {
+        self.0
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use chrono::Duration as ChronoDuration;
+/// A reservation chosen by a tracker for one hop, together with the tracker's
+/// [`Ticket`] for it.
+#[derive(Debug, Clone, Copy)]
+pub struct Selected<'a> {
+    /// The chosen reservation, borrowed from the slice passed to
+    /// [`ReservationTracker::select`].
+    pub reservation: &'a Reservation,
+    /// The issuing tracker's handle for the state behind `reservation`.
+    pub ticket: Ticket,
+}
 
-    use super::*;
-    use crate::{
-        address::{Asn, Isd},
-        hummingbird::Bandwidth,
-    };
-
-    fn make_reservation(
-        res_id: u32,
-        start: DateTime<Utc>,
-        bw_bytes_per_sec: u64,
-    ) -> ReservationInfo {
-        ReservationInfo {
-            isd_as: IsdAsn::new(Isd::new(1), Asn::new(1)),
-            ingress_interface: 1,
-            egress_interface: 2,
-            res_id,
-            bandwidth: Bandwidth::from_bytes_per_sec(bw_bytes_per_sec).unwrap(),
-            start,
-            duration: 60,
+impl<'a> Selected<'a> {
+    /// Creates a selection of `reservation` with no associated tracker state.
+    pub fn untracked(reservation: &'a Reservation) -> Self {
+        Self {
+            reservation,
+            ticket: Ticket::NONE,
         }
     }
+}
 
-    #[test]
-    fn different_start_times_get_independent_buckets() {
-        let mut tracker = ReservationTracker::new();
-        let now = Utc::now();
-
-        let res_a = make_reservation(42, now - ChronoDuration::seconds(10), 1024);
-        let res_b = make_reservation(42, now - ChronoDuration::seconds(5), 1024);
-
-        // Exhaust res_a's bucket entirely.
-        tracker.use_reservation(&res_a, 1024).unwrap();
-        assert!(tracker.use_reservation(&res_a, 1).is_err());
-
-        // res_b shares (isd_as, res_id) with res_a but has a different start time, so it
-        // must have gotten its own, untouched bucket.
-        tracker.use_reservation(&res_b, 1024).unwrap();
+/// Chooses which reservation to apply to each hop of a Hummingbird path, and
+/// accounts for the packets that are sent using them.
+///
+/// The trait is used through `dyn`, so it takes reservations as a slice and
+/// returns the concrete [`Ticket`] type rather than being generic over either.
+pub trait ReservationTracker: Send {
+    /// Called once per packet, before the first [`Self::select`] for that packet
+    /// and under the same lock, for trackers that keep per-packet or periodic
+    /// state. `now` is the same instant every `select` for this packet will see.
+    ///
+    /// Not called at all for paths that carry no reservations.
+    fn begin_packet(&mut self, now: SystemTime) {
+        let _ = now;
     }
 
-    #[test]
-    fn same_start_time_shares_bucket() {
-        let mut tracker = ReservationTracker::new();
-        let start = Utc::now() - ChronoDuration::seconds(10);
+    /// Chooses which of a hop's `reservations` to use, if any.
+    ///
+    /// `max_pkt_len` is an upper bound on the length of the packet being built:
+    /// the exact length is not yet known at selection time, and the value passed
+    /// to [`Self::commit`] is never larger.
+    ///
+    /// Returns `Ok(None)` when there is nothing to choose from, and an error when
+    /// candidates existed but none was usable — which fails the encode. Wrap the
+    /// tracker in [`Lenient`] to fall back to a standard hop field instead.
+    fn select<'a>(
+        &mut self,
+        reservations: &'a [Reservation],
+        now: SystemTime,
+        max_pkt_len: usize,
+    ) -> Result<Option<Selected<'a>>, ReservationTrackerError>;
 
-        let res_a = make_reservation(42, start, 1024);
-        let res_a_again = make_reservation(42, start, 1024);
+    /// Accounts for a packet of exactly `pkt_len` bytes sent using a reservation
+    /// previously returned by [`Self::select`].
+    fn commit(&mut self, selected: &Selected<'_>, pkt_len: usize);
 
-        tracker.use_reservation(&res_a, 1024).unwrap();
-        assert!(matches!(
-            tracker.use_reservation(&res_a_again, 1),
-            Err(ReservationTrackerError::BandwidthExceeded)
-        ));
+    /// Returns how many bytes may currently be sent over the best of
+    /// `reservations`, if the tracker tracks that at all.
+    ///
+    /// Purely a query: it neither selects nor commits. The default returns `None`,
+    /// for trackers that enforce no bandwidth limit.
+    fn available_bytes_for(
+        &mut self,
+        reservations: &[Reservation],
+        now: SystemTime,
+    ) -> Option<usize> {
+        let _ = (reservations, now);
+        None
+    }
+}
+
+/// Wraps a tracker so that a hop with no usable reservation degrades to a
+/// standard hop field instead of failing the encode.
+#[derive(Debug, Clone, Default)]
+pub struct Lenient<T>(pub T);
+
+impl<T: ReservationTracker> ReservationTracker for Lenient<T> {
+    fn begin_packet(&mut self, now: SystemTime) {
+        self.0.begin_packet(now)
+    }
+
+    fn select<'a>(
+        &mut self,
+        reservations: &'a [Reservation],
+        now: SystemTime,
+        max_pkt_len: usize,
+    ) -> Result<Option<Selected<'a>>, ReservationTrackerError> {
+        Ok(self
+            .0
+            .select(reservations, now, max_pkt_len)
+            .unwrap_or(None))
+    }
+
+    fn commit(&mut self, selected: &Selected<'_>, pkt_len: usize) {
+        self.0.commit(selected, pkt_len)
+    }
+
+    fn available_bytes_for(
+        &mut self,
+        reservations: &[Reservation],
+        now: SystemTime,
+    ) -> Option<usize> {
+        self.0.available_bytes_for(reservations, now)
     }
 }

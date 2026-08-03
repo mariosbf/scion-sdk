@@ -17,7 +17,13 @@ pub use flyover_mac_path::*;
 
 pub(super) mod token_bucket;
 
-/// Tracks per-flow Hummingbird reservations and enforces bandwidth limits.
+/// Chooses which reservation to apply to each hop when encoding a path.
 pub mod reservation_tracker;
-pub use reservation_tracker::{ReservationTracker, ReservationTrackerError};
+pub use reservation_tracker::{
+    Lenient, ReservationTracker, ReservationTrackerError, Selected, Ticket,
+};
+
+/// Tracks per-flow Hummingbird reservations and enforces bandwidth limits.
+pub mod token_bucket_tracker;
+pub use token_bucket_tracker::TokenBucketTracker;
 
