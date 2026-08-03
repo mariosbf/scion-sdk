@@ -117,5 +117,46 @@ fn bench_to_encoded(c: &mut Criterion) {
     group.finish()
 }
 
-criterion_group!(benches, bench_to_encoded);
+/// Builds the wire bytes of a standard SCION path with one segment of
+/// `num_hops` hops: 4-byte meta header, one 8-byte info field, and 12 bytes
+/// per hop field.
+fn standard_path_bytes(num_hops: u8) -> bytes::Bytes {
+    let meta: u32 = (num_hops as u32) << 12;
+    let mut v = Vec::from(meta.to_be_bytes());
+    // Info field: cons_dir flag, seg_id, timestamp.
+    v.extend_from_slice(b"\x01\x00\x13\x37\x65\x00\x00\x00");
+    for i in 0..num_hops {
+        v.extend_from_slice(&[0, 63, 0, i, 0, i + 1, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42]);
+    }
+    bytes::Bytes::from(v)
+}
+
+/// Reference: the per-packet cost of using a regular (standard) SCION path,
+/// whose wire bytes are static — either a `Bytes` refcount clone (reusing the
+/// cached encoding) or a `deep_copy` (fresh allocation + memcpy).
+fn bench_standard_reference(c: &mut Criterion) {
+    use scion_proto::{path::EncodedStandardPath, wire_encoding::WireDecode};
+
+    let mut group = c.benchmark_group("StandardPath reference");
+
+    for num_hops in [2u8, 6] {
+        let bytes = standard_path_bytes(num_hops);
+        let path = EncodedStandardPath::decode(&mut bytes.clone()).unwrap();
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{num_hops}hops_bytes_clone")),
+            &bytes,
+            |b, bytes| b.iter(|| black_box(bytes.clone())),
+        );
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{num_hops}hops_deep_copy")),
+            &path,
+            |b, path| b.iter(|| black_box(path.deep_copy())),
+        );
+    }
+
+    group.finish()
+}
+
+criterion_group!(benches, bench_to_encoded, bench_standard_reference);
 criterion_main!(benches);
