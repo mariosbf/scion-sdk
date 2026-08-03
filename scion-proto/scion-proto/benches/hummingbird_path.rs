@@ -21,10 +21,17 @@
 //! the baseline; the difference to the flyover configurations is the cost of
 //! applying reservations (flyover MAC computation and aggregation).
 //!
-//! No reservation tracker is attached, so no token-bucket state is consumed
-//! and repeated encoding of the same path is stable across iterations.
+//! The untracked group attaches no reservation tracker, so no token-bucket
+//! state is consumed and repeated encoding of the same path is stable across
+//! iterations. The tracked group attaches a [`ReservationTracker`] in strict
+//! mode, measuring the bandwidth-enforcement cost real senders pay; the
+//! reservations' bandwidth (near the encoding maximum) refills the buckets
+//! much faster than the benchmark drains them, so encoding never falls back.
 
-use std::hint::black_box;
+use std::{
+    hint::black_box,
+    sync::{Arc, Mutex},
+};
 
 use chrono::{Duration, Utc};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -33,7 +40,7 @@ use scion_proto::{
     hummingbird::{Bandwidth, Reservation, ReservationInfo},
     path::{
         InfoField, StandardHopField,
-        hummingbird::{HbirdAuthKey, HummingbirdPath},
+        hummingbird::{HbirdAuthKey, HummingbirdPath, ReservationTracker},
     },
 };
 
@@ -62,7 +69,10 @@ fn reservation(hop_idx: u8) -> Reservation {
             ingress_interface: hop_idx as u16,
             egress_interface: hop_idx as u16 + 1,
             res_id: 1000 + hop_idx as u32,
-            bandwidth: Bandwidth::from_bytes_per_sec(1_000_000).unwrap(),
+            // Near the encoding maximum (~67 GB/s), so that in the tracked
+            // benchmarks the token buckets refill much faster than the
+            // benchmark loop drains them. Irrelevant to the untracked group.
+            bandwidth: Bandwidth::from_bytes_per_sec(60_000_000_000).unwrap(),
             start: Utc::now() - Duration::seconds(60),
             duration: u16::MAX,
         },
@@ -98,6 +108,48 @@ fn bench_to_encoded(c: &mut Criterion) {
 
     for (num_hops, num_flyovers) in [(2, 0), (2, 2), (6, 0), (6, 3), (6, 6)] {
         let path = path(num_hops, num_flyovers);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{num_hops}hops_{num_flyovers}flyovers")),
+            &path,
+            |b, path| {
+                b.iter(|| {
+                    path.to_encoded(
+                        black_box(destination),
+                        black_box(PAYLOAD_LEN),
+                        black_box(ADDRESS_HEADER_LEN),
+                    )
+                    .unwrap()
+                })
+            },
+        );
+    }
+
+    group.finish()
+}
+
+/// Same as [`bench_to_encoded`], but with a strict [`ReservationTracker`]
+/// attached — the configuration real senders run with. Measures the added
+/// cost of bandwidth enforcement: tracker lock, per-reservation expiry
+/// checks, and token-bucket accounting. Strict mode makes the benchmark fail
+/// loudly (instead of silently encoding standard hops) if a bucket ever runs
+/// dry.
+fn bench_to_encoded_tracked(c: &mut Criterion) {
+    let mut group = c.benchmark_group("HummingbirdPath::to_encoded (tracked)");
+    let destination = destination();
+
+    for (num_hops, num_flyovers) in [(2, 2), (6, 0), (6, 3), (6, 6)] {
+        let path = path(num_hops, num_flyovers).with_reservation_tracker(
+            Arc::new(Mutex::new(ReservationTracker::new())),
+            true,
+        );
+
+        // Sanity check outside the timed loop: every reservation must
+        // actually be applied, otherwise the benchmark measures fallback.
+        let encoded = path
+            .to_encoded(destination, PAYLOAD_LEN, ADDRESS_HEADER_LEN)
+            .unwrap();
+        assert_eq!(encoded.flyover_hop_fields().count(), num_flyovers as usize);
+
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{num_hops}hops_{num_flyovers}flyovers")),
             &path,
@@ -158,5 +210,10 @@ fn bench_standard_reference(c: &mut Criterion) {
     group.finish()
 }
 
-criterion_group!(benches, bench_to_encoded, bench_standard_reference);
+criterion_group!(
+    benches,
+    bench_to_encoded,
+    bench_to_encoded_tracked,
+    bench_standard_reference
+);
 criterion_main!(benches);
