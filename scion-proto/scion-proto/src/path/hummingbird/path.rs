@@ -2,6 +2,7 @@
 
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use chrono::{DateTime, Utc};
@@ -984,22 +985,25 @@ impl HummingbirdPath {
         // Create a copy of the meta header
         let mut meta_header = self.path_meta;
 
-        // Set time in meta header
-        let time = Utc::now();
+        let time = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| {
+            HummingbirdPathError::InvalidBaseTimestamp(-(e.duration().as_secs() as i64))
+        })?;
         meta_header.base_timestamp = time
-            .timestamp()
+            .as_secs()
             .try_into()
             .ok()
             .and_then(HummingbirdBaseTimestamp::new)
-            .ok_or(HummingbirdPathError::InvalidBaseTimestamp(time.timestamp()))?;
+            .ok_or(HummingbirdPathError::InvalidBaseTimestamp(
+                time.as_secs() as i64
+            ))?;
 
         meta_header.millis_timestamp = time
-            .timestamp_subsec_millis()
+            .subsec_millis()
             .try_into()
             .ok()
             .and_then(HummingbirdMillisTimestamp::new)
             .ok_or(HummingbirdPathError::InvalidMillisTimestamp(
-                time.timestamp_subsec_millis(),
+                time.subsec_millis(),
             ))?;
 
         // Conservative upper bound on path header length — all reservable hops as flyovers.
