@@ -469,7 +469,7 @@ impl StandardHopField {
         pkt_len: u16,
     ) -> Result<FlyoverHopField, HummingbirdPathError> {
         let res_start_offset = reservation
-            .info
+            .info()
             .res_start_offset(meta_header.base_timestamp())
             .ok_or(HummingbirdPathError::ReservationNotValid)?;
 
@@ -492,10 +492,10 @@ impl StandardHopField {
             cons_ingress: self.cons_ingress,
             cons_egress: self.cons_egress,
             aggregated_mac: mac,
-            res_id: reservation.info.res_id,
-            res_bw: reservation.info.bandwidth,
+            res_id: reservation.info().res_id,
+            res_bw: reservation.info().bandwidth,
             res_start_offset,
-            res_duration: reservation.info.duration,
+            res_duration: reservation.info().duration,
         })
     }
 

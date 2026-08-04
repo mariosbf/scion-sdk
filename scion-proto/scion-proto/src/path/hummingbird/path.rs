@@ -783,9 +783,11 @@ impl HummingbirdPath {
                     egress
                 };
 
-                if reservation.info.ingress_interface == ingress
-                    && reservation.info.egress_interface == egress
-                    && hop.isd_asn.is_some_and(|ia| ia == reservation.info.isd_as)
+                if reservation.info().ingress_interface == ingress
+                    && reservation.info().egress_interface == egress
+                    && hop
+                        .isd_asn
+                        .is_some_and(|ia| ia == reservation.info().isd_as)
                 {
                     hop.reservations.push(reservation.clone());
                     result = true;
@@ -1016,7 +1018,7 @@ impl HummingbirdPath {
                 // that no error can occur after bytes have been written.
                 selected
                     .reservation
-                    .info
+                    .info()
                     .res_start_offset(meta_header.base_timestamp())
                     .ok_or(HummingbirdPathError::ReservationNotValid)?;
 
@@ -2344,9 +2346,9 @@ mod tests {
         assert_eq!(macs.payload_length_suggestion, 200);
         assert_eq!(macs.entries.len(), 1);
         assert_eq!(macs.entries[0].hop_index, 0);
-        assert_eq!(macs.entries[0].res_id, res.info.res_id);
-        assert_eq!(macs.entries[0].bandwidth, res.info.bandwidth);
-        assert_eq!(macs.entries[0].res_duration, res.info.duration);
+        assert_eq!(macs.entries[0].res_id, res.info().res_id);
+        assert_eq!(macs.entries[0].bandwidth, res.info().bandwidth);
+        assert_eq!(macs.entries[0].res_duration, res.info().duration);
     }
 
     #[test]

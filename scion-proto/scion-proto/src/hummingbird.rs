@@ -2,7 +2,10 @@
 //!
 //! See also [path::hummingbird].
 
-use std::sync::{Arc, OnceLock};
+use std::{
+    sync::{Arc, OnceLock},
+    time::SystemTime,
+};
 
 use aes::{Aes128Enc, cipher::KeyInit};
 use bytes::{Buf, BufMut, Bytes};
@@ -298,13 +301,28 @@ impl WireDecode<Bytes> for ReservationInfo {
 #[derive(Debug, Clone)]
 pub struct Reservation {
     /// Information about the reservation.
-    pub info: ReservationInfo,
+    ///
+    /// Kept private so it cannot change after construction: [`Self::valid_from`]
+    /// and [`Self::valid_until`] cache its validity window.
+    info: ReservationInfo,
 
     /// The key used to authenticate use of this reservation.
     ///
     /// Kept private so it cannot change after construction: [`Self::cipher`]
     /// caches the AES key schedule derived from it.
     reservation_key: HbirdAuthKey,
+
+    /// Start of the validity window, precomputed from `info`.
+    ///
+    /// Reservation selection tests this once per candidate per packet, and
+    /// converting `info.start` out of the chrono calendar representation each
+    /// time dominated the cost of selection (it runs the civil-from-days
+    /// algorithm). Storing both bounds reduces the test to two integer
+    /// comparisons.
+    valid_from: SystemTime,
+
+    /// End of the validity window, precomputed from `info`. Inclusive.
+    valid_until: SystemTime,
 
     /// AES key schedule for `reservation_key`, expanded lazily on first MAC
     /// computation and reused for the lifetime of the reservation.
@@ -333,15 +351,31 @@ impl Reservation {
     /// Creates a new reservation from its info and authentication key.
     pub fn new(info: ReservationInfo, reservation_key: HbirdAuthKey) -> Self {
         Self {
+            valid_from: info.start().into(),
+            valid_until: info.end().into(),
             info,
             reservation_key,
             cipher: Arc::new(OnceLock::new()),
         }
     }
 
+    /// Information about the reservation.
+    pub fn info(&self) -> &ReservationInfo {
+        &self.info
+    }
+
     /// The key used to authenticate use of this reservation.
     pub fn reservation_key(&self) -> &HbirdAuthKey {
         &self.reservation_key
+    }
+
+    /// Whether this reservation's validity window contains `now`.
+    ///
+    /// Both bounds are inclusive — unlike [`Self::is_valid_now`], whose upper
+    /// bound is exclusive. This is the check reservation trackers perform when
+    /// selecting a reservation for a packet.
+    pub fn is_valid_at(&self, now: SystemTime) -> bool {
+        self.valid_from <= now && now <= self.valid_until
     }
 
     /// The AES key schedule for [`Self::reservation_key`], expanded on first
@@ -497,9 +531,8 @@ impl FlyoverMAC {
 ///
 /// Wire format (15 bytes total):
 /// - `mac`: 6 bytes.
-/// - `res_id` (22 bits) and `bandwidth` (10 bits) packed into 4 bytes, using
-///   the same `(res_id << 10) | bandwidth` layout as [`ReservationInfo`]'s
-///   `ResID`/`BW` field.
+/// - `res_id` (22 bits) and `bandwidth` (10 bits) packed into 4 bytes, using the same `(res_id <<
+///   10) | bandwidth` layout as [`ReservationInfo`]'s `ResID`/`BW` field.
 /// - `res_start_offset`: 2 bytes.
 /// - `res_duration`: 2 bytes.
 /// - `hop_index`: 1 byte.
@@ -628,7 +661,8 @@ impl FlyoverMACs {
     }
 
     fn entry_valid_from(&self, entry: &FlyoverMACEntry) -> DateTime<Utc> {
-        self.packet_timestamp().min(self.entry_reservation_end(entry))
+        self.packet_timestamp()
+            .min(self.entry_reservation_end(entry))
     }
 
     fn entry_valid_until(&self, entry: &FlyoverMACEntry) -> DateTime<Utc> {
@@ -764,7 +798,11 @@ mod tests {
         for bytes_per_sec in [1u64, 15, 31] {
             let bw = Bandwidth::from_bytes_per_sec(bytes_per_sec).unwrap();
             assert_eq!(bw.exponent, 0, "bytes_per_sec={bytes_per_sec}");
-            assert_eq!(bw.to_bytes_per_sec(), bytes_per_sec, "bytes_per_sec={bytes_per_sec}");
+            assert_eq!(
+                bw.to_bytes_per_sec(),
+                bytes_per_sec,
+                "bytes_per_sec={bytes_per_sec}"
+            );
         }
     }
 
@@ -826,7 +864,9 @@ mod tests {
     #[test]
     fn encode_fits_in_10_bits() {
         for bytes_per_sec in [0u64, 1, 31, 32, 64, 1_000_000] {
-            let encoded = Bandwidth::from_bytes_per_sec(bytes_per_sec).unwrap().encode();
+            let encoded = Bandwidth::from_bytes_per_sec(bytes_per_sec)
+                .unwrap()
+                .encode();
             assert_eq!(
                 encoded & !Bandwidth::MASK,
                 0,
@@ -859,10 +899,41 @@ mod tests {
 
     #[test]
     fn reservation_stays_small() {
-        // Reservations are moved and cloned per packet on the encoding hot
-        // path (see `HummingbirdPath::hops_with_reservation`), so the cached
-        // AES key schedule must live behind a pointer, not inline.
+        // Reservations sit in a `Vec` that reservation selection scans once
+        // per packet (see `ReservationTracker::select`), so the cached AES key
+        // schedule must live behind a pointer, not inline. The two cached
+        // validity bounds are stored inline on purpose: they are read on every
+        // scan, and 32 bytes buys removing a calendar conversion per candidate.
         assert!(std::mem::size_of::<Reservation>() <= 96);
+    }
+
+    #[test]
+    fn cached_validity_window_matches_reservation_info() {
+        use std::time::Duration;
+
+        use crate::address::IsdAsn;
+
+        let info = ReservationInfo {
+            isd_as: IsdAsn(0x1_ff00_0000_0110),
+            ingress_interface: 1,
+            egress_interface: 2,
+            res_id: 7,
+            bandwidth: Bandwidth::from_bytes_per_sec(1024).unwrap(),
+            start: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            duration: 3600,
+        };
+        let reservation = Reservation::new(info.clone(), HbirdAuthKey::from([0xAB; 16]));
+
+        // The cache must agree with the window `info` describes, including
+        // that both bounds are inclusive.
+        let start: SystemTime = info.start().into();
+        let end: SystemTime = info.end().into();
+
+        assert!(reservation.is_valid_at(start));
+        assert!(reservation.is_valid_at(end));
+        assert!(reservation.is_valid_at(start + Duration::from_secs(1800)));
+        assert!(!reservation.is_valid_at(start - Duration::from_nanos(1)));
+        assert!(!reservation.is_valid_at(end + Duration::from_nanos(1)));
     }
 
     #[test]

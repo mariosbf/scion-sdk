@@ -191,10 +191,10 @@ pub fn generate_flyover_macs_from_reservations<'a>(
 
             Ok(FlyoverMACEntry {
                 mac: flyover_mac.mac,
-                res_id: reservation.info.res_id,
-                bandwidth: reservation.info.bandwidth,
+                res_id: reservation.info().res_id,
+                bandwidth: reservation.info().bandwidth,
                 res_start_offset,
-                res_duration: reservation.info.duration,
+                res_duration: reservation.info().duration,
                 hop_index,
             })
         })
@@ -697,7 +697,7 @@ mod tests {
             .unwrap();
 
         let base_timestamp = encoded.meta_header().base_timestamp.get();
-        let res_start_offset = reservation.info.res_start_offset(base_timestamp).unwrap();
+        let res_start_offset = reservation.info().res_start_offset(base_timestamp).unwrap();
         let raw_flyover_mac = calculate_flyover_mac(
             destination.isd(),
             destination.asn(),

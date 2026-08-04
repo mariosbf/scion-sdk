@@ -421,9 +421,9 @@ where
         self.reservable_hops()?
             .into_iter()
             .find(|&(_, isd_asn, ingress, egress)| {
-                isd_asn == reservation.info.isd_as
-                    && ingress == reservation.info.ingress_interface
-                    && egress == reservation.info.egress_interface
+                isd_asn == reservation.info().isd_as
+                    && ingress == reservation.info().ingress_interface
+                    && egress == reservation.info().egress_interface
             })
             .map(|(hop_idx, ..)| hop_idx)
     }

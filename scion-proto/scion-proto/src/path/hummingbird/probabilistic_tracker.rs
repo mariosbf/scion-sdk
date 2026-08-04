@@ -2,7 +2,6 @@
 
 use std::time::SystemTime;
 
-use chrono::{DateTime, Utc};
 use rand::{RngExt as _, SeedableRng, rngs::SmallRng};
 
 use super::reservation_tracker::{ReservationTracker, ReservationTrackerError, Selected};
@@ -67,11 +66,6 @@ impl ReservationTracker for ProbabilisticTracker {
             return Ok(None);
         }
 
-        // Convert the clock into the reservations' own time domain once per
-        // hop, rather than converting every reservation's bounds out of it.
-        // With no bucket lookups left, that conversion is the dominant cost.
-        let now: DateTime<Utc> = now.into();
-
         // Weighted reservoir sampling: one pass, no allocation, and no need to
         // know the total bandwidth up front. Replacing the running choice with
         // probability w/total-so-far leaves each candidate selected with
@@ -81,12 +75,12 @@ impl ReservationTracker for ProbabilisticTracker {
         let mut selected = None;
 
         for reservation in reservations {
-            if !is_valid_at(reservation, now) {
+            if !reservation.is_valid_at(now) {
                 num_expired += 1;
                 continue;
             }
 
-            let weight = reservation.info.bandwidth.to_bytes_per_sec();
+            let weight = reservation.info().bandwidth.to_bytes_per_sec();
             if weight == 0 {
                 continue;
             }
@@ -113,14 +107,6 @@ impl ReservationTracker for ProbabilisticTracker {
     fn commit(&mut self, _selected: &Selected<'_>, _pkt_len: usize) {}
 }
 
-/// Whether `reservation`'s validity window contains `now`.
-///
-/// Both bounds are inclusive, matching
-/// [`TokenBucketTracker`][super::TokenBucketTracker].
-fn is_valid_at(reservation: &Reservation, now: DateTime<Utc>) -> bool {
-    reservation.info.start <= now && now <= reservation.info.end()
-}
-
 impl Default for ProbabilisticTracker {
     fn default() -> Self {
         Self::new()
@@ -129,7 +115,7 @@ impl Default for ProbabilisticTracker {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Duration as ChronoDuration;
+    use chrono::{DateTime, Duration as ChronoDuration, Utc};
 
     use super::*;
     use crate::{
@@ -182,7 +168,7 @@ mod tests {
             let selected = tracker.select(candidates, now, 1024).unwrap().unwrap();
             let idx = candidates
                 .iter()
-                .position(|c| c.info.res_id == selected.reservation.info.res_id)
+                .position(|c| c.info().res_id == selected.reservation.info().res_id)
                 .unwrap();
             counts[idx] += 1;
         }

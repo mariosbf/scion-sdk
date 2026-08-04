@@ -180,8 +180,8 @@ pub fn from_proto_responses(
 impl From<Reservation> for v1::Reservation {
     fn from(r: Reservation) -> Self {
         v1::Reservation {
-            ia: r.info.isd_as.into(),
-            res_id: r.info.res_id,
+            ia: r.info().isd_as.into(),
+            res_id: r.info().res_id,
             auth_key: r.reservation_key().to_vec(),
         }
     }

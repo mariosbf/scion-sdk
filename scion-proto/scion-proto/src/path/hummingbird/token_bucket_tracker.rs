@@ -247,7 +247,10 @@ impl ReservationTracker for TokenBucketTracker {
         let mut selected: Option<(&Reservation, i64, usize)> = None;
 
         for reservation in reservations {
-            if !is_valid_at(&reservation.info, now) {
+            // Uses the reservation's precomputed window rather than the
+            // `ReservationInfo` overload below, which has to convert out of
+            // the chrono calendar representation on every call.
+            if !reservation.is_valid_at(now) {
                 num_expired += 1;
                 continue;
             }
@@ -255,7 +258,7 @@ impl ReservationTracker for TokenBucketTracker {
             // One lookup and one replenishment answer both questions: whether
             // the bucket can carry the packet, and how much room it has left
             // for the tie-break below.
-            let slot = self.slot_for(&reservation.info);
+            let slot = self.slot_for(reservation.info());
             let tokens = self.buckets[slot].bucket.replenish_at(now);
 
             if tokens < max_pkt_len as i64 {
@@ -289,7 +292,7 @@ impl ReservationTracker for TokenBucketTracker {
             // The ticket predates a cleanup, or came from another tracker.
             // Fall back to the keyed lookup rather than deducting from a
             // bucket that is no longer the one that was selected.
-            None => self.deduct_reservation(&selected.reservation.info, pkt_len),
+            None => self.deduct_reservation(selected.reservation.info(), pkt_len),
         }
     }
 
@@ -300,7 +303,7 @@ impl ReservationTracker for TokenBucketTracker {
     ) -> Option<usize> {
         reservations
             .iter()
-            .map(|r| self.available_bytes_at(&r.info, now))
+            .map(|r| self.available_bytes_at(r.info(), now))
             .max()
     }
 }
@@ -409,7 +412,7 @@ mod tests {
         let candidates = vec![roomy, tight];
 
         let selected = tracker.select(&candidates, now, 1024).unwrap().unwrap();
-        assert_eq!(selected.reservation.info.res_id, 2);
+        assert_eq!(selected.reservation.info().res_id, 2);
     }
 
     #[test]
@@ -480,9 +483,9 @@ mod tests {
         let candidates = vec![reservation(make_reservation(1, start, 1024))];
 
         let selected = tracker.select(&candidates, now, 1024).unwrap().unwrap();
-        let before = tracker.available_bytes_at(&candidates[0].info, now);
+        let before = tracker.available_bytes_at(candidates[0].info(), now);
         tracker.commit(&selected, 512);
-        let after = tracker.available_bytes_at(&candidates[0].info, now);
+        let after = tracker.available_bytes_at(candidates[0].info(), now);
 
         assert!(before >= after + 512);
     }
@@ -501,7 +504,7 @@ mod tests {
 
         let mut tracker = TokenBucketTracker::new();
         tracker.commit(&selected, 512);
-        let after = tracker.available_bytes_at(&candidates[0].info, now);
+        let after = tracker.available_bytes_at(candidates[0].info(), now);
 
         // The fallback found no bucket for this reservation, so nothing was
         // deducted and a fresh bucket reads as full.
@@ -535,7 +538,7 @@ mod tests {
         tracker.commit(&selected, 512);
 
         // The deduction must have followed c, not the bucket now in slot 2.
-        assert!(tracker.available_bytes_at(&c.info, now) <= 1024 - 512);
-        assert_eq!(tracker.available_bytes_at(&d.info, now), 1024);
+        assert!(tracker.available_bytes_at(c.info(), now) <= 1024 - 512);
+        assert_eq!(tracker.available_bytes_at(d.info(), now), 1024);
     }
 }
