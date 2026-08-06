@@ -599,6 +599,30 @@ struct SelectedHop<'a> {
     selection: Option<Selected<'a>>,
 }
 
+/// A precomputed encoding of the path header for the shape in which every hop
+/// that has a reservation is encoded as a flyover hop field.
+///
+/// Everything that varies from packet to packet is left zero: the meta header's
+/// timestamp and counter fields, and, in each flyover hop field, the aggregated
+/// MAC together with the reservation-dependent fields. Encoding is then a copy
+/// of the template followed by patching those regions — which is why the
+/// template depends on neither the destination, nor the payload length, nor
+/// which reservation the tracker happens to pick.
+///
+/// It describes the path's *structure*, so it stays valid until the structure
+/// changes. See [`HummingbirdPath::rebuild_template`].
+#[derive(Debug, Clone, PartialEq)]
+struct Template {
+    /// The encoded path header with every per-packet field zeroed, alongside
+    /// the meta header whose layout fields — segment lengths and current hop
+    /// field index — are already finalized.
+    encoded: EncodedHummingbirdPath<Bytes>,
+    /// Byte offset of each flyover hop field from the start of the encoded
+    /// path, in encode order. Patching walks these directly rather than
+    /// scanning for hop field boundaries.
+    flyover_offsets: Vec<usize>,
+}
+
 /// A fully decoded Hummingbird data plane path. It can be used to build new paths
 /// or to modify existing ones. If you only need to read information, use
 /// [EncodedHummingbirdPath] instead for better performance.
@@ -616,6 +640,14 @@ pub struct HummingbirdPath {
     /// Optional per-path reservation tracker, choosing which reservation to
     /// apply to each hop when encoding.
     reservation_tracker: Option<Arc<Mutex<dyn ReservationTracker>>>,
+
+    /// Precomputed encoding of this path's structure, rebuilt whenever the
+    /// structure changes. `None` if the path cannot be laid out at all, in
+    /// which case encoding reports the error.
+    ///
+    /// Invariant: this always equals [`Self::compute_template`]. The
+    /// `template_is_never_stale` test enforces it across every mutating method.
+    template: Option<Template>,
 }
 
 impl HummingbirdPath {
@@ -636,12 +668,15 @@ impl HummingbirdPath {
             counter,
         };
 
-        HummingbirdPath {
+        let mut path = HummingbirdPath {
             path_meta: meta_header,
             info_fields: vec![],
             segments: vec![],
             reservation_tracker: None,
-        }
+            template: None,
+        };
+        path.rebuild_template();
+        path
     }
 
     /// Attach a [`ReservationTracker`] to this path.
@@ -698,6 +733,7 @@ impl HummingbirdPath {
     /// Set the current info field index to the specified value.
     pub fn set_current_info_field_index(&mut self, index: HummingbirdInfoFieldIndex) {
         self.path_meta.current_info_field = index;
+        self.rebuild_template();
     }
 
     /// Returns the index of the current hop field field.
@@ -708,6 +744,7 @@ impl HummingbirdPath {
     /// Set the current hop field index to the specified value.
     pub fn set_current_hop_field_index(&mut self, index: HummingbirdHopfieldIndex) {
         self.path_meta.current_hop_field = index;
+        self.rebuild_template();
     }
 
     /// Returns the counter of the path.
@@ -747,7 +784,15 @@ impl HummingbirdPath {
             .nth(hop_idx as usize)
             .ok_or(HummingbirdPathError::HopIndexOutOfRange)?;
 
+        // Only a hop's *first* reservation changes the encoded shape, turning a
+        // standard hop field into a flyover one. Later ones leave it intact.
+        let was_bare = hop.reservations.is_empty();
         hop.reservations.push(reservation);
+
+        if was_bare {
+            self.rebuild_template();
+        }
+
         Ok(())
     }
 
@@ -759,6 +804,7 @@ impl HummingbirdPath {
     pub fn try_add_reservation(&mut self, reservation: Reservation) -> bool {
         // TODO(mariosbf): might not be correct for paths with peering links
         let mut result = false;
+        let mut shape_changed = false;
         for seg_idx in 0..self.segments.len() {
             let next_segment = self.segments.get(seg_idx + 1);
             let next_info = self.info_fields.get(seg_idx + 1);
@@ -789,10 +835,16 @@ impl HummingbirdPath {
                         .isd_asn
                         .is_some_and(|ia| ia == reservation.info().isd_as)
                 {
+                    // Only a hop's first reservation changes the encoded shape.
+                    shape_changed |= hop.reservations.is_empty();
                     hop.reservations.push(reservation.clone());
                     result = true;
                 }
             }
+        }
+
+        if shape_changed {
+            self.rebuild_template();
         }
 
         result
@@ -826,6 +878,7 @@ impl HummingbirdPath {
                 })
                 .collect(),
         );
+        self.rebuild_template();
 
         Ok(())
     }
@@ -944,6 +997,127 @@ impl HummingbirdPath {
             + flyover_count * (FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE)
     }
 
+    /// Recomputes [`Self::template`] from the path's current structure.
+    ///
+    /// Must be called by every method that changes which hops exist or which of
+    /// them carry a reservation, and by every method that changes a meta header
+    /// field the template bakes in. Adding a second reservation to a hop that
+    /// already has one does *not* need it: the encoded shape is unchanged.
+    fn rebuild_template(&mut self) {
+        self.template = self.compute_template();
+    }
+
+    /// Builds the encoding template for this path, or returns `None` if the
+    /// path cannot be laid out — a path whose segments are too long or whose
+    /// hop field index is out of range has no valid encoding, and encoding it
+    /// reports the error.
+    fn compute_template(&self) -> Option<Template> {
+        // The timestamp and counter are written per packet, so the template
+        // must not bake them in — otherwise set_counter would silently
+        // invalidate it.
+        let mut meta_header = HummingbirdMetaHeader {
+            base_timestamp: HummingbirdBaseTimestamp::default(),
+            millis_timestamp: HummingbirdMillisTimestamp::default(),
+            counter: HummingbirdCounter::default(),
+            ..self.path_meta
+        };
+
+        let header_len = self
+            .apply_header_layout(&mut meta_header, |_, hop| !hop.reservations.is_empty())
+            .ok()?;
+
+        let mut buffer = vec![0u8; header_len];
+        let mut slice: &mut [u8] = &mut buffer;
+
+        meta_header.encode_to_unchecked(&mut slice);
+        for info in self.info_fields.iter() {
+            info.encode_to_unchecked(&mut slice);
+        }
+
+        let mut flyover_offsets = Vec::new();
+        let mut offset = HummingbirdMetaHeader::LENGTH + self.info_fields_len();
+
+        for hop in self.hops() {
+            if hop.reservations.is_empty() {
+                hop.hop_field.encode_to_unchecked(&mut slice);
+                offset += StandardHopField::ENCODED_SIZE;
+            } else {
+                FlyoverHopField::encode_template_to_unchecked(&hop.hop_field, &mut slice);
+                flyover_offsets.push(offset);
+                offset += FlyoverHopField::ENCODED_SIZE;
+            }
+        }
+
+        debug_assert_eq!(offset, header_len);
+
+        Some(Template {
+            encoded: EncodedHummingbirdPath {
+                meta_header,
+                encoded_path: buffer.into(),
+            },
+            flyover_offsets,
+        })
+    }
+
+    /// Computes the byte layout of the encoded path header for one particular
+    /// choice of which hops become flyover hop fields, writing the resulting
+    /// segment lengths and current hop field index into `meta_header`.
+    ///
+    /// `is_flyover` is called once per hop in encode order, receiving the hop's
+    /// flat index and the hop itself. Callers that have already picked a
+    /// reservation per hop answer from that selection; the template builder
+    /// answers from the hop's reservation list.
+    ///
+    /// Returns the total encoded length of the path header.
+    fn apply_header_layout(
+        &self,
+        meta_header: &mut HummingbirdMetaHeader,
+        is_flyover: impl Fn(usize, &HummingbirdPathHop) -> bool,
+    ) -> Result<usize, HummingbirdPathError> {
+        // Captured before the field is overwritten below, so that every
+        // comparison is against the index the path came in with.
+        let original_hf_offset = meta_header.current_hop_field.byte_offset();
+
+        let mut curr_hf_index = original_hf_offset;
+        let mut hop_offset = 0;
+        let mut seglens = [0; 3];
+        let mut flat_idx = 0;
+
+        for (seg_idx, segment) in self.segments.iter().enumerate() {
+            for hop in segment {
+                let hop_len = if is_flyover(flat_idx, hop) {
+                    // If the matched hop field is before the current hop field, the
+                    // current hop field's byte offset must be advanced by the size
+                    // difference between a flyover and a standard hop field.
+                    if hop_offset < original_hf_offset {
+                        curr_hf_index +=
+                            FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE;
+                    }
+
+                    FlyoverHopField::ENCODED_SIZE
+                } else {
+                    StandardHopField::ENCODED_SIZE
+                };
+
+                hop_offset += hop_len;
+                seglens[seg_idx] += hop_len;
+                flat_idx += 1;
+            }
+        }
+
+        // Adjust segment lengths
+        for (seg_idx, seg_len) in seglens.iter().enumerate() {
+            meta_header.segment_lengths[seg_idx] = HummingbirdSegmentLength::new(*seg_len)
+                .ok_or(HummingbirdPathError::SegmentTooLong)?;
+        }
+
+        // Adjust current hop field index in meta header.
+        meta_header.current_hop_field = HummingbirdHopfieldIndex::new(curr_hf_index)
+            .ok_or(HummingbirdPathError::InvalidHopFieldIndex)?;
+
+        Ok(meta_header.encoded_length() + self.info_fields_len() + hop_offset)
+    }
+
     /// Applies reservations and encodes the complete path header (meta
     /// header, info fields, hop fields) in a single pass, turning hop fields
     /// with a selected reservation into flyover hop fields and adjusting
@@ -961,10 +1135,26 @@ impl HummingbirdPath {
         payload_len: u16,
         address_header_len: u16,
     ) -> Result<(HummingbirdMetaHeader, Bytes), HummingbirdPathError> {
+        self.encode_with_reservations_at(
+            SystemTime::now(),
+            destination,
+            payload_len,
+            address_header_len,
+        )
+    }
+
+    /// [`Self::encode_with_reservations`] against a caller-supplied clock, so
+    /// that two encodings of the same path can be compared byte for byte.
+    fn encode_with_reservations_at(
+        &self,
+        now: SystemTime,
+        destination: IsdAsn,
+        payload_len: u16,
+        address_header_len: u16,
+    ) -> Result<(HummingbirdMetaHeader, Bytes), HummingbirdPathError> {
         // Create a copy of the meta header
         let mut meta_header = self.path_meta;
 
-        let now = SystemTime::now();
         let time = now.duration_since(UNIX_EPOCH).map_err(|e| {
             HummingbirdPathError::InvalidBaseTimestamp(-(e.duration().as_secs() as i64))
         })?;
@@ -1004,52 +1194,44 @@ impl HummingbirdPath {
             tracker_guard.as_deref_mut().map(|t| (t, now)),
         )?;
 
-        // Pre-pass over the selection: validate reservations and compute the
-        // exact hop-field byte layout, so the meta header can be finalized —
-        // and the packet length known for the flyover MACs — before encoding
-        // starts.
-        let mut curr_hf_index = meta_header.current_hop_field.byte_offset();
-        let mut hop_offset = 0;
-        let mut seglens = [0; 3];
-
+        // Validate every selected reservation before any byte is written, so
+        // that no error can occur once encoding has started. This is the same
+        // check apply_reservation performs below.
         for hop in &hops {
-            let hop_len = if let Some(selected) = hop.selection {
-                // Same check apply_reservation performs below; done here so
-                // that no error can occur after bytes have been written.
+            if let Some(selected) = hop.selection {
                 selected
                     .reservation
                     .info()
                     .res_start_offset(meta_header.base_timestamp())
                     .ok_or(HummingbirdPathError::ReservationNotValid)?;
-
-                // If the matched hop field is before the current hop field, the
-                // current hop field's byte offset must be advanced by the size
-                // difference between a flyover and a standard hop field.
-                if hop_offset < meta_header.current_hop_field.byte_offset() {
-                    curr_hf_index += FlyoverHopField::ENCODED_SIZE - StandardHopField::ENCODED_SIZE;
-                }
-
-                FlyoverHopField::ENCODED_SIZE
-            } else {
-                StandardHopField::ENCODED_SIZE
-            };
-
-            hop_offset += hop_len;
-            seglens[hop.seg_idx] += hop_len;
+            }
         }
 
-        // Adjust segment lengths
-        for (seg_idx, seg_len) in seglens.iter().enumerate() {
-            meta_header.segment_lengths[seg_idx] = HummingbirdSegmentLength::new(*seg_len)
-                .ok_or(HummingbirdPathError::SegmentTooLong)?;
-        }
+        // The template describes the shape where every reservable hop becomes a
+        // flyover, so it applies exactly when the selection produced one
+        // reservation per reservable hop. A hop can only be selected if it has
+        // reservations, so counting selections is enough: any hop that has
+        // reservations but was declined — by a `Lenient` tracker, say — leaves
+        // the count short and the layout different.
+        let template = self.template.as_ref().filter(|template| {
+            hops.iter().filter(|hop| hop.selection.is_some()).count()
+                == template.flyover_offsets.len()
+        });
 
-        // Adjust current hop field index in meta header.
-        meta_header.current_hop_field = HummingbirdHopfieldIndex::new(curr_hf_index)
-            .ok_or(HummingbirdPathError::InvalidHopFieldIndex)?;
-
-        // Compute the exact packet length based on the actual selection.
-        let path_header_len = meta_header.encoded_length() + self.info_fields_len() + hop_offset;
+        // Finalize the meta header against the actual selection, which also
+        // yields the packet length the flyover MACs are computed over. A
+        // template has already laid this shape out.
+        let path_header_len = match template {
+            Some(template) => {
+                let laid_out = template.encoded.meta_header();
+                meta_header.segment_lengths = laid_out.segment_lengths;
+                meta_header.current_hop_field = laid_out.current_hop_field;
+                template.encoded.raw().len()
+            }
+            None => self.apply_header_layout(&mut meta_header, |flat_idx, _| {
+                hops[flat_idx].selection.is_some()
+            })?,
+        };
         let pkt_len = u16::try_from(path_header_len)
             .ok()
             .and_then(|v| v.checked_add(CommonHeader::LENGTH as u16))
@@ -1057,25 +1239,74 @@ impl HummingbirdPath {
             .and_then(|v| v.checked_add(payload_len))
             .ok_or(HummingbirdPathError::PayloadTooLong)?;
 
-        // Encode pass: build each hop field on the stack and write it out
-        // immediately through a slice cursor. The buffer is exactly sized and
-        // the reservations validated above, so no write can fail.
-        let mut buffer = vec![0u8; path_header_len];
-        let mut slice: &mut [u8] = &mut buffer;
+        let buffer = match template {
+            // Fast path: copy the precomputed header and overwrite only what
+            // this packet changes.
+            Some(template) => {
+                let mut buffer = template.encoded.raw().to_vec();
 
-        meta_header.encode_to_unchecked(&mut slice);
-        for info in self.info_fields.iter() {
-            info.encode_to_unchecked(&mut slice);
-        }
-        for selected_hop in &hops {
-            let hop = &self.segments[selected_hop.seg_idx][selected_hop.hop_idx].hop_field;
-            if let Some(selected) = selected_hop.selection {
-                hop.apply_reservation(meta_header, selected.reservation, destination, pkt_len)?
-                    .encode_to_unchecked(&mut slice);
-            } else {
-                hop.encode_to_unchecked(&mut slice);
+                // Three word stores, and cheaper than patching the timestamp
+                // and counter fields individually.
+                meta_header.encode_to_unchecked(&mut &mut buffer[..]);
+
+                let selections = hops.iter().filter_map(|hop| {
+                    hop.selection
+                        .map(|selected| (selected, &self.segments[hop.seg_idx][hop.hop_idx]))
+                });
+                debug_assert_eq!(selections.clone().count(), template.flyover_offsets.len());
+
+                for (offset, (selected, hop)) in
+                    template.flyover_offsets.iter().copied().zip(selections)
+                {
+                    let (mac, res_start_offset) = hop.hop_field.aggregated_flyover_mac(
+                        meta_header,
+                        selected.reservation,
+                        destination,
+                        pkt_len,
+                    )?;
+
+                    let info = selected.reservation.info();
+                    FlyoverHopField::encode_per_packet_fields_to(
+                        &mut buffer[offset..offset + FlyoverHopField::ENCODED_SIZE],
+                        &mac,
+                        info.res_id,
+                        info.bandwidth,
+                        res_start_offset,
+                        info.duration,
+                    );
+                }
+
+                buffer
             }
-        }
+            // Encode pass: build each hop field on the stack and write it out
+            // immediately through a slice cursor. The buffer is exactly sized
+            // and the reservations validated above, so no write can fail.
+            None => {
+                let mut buffer = vec![0u8; path_header_len];
+                let mut slice: &mut [u8] = &mut buffer;
+
+                meta_header.encode_to_unchecked(&mut slice);
+                for info in self.info_fields.iter() {
+                    info.encode_to_unchecked(&mut slice);
+                }
+                for selected_hop in &hops {
+                    let hop = &self.segments[selected_hop.seg_idx][selected_hop.hop_idx].hop_field;
+                    if let Some(selected) = selected_hop.selection {
+                        hop.apply_reservation(
+                            meta_header,
+                            selected.reservation,
+                            destination,
+                            pkt_len,
+                        )?
+                        .encode_to_unchecked(&mut slice);
+                    } else {
+                        hop.encode_to_unchecked(&mut slice);
+                    }
+                }
+
+                buffer
+            }
+        };
 
         // Commit the packet against the selected reservations, now that its
         // exact length is known (still under the same tracker lock).
@@ -1360,12 +1591,16 @@ impl HummingbirdPath {
             segments.push(hop_fields);
         }
 
-        Ok(HummingbirdPath {
+        let mut path = HummingbirdPath {
             path_meta: meta_header,
             info_fields,
             segments,
             reservation_tracker: None,
-        })
+            template: None,
+        };
+        path.rebuild_template();
+
+        Ok(path)
     }
 }
 
@@ -1420,7 +1655,7 @@ mod tests {
         address::{Asn, Isd, IsdAsn},
         hummingbird::{Bandwidth, Reservation, ReservationInfo},
         packet::DecodeError,
-        path::DataPlanePathErrorKind,
+        path::{DataPlanePathErrorKind, hummingbird::Lenient},
         wire_encoding::WireDecode,
     };
     use bytes::Bytes;
@@ -1994,6 +2229,249 @@ mod tests {
     // ---------------------------------------------------------------------------
     // HummingbirdPath
     // ---------------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------------
+    // encoding template
+    // ---------------------------------------------------------------------------
+
+    /// The template is only sound while it still describes the current
+    /// structure, so every mutating method has to leave it fresh.
+    #[track_caller]
+    fn assert_template_fresh(path: &HummingbirdPath, after: &str) {
+        assert_eq!(
+            path.template,
+            path.compute_template(),
+            "the template is stale after {after}"
+        );
+    }
+
+    #[test]
+    fn template_is_never_stale() {
+        let mut path = HummingbirdPath::new();
+        assert_template_fresh(&path, "new");
+
+        path.add_segment(
+            make_info(true, 0),
+            vec![make_std_hop(0, 1), make_std_hop(1, 2)],
+        )
+        .unwrap();
+        assert_template_fresh(&path, "add_segment");
+
+        path.add_reservation(0, make_reservation(0, 1, 10, 600, 1024))
+            .unwrap();
+        assert_template_fresh(&path, "add_reservation");
+
+        // A hop's second reservation leaves the encoded shape alone, so
+        // add_reservation deliberately skips the rebuild. Check that holds.
+        path.add_reservation(0, make_reservation(0, 1, 10, 600, 2048))
+            .unwrap();
+        assert_template_fresh(&path, "add_reservation on a hop that already had one");
+
+        assert!(path.try_add_reservation(make_reservation(1, 2, 10, 600, 1024)));
+        assert_template_fresh(&path, "try_add_reservation");
+
+        path.add_segment(make_info(true, 1), vec![make_std_hop(2, 3)])
+            .unwrap();
+        assert_template_fresh(&path, "add_segment on a path that has reservations");
+
+        // Past the first hop, which is a 20-byte flyover, so this exercises the
+        // hop field index adjustment the template bakes in.
+        path.set_current_hop_field_index(HummingbirdHopfieldIndex::new(20).unwrap());
+        assert_template_fresh(&path, "set_current_hop_field_index");
+
+        path.set_current_info_field_index(HummingbirdInfoFieldIndex::new(1).unwrap());
+        assert_template_fresh(&path, "set_current_info_field_index");
+
+        path.set_counter(HummingbirdCounter::new(7).unwrap());
+        assert_template_fresh(&path, "set_counter");
+    }
+
+    #[test]
+    fn the_template_does_not_bake_in_the_counter() {
+        // set_counter skips the rebuild because the counter is written per
+        // packet. That is only sound if the template really is independent of
+        // it — otherwise every send after a counter change encodes stale bytes.
+        let mut path = HummingbirdPath::new();
+        path.add_segment(make_info(true, 0), vec![make_std_hop(0, 1)])
+            .unwrap();
+        path.add_reservation(0, make_reservation(0, 1, 10, 600, 1024))
+            .unwrap();
+
+        // Compare freshly computed templates, not the stored one: set_counter
+        // skips the rebuild, so the stored template is trivially unchanged and
+        // would prove nothing.
+        let before = path.compute_template();
+        path.set_counter(HummingbirdCounter::new(12345).unwrap());
+
+        assert_eq!(path.compute_template(), before);
+    }
+
+    /// A hop whose MAC and expiry differ from its neighbours', so that two hop
+    /// fields written in the wrong order change the encoding.
+    fn distinct_hop(n: u16) -> (Option<IsdAsn>, StandardHopField) {
+        let (isd_asn, mut hop_field) = make_std_hop(n, n + 1);
+        hop_field.mac = [n as u8 + 0xA0; 6];
+        hop_field.exp_time = 60 + n as u8;
+        (isd_asn, hop_field)
+    }
+
+    /// A reservation whose every encoded field differs from its neighbours', so
+    /// that a field left unpatched shows up in the bytes.
+    fn distinct_reservation(n: u16, res_id: u32) -> Reservation {
+        let start = DateTime::from_timestamp(
+            (Utc::now().timestamp() as u32).saturating_sub(10 + n as u32) as i64,
+            0,
+        )
+        .expect("valid timestamp");
+
+        Reservation::new(
+            ReservationInfo {
+                isd_as: IsdAsn::new(Isd::new(1), Asn::new(1)),
+                ingress_interface: n,
+                egress_interface: n + 1,
+                res_id,
+                bandwidth: Bandwidth::from_bytes_per_sec(1024 * (n as u64 + 1)).unwrap(),
+                start,
+                duration: 600 + n,
+            },
+            [n as u8 + 1; 16].into(),
+        )
+    }
+
+    /// Encodes `path` twice at the same instant — once as built, once with the
+    /// template removed so the full encoder runs — and asserts the two agree.
+    /// The template is only worth having if it is indistinguishable from the
+    /// encoder it replaces.
+    #[track_caller]
+    fn assert_template_matches_full_encoder(path: &mut HummingbirdPath, shape: &str) {
+        let destination = IsdAsn::new(Isd::new(2), Asn::new(9));
+        // Read once and shared by both encodings, so they derive identical
+        // timestamps and MACs. It has to track the wall clock rather than be a
+        // constant: a reservation's start offset is relative to the base
+        // timestamp and only spans a few hours.
+        let now = SystemTime::now();
+
+        let templated = path
+            .encode_with_reservations_at(now, destination, 512, 24)
+            .expect("templated encode");
+
+        let template = path.template.take();
+        let full = path
+            .encode_with_reservations_at(now, destination, 512, 24)
+            .expect("full encode");
+        path.template = template;
+
+        assert_eq!(templated.0, full.0, "meta header differs for {shape}");
+        assert_eq!(templated.1, full.1, "encoded bytes differ for {shape}");
+    }
+
+    #[test]
+    fn the_template_encodes_exactly_like_the_full_encoder() {
+        // Every hop reservable: the shape the template is built for. The second
+        // reservation's id overflows the 22 bits the wire format carries, so
+        // the fast path has to truncate it exactly as the full encoder does.
+        let mut path = HummingbirdPath::new();
+        path.add_segment(make_info(true, 0), vec![distinct_hop(0), distinct_hop(1)])
+            .unwrap();
+        path.add_reservation(0, distinct_reservation(0, 7)).unwrap();
+        path.add_reservation(1, distinct_reservation(1, 0x00FF_FFFF))
+            .unwrap();
+        assert_template_matches_full_encoder(&mut path, "all hops reservable");
+
+        // A bare hop between two reservable ones, so the template has to place
+        // a 12-byte standard hop field between two 20-byte flyovers.
+        let mut path = HummingbirdPath::new();
+        path.add_segment(
+            make_info(true, 0),
+            vec![distinct_hop(0), distinct_hop(1), distinct_hop(2)],
+        )
+        .unwrap();
+        path.add_reservation(0, distinct_reservation(0, 7)).unwrap();
+        path.add_reservation(2, distinct_reservation(2, 9)).unwrap();
+        assert_template_matches_full_encoder(&mut path, "a bare hop between flyovers");
+
+        // Two segments, and a current hop field index past the first flyover —
+        // the index adjustment the template bakes in.
+        let mut path = HummingbirdPath::new();
+        path.add_segment(make_info(true, 0), vec![distinct_hop(0), distinct_hop(1)])
+            .unwrap();
+        path.add_segment(make_info(true, 1), vec![distinct_hop(2)])
+            .unwrap();
+        path.add_reservation(0, distinct_reservation(0, 7)).unwrap();
+        path.add_reservation(2, distinct_reservation(2, 9)).unwrap();
+        path.set_current_hop_field_index(HummingbirdHopfieldIndex::new(20).unwrap());
+        assert_template_matches_full_encoder(&mut path, "two segments, advanced hop field index");
+    }
+
+    #[test]
+    fn a_declined_reservation_falls_back_to_the_full_encoder() {
+        // A Lenient tracker that never selects leaves a reservable hop encoded
+        // as a standard hop field, which is not the shape the template
+        // describes — encoding must notice and fall back.
+        #[derive(Debug)]
+        struct NeverSelects;
+        impl ReservationTracker for NeverSelects {
+            fn select<'a>(
+                &mut self,
+                _reservations: &'a [Reservation],
+                _now: SystemTime,
+                _max_pkt_len: usize,
+            ) -> Result<Option<Selected<'a>>, ReservationTrackerError> {
+                Err(ReservationTrackerError::BandwidthExceeded)
+            }
+            fn commit(&mut self, _selected: &Selected<'_>, _pkt_len: usize) {}
+        }
+
+        let mut path = HummingbirdPath::new();
+        path.add_segment(
+            make_info(true, 0),
+            vec![make_std_hop(0, 1), make_std_hop(1, 2)],
+        )
+        .unwrap();
+        path.add_reservation(0, make_reservation(0, 1, 10, 600, 1024))
+            .unwrap();
+        path.set_reservation_tracker(Arc::new(Mutex::new(Lenient(NeverSelects))));
+
+        let encoded = path.to_encoded(IsdAsn::new(Isd::new(2), Asn::new(9)), 512, 24);
+        let encoded = encoded.expect("a declined reservation is not an error under Lenient");
+
+        // All hops standard, so the template's flyover-shaped buffer was not used.
+        assert_eq!(
+            encoded.raw().len(),
+            HummingbirdMetaHeader::LENGTH
+                + path.info_fields_len()
+                + 2 * StandardHopField::ENCODED_SIZE
+        );
+        assert!(encoded.hop_fields().all(|hop| !hop.is_flyover()));
+    }
+
+    #[test]
+    fn the_template_marks_exactly_the_hops_that_have_reservations() {
+        let mut path = HummingbirdPath::new();
+        path.add_segment(
+            make_info(true, 0),
+            vec![make_std_hop(0, 1), make_std_hop(1, 2), make_std_hop(2, 3)],
+        )
+        .unwrap();
+        // Middle hop only, so a template that simply counted hops or assumed a
+        // prefix would place the offset wrong.
+        path.add_reservation(1, make_reservation(1, 2, 10, 600, 1024))
+            .unwrap();
+
+        let template = path.template.as_ref().unwrap();
+        let hop_fields_start = HummingbirdMetaHeader::LENGTH + path.info_fields_len();
+
+        assert_eq!(
+            template.flyover_offsets,
+            vec![hop_fields_start + StandardHopField::ENCODED_SIZE]
+        );
+        assert_eq!(
+            template.encoded.raw().len(),
+            hop_fields_start
+                + 2 * StandardHopField::ENCODED_SIZE
+                + FlyoverHopField::ENCODED_SIZE
+        );
+    }
 
     // ---------------------------------------------------------------------------
     // add_segment

@@ -2,7 +2,8 @@
 
 use bytes::{Buf, BufMut, Bytes};
 use chrono::{DateTime, Utc};
-use std::{num::NonZeroU16, time::Duration};
+use sciparse::path::hbird::layout::FlyoverHopFieldLayout;
+use std::{num::NonZeroU16, ops::Range, time::Duration};
 
 use crate::{
     hummingbird::Bandwidth,
@@ -354,6 +355,74 @@ impl FlyoverHopField {
     pub(super) const FLYOVER_BIT: u8 = 0b1000_0000;
 
     pub(super) const DURATION_PER_EXP_UNIT: Duration = StandardHopField::DURATION_PER_EXP_UNIT;
+
+    /// The part of an encoded flyover hop field that varies per packet or with
+    /// the chosen reservation: the aggregated MAC, the reservation id and
+    /// bandwidth, the start offset and the duration. These are contiguous and
+    /// run to the end of the field.
+    pub(super) const PER_PACKET_RNG: Range<usize> =
+        FlyoverHopFieldLayout::MAC_RNG.aligned_byte_range().start
+            ..FlyoverHopFieldLayout::RES_DURATION_RNG
+                .aligned_byte_range()
+                .end;
+
+    /// Writes the per-packet part of an encoded flyover hop field — the region
+    /// described by [`Self::PER_PACKET_RNG`] — over `field`, which must be an
+    /// encoded flyover hop field.
+    ///
+    /// Writing the region outright rather than through `sciparse`'s generated
+    /// field setters is deliberate: each of those costs a masked
+    /// read-modify-write through a 16-byte lane, which measured slower than a
+    /// single copy of the whole region.
+    ///
+    /// The packing must agree with [`Self::encode_to_unchecked`], which the
+    /// `the_template_encodes_exactly_like_the_full_encoder` test enforces by
+    /// comparing the two encoders byte for byte.
+    pub(super) fn encode_per_packet_fields_to(
+        field: &mut [u8],
+        aggregated_mac: &[u8; 6],
+        res_id: u32,
+        res_bw: Bandwidth,
+        res_start_offset: u16,
+        res_duration: u16,
+    ) {
+        let mut bytes = [0u8; Self::ENCODED_SIZE - Self::PER_PACKET_RNG.start];
+
+        bytes[..6].copy_from_slice(aggregated_mac);
+        let res_id_and_bw = ((res_id & 0x3FFFFF) << 10) | res_bw.encode() as u32;
+        bytes[6..10].copy_from_slice(&res_id_and_bw.to_be_bytes());
+        bytes[10..12].copy_from_slice(&res_start_offset.to_be_bytes());
+        bytes[12..14].copy_from_slice(&res_duration.to_be_bytes());
+
+        field[Self::PER_PACKET_RNG].copy_from_slice(&bytes);
+    }
+
+    /// Encodes `hop_field` in flyover form, leaving zero every field that
+    /// depends on the packet or on the reservation that will be chosen: the
+    /// aggregated MAC, the reservation id and bandwidth, the start offset and
+    /// the duration. Only the routing fields — the flyover bit, the router
+    /// alerts, the expiry time and the interfaces — are written.
+    ///
+    /// This is the flyover half of a
+    /// [`HummingbirdPath`][super::HummingbirdPath] encoding template, where the
+    /// zeroed tail is patched for each packet.
+    pub(super) fn encode_template_to_unchecked<T: BufMut>(
+        hop_field: &StandardHopField,
+        buffer: &mut T,
+    ) {
+        let mut flags: u8 = Self::FLYOVER_BIT;
+        if hop_field.ingress_router_alert {
+            flags |= Self::FLAGS_INGRESS_ROUTER_ALERT;
+        }
+        if hop_field.egress_router_alert {
+            flags |= Self::FLAGS_EGRESS_ROUTER_ALERT;
+        }
+        buffer.put_u8(flags);
+        buffer.put_u8(hop_field.exp_time);
+        buffer.put_u16(hop_field.cons_ingress);
+        buffer.put_u16(hop_field.cons_egress);
+        buffer.put_bytes(0, Self::ENCODED_SIZE - Self::PER_PACKET_RNG.start);
+    }
 }
 
 impl HopField for FlyoverHopField {

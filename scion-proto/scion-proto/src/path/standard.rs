@@ -460,14 +460,21 @@ impl HopField for StandardHopField {
 }
 
 impl StandardHopField {
-    /// Turns this into a FlyoverHopField by applying a Hummingbird reservation.  
-    pub fn apply_reservation(
+    /// Computes the aggregated MAC this hop field carries when `reservation` is
+    /// applied to it, together with the reservation's start offset relative to
+    /// the meta header's base timestamp.
+    ///
+    /// These are the only two parts of the resulting flyover hop field that
+    /// depend on the packet, which is why encoding through a path template
+    /// calls this directly instead of building a whole
+    /// [`FlyoverHopField`] via [`Self::apply_reservation`].
+    pub fn aggregated_flyover_mac(
         &self,
         meta_header: HummingbirdMetaHeader,
         reservation: &crate::hummingbird::Reservation,
         destination: IsdAsn,
         pkt_len: u16,
-    ) -> Result<FlyoverHopField, HummingbirdPathError> {
+    ) -> Result<([u8; 6], u16), HummingbirdPathError> {
         let res_start_offset = reservation
             .info()
             .res_start_offset(meta_header.base_timestamp())
@@ -484,6 +491,20 @@ impl StandardHopField {
         );
         let mut mac = self.mac;
         xor_in_place(&mut mac, &flyover_mac);
+
+        Ok((mac, res_start_offset))
+    }
+
+    /// Turns this into a FlyoverHopField by applying a Hummingbird reservation.
+    pub fn apply_reservation(
+        &self,
+        meta_header: HummingbirdMetaHeader,
+        reservation: &crate::hummingbird::Reservation,
+        destination: IsdAsn,
+        pkt_len: u16,
+    ) -> Result<FlyoverHopField, HummingbirdPathError> {
+        let (mac, res_start_offset) =
+            self.aggregated_flyover_mac(meta_header, reservation, destination, pkt_len)?;
 
         Ok(FlyoverHopField {
             ingress_router_alert: self.ingress_router_alert,
