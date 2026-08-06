@@ -14,6 +14,7 @@ hbird-redemption-api = { workspace = true }
 hbird-redemption-api-models = { workspace = true }
 hbird-redemption-api-protobuf = { workspace = true }
 scion-proto = { workspace = true }
+scion-sdk-quic-scion = { workspace = true }
 scion-sdk-reqwest-connect-rpc = { workspace = true }
 scion-sdk-scion-connect-rpc = { workspace = true }
 scion-stack = { workspace = true }
