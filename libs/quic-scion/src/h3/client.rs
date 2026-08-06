@@ -168,13 +168,15 @@ impl H3Client {
     /// Establishes a new HTTP/3 connection.
     async fn establish_connection(&self) -> Result<H3Connection, H3ConnectionError> {
         let config = self.config.to_quiche_config()?;
-        let conn = QuicConnection::new(
-            self.server_name.clone(),
-            self.remote,
-            self.socket.clone(),
-            config,
-        )
-        .await?;
+        // squiche uses the server name both for SNI and for certificate name verification, so it
+        // has to be withheld entirely when the peer's certificate cannot supply a matching name.
+        let server_name = self
+            .config
+            .verify_server_name
+            .then(|| self.server_name.clone())
+            .flatten();
+        let conn =
+            QuicConnection::new(server_name, self.remote, self.socket.clone(), config).await?;
 
         let h3_driver = H3Driver::new(conn.clone()).await?;
         let h3_connection = h3_driver.h3_connection();
