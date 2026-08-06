@@ -88,7 +88,8 @@ impl CrpcClient {
     /// # Arguments
     /// * `remote` - The remote SCION socket address of the server.
     /// * `socket` - The SCION UDP socket to use for sending/receiving packets
-    /// * `server_name` - Optional server name for TLS SNI (also used as :authority header)
+    /// * `server_name` - Optional server name for TLS SNI and certificate name verification. The
+    ///   `:authority` header is derived from the request URL instead.
     /// * `authorization_token` - Optional authorization token for authentication
     ///
     /// # Returns
@@ -112,7 +113,8 @@ impl CrpcClient {
     /// # Arguments
     /// * `remote` - The remote SCION socket address of the server.
     /// * `socket` - The SCION UDP socket to use for sending/receiving packets
-    /// * `server_name` - Optional server name for TLS SNI (also used as :authority header)
+    /// * `server_name` - Optional server name for TLS SNI and certificate name verification. The
+    ///   `:authority` header is derived from the request URL instead.
     /// * `authorization_token` - Optional authorization token for authentication
     /// * `config` - Custom QUIC configuration for the client
     ///

@@ -29,6 +29,7 @@ use scion_proto::{
     address::{IsdAsn, ScionAddr, ScionAddrSvc, ServiceAddr, SocketAddr, SocketAddrSvc},
     hummingbird::Reservation,
 };
+use scion_sdk_quic_scion::quic::config::QuicConfig;
 use scion_sdk_reqwest_connect_rpc::client::CrpcClient as ReqwestCrpcClient;
 use scion_sdk_scion_connect_rpc::client::{ConnectRpcClient, CrpcClient as ScionCrpcClient};
 use scion_stack::scionstack::ScionStack;
@@ -57,6 +58,9 @@ pub struct CrpcHbirdRedemptionClient {
 
     /// DER-encoded RSA public key sent with redemption requests.
     pk_der: Vec<u8>,
+
+    /// QUIC configuration used for remote AS communication.
+    quic_config: QuicConfig,
 }
 
 /// A single Hummingbird flyover redemption request.
@@ -98,6 +102,37 @@ impl CrpcHbirdRedemptionClient {
         local_hbird_service_url: url::Url,
         local_addr: ScionAddr,
     ) -> Result<Self, HbirdRedemptionError> {
+        Self::with_quic_config(
+            scion_stack,
+            local_hbird_service_url,
+            local_addr,
+            QuicConfig::default(),
+        )
+        .await
+    }
+
+    /// Creates a new Hummingbird redemption client with a custom QUIC configuration.
+    ///
+    /// Use this to reach a Hummingbird service that does not speak squiche's SCION QUIC version,
+    /// or whose certificate is issued by the SCION control-plane PKI rather than the web PKI:
+    ///
+    /// ```no_run
+    /// # use scion_sdk_quic_scion::quic::config::{QuicConfig, PROTOCOL_VERSION};
+    /// let quic_config = QuicConfig::builder()
+    ///     .protocol_version(PROTOCOL_VERSION)
+    ///     .ca_certs_dir("/path/to/gen/certs")
+    ///     .verify_server_name(false)
+    ///     .build();
+    /// ```
+    ///
+    /// Parameters are as for [`Self::new`], plus:
+    /// - `quic_config`: QUIC configuration for remote AS communication.
+    pub async fn with_quic_config(
+        scion_stack: Arc<ScionStack>,
+        local_hbird_service_url: url::Url,
+        local_addr: ScionAddr,
+        quic_config: QuicConfig,
+    ) -> Result<Self, HbirdRedemptionError> {
         let svc_resolution_socket = scion_stack
             .bind(Some(SocketAddr::new(local_addr, 0)))
             .await?;
@@ -124,6 +159,7 @@ impl CrpcHbirdRedemptionClient {
             svc_resolution_client,
             sk,
             pk_der,
+            quic_config,
         })
     }
 }
@@ -176,13 +212,17 @@ impl CrpcHbirdRedemptionClient {
 
                 let server_name = target_isd_as.to_string();
 
-                let client = ScionCrpcClient::new(hbird_addr, socket, Some(server_name), None)
-                    .await
-                    .map_err(|e| {
-                        HbirdRedemptionError::Transport(format!(
-                            "failed to create SCION client: {e}"
-                        ))
-                    })?;
+                let client = ScionCrpcClient::with_quic_config(
+                    hbird_addr,
+                    socket,
+                    Some(server_name),
+                    None,
+                    self.quic_config.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    HbirdRedemptionError::Transport(format!("failed to create SCION client: {e}"))
+                })?;
 
                 client
                     .unary_request::<_, RedemptionResponses>(

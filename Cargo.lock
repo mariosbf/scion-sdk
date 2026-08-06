@@ -1888,6 +1888,7 @@ dependencies = [
  "rand 0.8.6",
  "rsa",
  "scion-proto",
+ "scion-sdk-quic-scion",
  "scion-sdk-reqwest-connect-rpc",
  "scion-sdk-scion-connect-rpc",
  "scion-stack",
