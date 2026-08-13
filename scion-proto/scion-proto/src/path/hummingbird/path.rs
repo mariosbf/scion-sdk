@@ -796,6 +796,25 @@ impl HummingbirdPath {
         Ok(())
     }
 
+    /// Removes every expired reservation from every hop of the path.
+    ///
+    /// A hop whose last reservation is removed reverts from a flyover hop
+    /// field to a standard one, changing the encoded shape; the template is
+    /// rebuilt when that happens (mirroring [`Self::add_reservation`], where
+    /// only a hop's *first* reservation rebuilds it).
+    pub fn remove_expired_reservations(&mut self) {
+        let mut shape_changed = false;
+        for hop in self.hops_mut() {
+            let had_reservations = !hop.reservations.is_empty();
+            hop.reservations.retain(|r| !r.is_expired());
+            shape_changed |= had_reservations && hop.reservations.is_empty();
+        }
+
+        if shape_changed {
+            self.rebuild_template();
+        }
+    }
+
     /// Add a reservation to use with this path. Reservations added using this
     /// method will be applied to all matching regular HopFields contained
     /// in the segments.
@@ -3004,6 +3023,36 @@ mod tests {
             matches!(result, Err(HummingbirdPathError::HopIndexOutOfRange)),
             "expected HopIndexOutOfRange, got {result:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // remove_expired_reservations
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn remove_expired_reservations_prunes_and_rebuilds_template() {
+        let mut path = HummingbirdPath::new();
+        path.add_segment(
+            make_info(true, 1),
+            vec![make_std_hop(1, 2), make_std_hop(3, 4)],
+        )
+        .unwrap();
+
+        // Hop 0: only an expired reservation (started 1000s ago, 200s long),
+        // so pruning turns it back into a bare hop and changes the encoded
+        // shape. Hop 1: one expired and one valid, so it stays a flyover hop.
+        let valid = make_reservation(3, 4, 10, 600, 1024);
+        path.add_reservation(0, make_reservation(1, 2, 1000, 200, 1024))
+            .unwrap();
+        path.add_reservation(1, make_reservation(3, 4, 1000, 200, 1024))
+            .unwrap();
+        path.add_reservation(1, valid.clone()).unwrap();
+
+        path.remove_expired_reservations();
+
+        assert_eq!(path.segments[0][0].reservations, vec![]);
+        assert_eq!(path.segments[0][1].reservations, vec![valid]);
+        assert_template_fresh(&path, "remove_expired_reservations");
     }
 
     // ---------------------------------------------------------------------------
