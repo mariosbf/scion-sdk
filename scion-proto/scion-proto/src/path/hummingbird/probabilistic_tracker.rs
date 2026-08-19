@@ -2,8 +2,6 @@
 
 use std::time::SystemTime;
 
-use rand::{RngExt as _, SeedableRng, rngs::SmallRng};
-
 use super::reservation_tracker::{ReservationTracker, ReservationTrackerError, Selected};
 use crate::hummingbird::Reservation;
 
@@ -23,30 +21,27 @@ use crate::hummingbird::Reservation;
 /// routers drop those packets. Use
 /// [`TokenBucketTracker`][super::TokenBucketTracker] where client-side
 /// enforcement is required; this one trades enforcement for speed.
-#[derive(Debug)]
-pub struct ProbabilisticTracker {
-    rng: SmallRng,
-}
+///
+/// # Concurrency
+///
+/// The tracker carries no state: selection draws from the thread-local
+/// generator, so it takes `&self`, needs no lock, and threads encode fully in
+/// parallel.
+///
+/// One tracker belongs to one path, so there was never cross-thread state to
+/// keep here — only a generator, and a generator per thread spreads traffic
+/// exactly as well as one shared between them.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ProbabilisticTracker;
 
 impl ProbabilisticTracker {
-    /// Creates a tracker seeded from the operating system.
+    /// Creates a tracker.
     ///
-    /// Use [`Self::with_seed`] where reproducibility matters, such as in tests
-    /// and benchmarks.
+    /// Selection draws from the thread-local generator and is therefore not
+    /// reproducible from a seed; the tests assert the distribution over many
+    /// draws rather than an exact sequence.
     pub fn new() -> Self {
-        Self {
-            rng: rand::make_rng(),
-        }
-    }
-
-    /// Creates a tracker whose selections are reproducible for a given `seed`.
-    ///
-    /// The underlying generator is not portable: the same seed may select
-    /// differently across platforms or library versions.
-    pub fn with_seed(seed: u64) -> Self {
-        Self {
-            rng: SmallRng::seed_from_u64(seed),
-        }
+        Self
     }
 }
 
@@ -57,7 +52,7 @@ impl ReservationTracker for ProbabilisticTracker {
     /// `max_pkt_len` is ignored: this tracker enforces no bandwidth limit, so
     /// packet size does not affect which reservation is usable.
     fn select<'a>(
-        &mut self,
+        &self,
         reservations: &'a [Reservation],
         now: SystemTime,
         _max_pkt_len: usize,
@@ -86,7 +81,7 @@ impl ReservationTracker for ProbabilisticTracker {
             }
 
             total += weight;
-            if self.rng.random_range(0..total) < weight {
+            if rand::random_range(0..total) < weight {
                 selected = Some(reservation);
             }
         }
@@ -104,13 +99,7 @@ impl ReservationTracker for ProbabilisticTracker {
     }
 
     /// Does nothing: this tracker keeps no state to account against.
-    fn commit(&mut self, _selected: &Selected<'_>, _pkt_len: usize) {}
-}
-
-impl Default for ProbabilisticTracker {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn commit(&self, _selected: &Selected<'_>, _pkt_len: usize) {}
 }
 
 #[cfg(test)]
@@ -180,7 +169,7 @@ mod tests {
     fn selection_is_proportional_to_bandwidth() {
         // 3:1 bandwidth ratio, so roughly a 75/25 split.
         let candidates = vec![valid(1, 3072), valid(2, 1024)];
-        let mut tracker = ProbabilisticTracker::with_seed(0xDECAFBAD);
+        let mut tracker = ProbabilisticTracker::new();
 
         const TRIALS: u32 = 20_000;
         let counts = tally(&mut tracker, &candidates, TRIALS);
@@ -197,7 +186,7 @@ mod tests {
         // Even a much narrower reservation must be selected sometimes,
         // otherwise the draw has collapsed to always picking the widest.
         let candidates = vec![valid(1, 65536), valid(2, 1024)];
-        let mut tracker = ProbabilisticTracker::with_seed(7);
+        let mut tracker = ProbabilisticTracker::new();
 
         let counts = tally(&mut tracker, &candidates, 5_000);
         assert!(counts[1] > 0, "the narrow reservation was never selected");
@@ -206,7 +195,7 @@ mod tests {
     #[test]
     fn expired_candidates_are_never_selected() {
         let candidates = vec![expired(1, 1_000_000), valid(2, 1024)];
-        let mut tracker = ProbabilisticTracker::with_seed(1);
+        let mut tracker = ProbabilisticTracker::new();
 
         // The expired one has a thousand times the bandwidth, so weighting
         // alone would pick it almost every time.
@@ -218,7 +207,7 @@ mod tests {
     #[test]
     fn all_expired_reports_expiry() {
         let candidates = vec![expired(1, 1024), expired(2, 1024)];
-        let mut tracker = ProbabilisticTracker::with_seed(1);
+        let tracker = ProbabilisticTracker::new();
 
         assert!(matches!(
             tracker.select(&candidates, SystemTime::now(), 1024),
@@ -228,7 +217,7 @@ mod tests {
 
     #[test]
     fn empty_candidates_is_none_not_error() {
-        let mut tracker = ProbabilisticTracker::with_seed(1);
+        let tracker = ProbabilisticTracker::new();
         assert!(
             tracker
                 .select(&[], SystemTime::now(), 1024)
@@ -238,22 +227,9 @@ mod tests {
     }
 
     #[test]
-    fn the_same_seed_selects_the_same_way() {
-        let candidates = vec![valid(1, 4096), valid(2, 1024), valid(3, 2048)];
-
-        let mut a = ProbabilisticTracker::with_seed(42);
-        let mut b = ProbabilisticTracker::with_seed(42);
-
-        assert_eq!(
-            tally(&mut a, &candidates, 500),
-            tally(&mut b, &candidates, 500)
-        );
-    }
-
-    #[test]
     fn selection_issues_no_ticket_and_commit_is_inert() {
         let candidates = vec![valid(1, 1024)];
-        let mut tracker = ProbabilisticTracker::with_seed(1);
+        let tracker = ProbabilisticTracker::new();
 
         let selected = tracker
             .select(&candidates, SystemTime::now(), 1024)

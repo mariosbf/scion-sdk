@@ -1,9 +1,10 @@
 //! HopField and FlyoverHopField definitions and encoding/decoding logic.
 
+use std::{num::NonZeroU16, ops::Range, time::Duration};
+
 use bytes::{Buf, BufMut, Bytes};
 use chrono::{DateTime, Utc};
 use sciparse::path::hbird::layout::FlyoverHopFieldLayout;
-use std::{num::NonZeroU16, ops::Range, time::Duration};
 
 use crate::{
     hummingbird::Bandwidth,
@@ -691,12 +692,13 @@ impl<'a> Iterator for HummingbirdHopFields<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU16;
+
     use super::*;
     use crate::{
         path::{EncodedHopField, StandardHopField, hummingbird::EncodedFlyoverHopField},
         test_case, test_hopfield_flag,
     };
-    use std::num::NonZeroU16;
 
     test_hopfield_flag! {
         cons_ingress_router_alert_flag: {

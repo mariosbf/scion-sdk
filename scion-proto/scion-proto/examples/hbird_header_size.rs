@@ -28,7 +28,7 @@
 //! cargo run --release -p scion-proto --example hbird_header_size
 //! ```
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use chrono::{Duration, Utc};
 use scion_proto::{
@@ -95,8 +95,7 @@ fn hbird_header_len(hops: u8, flyovers: u8) -> usize {
     // A tracker is attached so that the encode exercises the same selection
     // path a real sender takes; the bandwidth is far above what one packet
     // consumes, so every reserved hop does become a flyover.
-    let tracker: Arc<Mutex<dyn ReservationTracker>> =
-        Arc::new(Mutex::new(TokenBucketTracker::new()));
+    let tracker: Arc<dyn ReservationTracker> = Arc::new(TokenBucketTracker::new());
     path.set_reservation_tracker(tracker);
 
     let encoded = path

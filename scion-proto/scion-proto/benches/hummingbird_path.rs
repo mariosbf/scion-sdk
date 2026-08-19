@@ -60,10 +60,7 @@
 //! the number of flyovers it is supposed to — otherwise a silently degraded
 //! encode would be reported as a fast one.
 
-use std::{
-    hint::black_box,
-    sync::{Arc, Mutex},
-};
+use std::{hint::black_box, sync::Arc};
 
 use chrono::{Duration, Utc};
 use criterion::{
@@ -94,9 +91,6 @@ const FAT_BW: u64 = 60_000_000_000;
 /// One byte per second: the bucket cannot carry even one packet, so every
 /// selection against it fails. Used only by `e5-fallback`.
 const STARVED_BW: u64 = 1;
-
-/// Fixed seed: reservation selection must not vary between benchmark runs.
-const PROB_SEED: u64 = 0x5EED;
 
 fn destination() -> IsdAsn {
     "1-ff00:0:110".parse().unwrap()
@@ -171,8 +165,8 @@ fn path(hops: u8, flyovers: u8, per_hop: u32) -> HummingbirdPath {
     path_with(hops, flyovers, per_hop, |_| FAT_BW)
 }
 
-fn tracker(t: impl ReservationTracker + 'static) -> Arc<Mutex<dyn ReservationTracker>> {
-    Arc::new(Mutex::new(t))
+fn tracker(t: impl ReservationTracker + 'static) -> Arc<dyn ReservationTracker> {
+    Arc::new(t)
 }
 
 /// Times one encode configuration, having first checked outside the timed loop
@@ -216,7 +210,7 @@ fn bench_encode(
 fn bench_tracked(
     group: &mut BenchmarkGroup<'_, WallTime>,
     variant: &str,
-    tracker: &Option<Arc<Mutex<dyn ReservationTracker>>>,
+    tracker: &Option<Arc<dyn ReservationTracker>>,
     hops: u8,
     flyovers: u8,
     per_hop: u32,
@@ -279,11 +273,11 @@ const HOPS: [u8; 8] = [1, 2, 3, 4, 5, 6, 8, 10];
 /// inter-ISD path and leaves room to sweep coverage either side of half.
 const FIXED_HOPS: u8 = 6;
 
-fn make_tracker(name: &str) -> Option<Arc<Mutex<dyn ReservationTracker>>> {
+fn make_tracker(name: &str) -> Option<Arc<dyn ReservationTracker>> {
     match name {
         "none" => None,
         "tokenbucket" => Some(tracker(TokenBucketTracker::new())),
-        "probabilistic" => Some(tracker(ProbabilisticTracker::with_seed(PROB_SEED))),
+        "probabilistic" => Some(tracker(ProbabilisticTracker::new())),
         "lenient-tokenbucket" => Some(tracker(Lenient(TokenBucketTracker::new()))),
         other => panic!("unknown tracker {other}"),
     }

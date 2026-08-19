@@ -142,7 +142,7 @@ impl HummingbirdSegmentLength {
     pub const fn encode(&self) -> u8 {
         self.0
     }
-    
+
     /// Get the length of the segment in bytes
     #[inline]
     pub const fn bytes(&self) -> usize {
@@ -450,8 +450,7 @@ impl WireEncode for HummingbirdMetaHeader {
             | ((self.segment_lengths[1].encode() as u32) << 7)
             | (self.segment_lengths[2].encode() as u32);
         let fields2: u32 = self.base_timestamp.get();
-        let fields3: u32 =
-            ((self.millis_timestamp.get() as u32) << 22) | self.counter.get();
+        let fields3: u32 = ((self.millis_timestamp.get() as u32) << 22) | self.counter.get();
         buffer.put_u32(fields1);
         buffer.put_u32(fields2);
         buffer.put_u32(fields3);
@@ -510,8 +509,9 @@ const fn field<const START: usize, const END: usize>(fields: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::{Duration, UNIX_EPOCH};
+
+    use super::*;
 
     // ---------------------------------------------------------------------------
     // Helpers

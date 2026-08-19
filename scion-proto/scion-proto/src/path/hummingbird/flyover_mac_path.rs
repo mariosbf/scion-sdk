@@ -679,7 +679,10 @@ mod tests {
         assert_eq!(encoded.flyover_hop_fields().count(), 1);
         let flyover = encoded.flyover_hop_fields().next().unwrap();
         assert_eq!(flyover.reservation_id(), 7);
-        assert_eq!(flyover.bandwidth(), Bandwidth::from_bytes_per_sec(512).unwrap());
+        assert_eq!(
+            flyover.bandwidth(),
+            Bandwidth::from_bytes_per_sec(512).unwrap()
+        );
 
         // The flyover's aggregated MAC must equal the original standard
         // hop's MAC XORed with a freshly computed flyover MAC, using the

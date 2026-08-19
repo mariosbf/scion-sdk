@@ -1,10 +1,10 @@
 //! Cryptographic functions for Hummingbird reservations.
 //!
 //! We divide keys into two categories:
-//! - Hummingbird authentication keys: Used to authenticate attempts to use a reservation.
-//!   Denoted A_K in the Hummingbird paper.
-//! - Hummingbird keys: Used by ASes to derive authentication keys for
-//!   reservations. Denoted SV_K in the Hummingbird paper.
+//! - Hummingbird authentication keys: Used to authenticate attempts to use a reservation. Denoted
+//!   A_K in the Hummingbird paper.
+//! - Hummingbird keys: Used by ASes to derive authentication keys for reservations. Denoted SV_K in
+//!   the Hummingbird paper.
 
 use aes::cipher::{BlockEncrypt, consts::U16, generic_array::GenericArray};
 
