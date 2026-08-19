@@ -1,8 +1,10 @@
 //! Hummingbird path type and associated encoding.
 
-use std::ops::Deref;
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    ops::Deref,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use chrono::{DateTime, Utc};
@@ -27,7 +29,9 @@ use crate::{
             flyover_mac_path::{
                 generate_flyover_macs_from_reservations, packet_length_for_payload_with_flyovers,
             },
-            reservation_tracker::{ReservationTracker, ReservationTrackerError, Selected},
+            reservation_tracker::{
+                PacketSession, ReservationTracker, ReservationTrackerError, Selected,
+            },
         },
         metadata::{Metadata, PathInterface},
     },
@@ -204,17 +208,23 @@ where
             let cons_dir = info_field.is_constructed_dir();
 
             seg.hop_fields()
-                .flat_map(move |hop_field| match cons_dir {
-                    true => [
-                        hop_field.cons_ingress_interface(),
-                        hop_field.cons_egress_interface(),
-                    ]
-                    .into_iter(),
-                    false => [
-                        hop_field.cons_egress_interface(),
-                        hop_field.cons_ingress_interface(),
-                    ]
-                    .into_iter(),
+                .flat_map(move |hop_field| {
+                    match cons_dir {
+                        true => {
+                            [
+                                hop_field.cons_ingress_interface(),
+                                hop_field.cons_egress_interface(),
+                            ]
+                            .into_iter()
+                        }
+                        false => {
+                            [
+                                hop_field.cons_egress_interface(),
+                                hop_field.cons_ingress_interface(),
+                            ]
+                            .into_iter()
+                        }
+                    }
                 })
                 .flatten()
         })
@@ -342,21 +352,27 @@ where
                 // The value 42 fits into the 6-bit segment length field of a regular SCION
                 // path.
                 [0, ..] => [SegmentLength::new_unchecked(0); 3],
-                [s1, 0, ..] => [
-                    SegmentLength::new_unchecked(s1),
-                    SegmentLength::new_unchecked(0),
-                    SegmentLength::new_unchecked(0),
-                ],
-                [s1, s2, 0] => [
-                    SegmentLength::new_unchecked(s2),
-                    SegmentLength::new_unchecked(s1),
-                    SegmentLength::new_unchecked(0),
-                ],
-                [s1, s2, s3] => [
-                    SegmentLength::new_unchecked(s3),
-                    SegmentLength::new_unchecked(s2),
-                    SegmentLength::new_unchecked(s1),
-                ],
+                [s1, 0, ..] => {
+                    [
+                        SegmentLength::new_unchecked(s1),
+                        SegmentLength::new_unchecked(0),
+                        SegmentLength::new_unchecked(0),
+                    ]
+                }
+                [s1, s2, 0] => {
+                    [
+                        SegmentLength::new_unchecked(s2),
+                        SegmentLength::new_unchecked(s1),
+                        SegmentLength::new_unchecked(0),
+                    ]
+                }
+                [s1, s2, s3] => {
+                    [
+                        SegmentLength::new_unchecked(s3),
+                        SegmentLength::new_unchecked(s2),
+                        SegmentLength::new_unchecked(s1),
+                    ]
+                }
             },
         }
     }
@@ -599,6 +615,30 @@ struct SelectedHop<'a> {
     selection: Option<Selected<'a>>,
 }
 
+/// Accounts one encoded packet against every reservation it used, through the
+/// packet's session if the tracker opened one and against the tracker directly
+/// otherwise.
+fn commit_packet(
+    tracker: Option<&dyn ReservationTracker>,
+    mut session: Option<&mut (dyn PacketSession + '_)>,
+    hops: &[SelectedHop<'_>],
+    pkt_len: usize,
+) {
+    for hop in hops {
+        let Some(selected) = hop.selection else {
+            continue;
+        };
+        match session.as_deref_mut() {
+            Some(session) => session.commit(&selected, pkt_len),
+            None => {
+                if let Some(tracker) = tracker {
+                    tracker.commit(&selected, pkt_len)
+                }
+            }
+        }
+    }
+}
+
 /// A precomputed encoding of the path header for the shape in which every hop
 /// that has a reservation is encoded as a flyover hop field.
 ///
@@ -639,7 +679,7 @@ pub struct HummingbirdPath {
 
     /// Optional per-path reservation tracker, choosing which reservation to
     /// apply to each hop when encoding.
-    reservation_tracker: Option<Arc<Mutex<dyn ReservationTracker>>>,
+    reservation_tracker: Option<Arc<dyn ReservationTracker>>,
 
     /// Precomputed encoding of this path's structure, rebuilt whenever the
     /// structure changes. `None` if the path cannot be laid out at all, in
@@ -690,7 +730,7 @@ impl HummingbirdPath {
     /// standard hop fields instead.
     ///
     /// [`Lenient`]: crate::path::hummingbird::Lenient
-    pub fn with_reservation_tracker(mut self, tracker: Arc<Mutex<dyn ReservationTracker>>) -> Self {
+    pub fn with_reservation_tracker(mut self, tracker: Arc<dyn ReservationTracker>) -> Self {
         self.reservation_tracker = Some(tracker);
         self
     }
@@ -698,7 +738,7 @@ impl HummingbirdPath {
     /// Sets the [`ReservationTracker`] on this path.
     ///
     /// See [`Self::with_reservation_tracker`].
-    pub fn set_reservation_tracker(&mut self, tracker: Arc<Mutex<dyn ReservationTracker>>) {
+    pub fn set_reservation_tracker(&mut self, tracker: Arc<dyn ReservationTracker>) {
         self.reservation_tracker = Some(tracker);
     }
 
@@ -710,14 +750,13 @@ impl HummingbirdPath {
     /// attached to this path, or if the tracker enforces no bandwidth limit and
     /// so has no figure to report.
     pub fn available_packet_size(&self) -> Option<usize> {
-        let tracker = self.reservation_tracker.as_ref()?;
-        let mut guard = tracker.lock().unwrap();
+        let tracker = self.reservation_tracker.as_deref()?;
 
         let now = SystemTime::now();
         let mut min_available: Option<usize> = None;
 
         for hop in self.hops() {
-            if let Some(avail) = guard.available_bytes_for(&hop.reservations, now) {
+            if let Some(avail) = tracker.available_bytes_for(&hop.reservations, now) {
                 min_available = Some(min_available.map_or(avail, |m: usize| m.min(avail)));
             }
         }
@@ -890,10 +929,12 @@ impl HummingbirdPath {
         self.info_fields.push(info_field);
         self.segments.push(
             hops.into_iter()
-                .map(|(isd_asn, hop_field)| HummingbirdPathHop {
-                    isd_asn,
-                    hop_field,
-                    reservations: vec![],
+                .map(|(isd_asn, hop_field)| {
+                    HummingbirdPathHop {
+                        isd_asn,
+                        hop_field,
+                        reservations: vec![],
+                    }
                 })
                 .collect(),
         );
@@ -908,7 +949,7 @@ impl HummingbirdPath {
     /// may change the encoded length.
     pub fn encoded_length(&self) -> usize {
         let hops = self
-            .hops_with_reservation(0, None)
+            .hops_with_reservation(0, None, None)
             .expect("infallible: no tracker");
         self.path_header_len(&hops)
     }
@@ -956,28 +997,26 @@ impl HummingbirdPath {
         &'a self,
         pkt_len: usize,
         // The `'static` object bound matches the tracker stored on the path.
-        // Without it the default bound ties the trait object's lifetime to the
-        // borrow, which `&mut`'s invariance then cannot reconcile.
-        mut tracker: Option<(&mut (dyn ReservationTracker + 'static), SystemTime)>,
+        tracker: Option<(&(dyn ReservationTracker + 'static), SystemTime)>,
+        // The packet's session, if the tracker opened one. Selections go
+        // through it rather than through `tracker` so that a locking tracker
+        // holds its guard across the whole packet.
+        mut session: Option<&mut (dyn PacketSession + '_)>,
     ) -> Result<Vec<SelectedHop<'a>>, HummingbirdPathError> {
         let mut hop_fields = Vec::with_capacity(self.num_hopfields());
-        // Deferred until a hop actually has reservations, so that a path without
-        // any never pays for the tracker's per-packet setup.
-        let mut began = false;
 
         for (seg_idx, segment) in self.segments.iter().enumerate() {
             for (hop_idx, hop) in segment.iter().enumerate() {
                 let reservations = &hop.reservations;
-                let selection = if let Some((tracker, now)) = tracker.as_mut()
-                    && !reservations.is_empty()
-                {
-                    let now = *now;
-                    if !began {
-                        tracker.begin_packet(now);
-                        began = true;
+                let selection = if reservations.is_empty() {
+                    None
+                } else if let Some((tracker, now)) = tracker {
+                    match session.as_deref_mut() {
+                        Some(session) => session.select(reservations, now, pkt_len)?,
+                        None => tracker.select(reservations, now, pkt_len)?,
                     }
-                    tracker.select(reservations, now, pkt_len)?
                 } else {
+                    // No tracker: a hop's first reservation is used unconditionally.
                     reservations.first().map(Selected::untracked)
                 };
 
@@ -990,6 +1029,19 @@ impl HummingbirdPath {
         }
 
         Ok(hop_fields)
+    }
+
+    /// Opens the tracker's session for one packet, if it wants one.
+    ///
+    /// Skipped entirely when no hop carries a reservation, so such a path never
+    /// pays for a tracker's per-packet setup — the guarantee
+    /// [`ReservationTracker::begin_packet`] documents.
+    fn begin_packet(&self, now: SystemTime) -> Option<Box<dyn PacketSession + '_>> {
+        let tracker = self.reservation_tracker.as_deref()?;
+        if self.hops().all(|hop| hop.reservations.is_empty()) {
+            return None;
+        }
+        tracker.begin_packet(now)
     }
 
     fn hops(&self) -> impl Iterator<Item = &HummingbirdPathHop> {
@@ -1205,12 +1257,16 @@ impl HummingbirdPath {
             + address_header_len as usize
             + payload_len as usize;
 
-        // Lock the tracker once for the entire check → encode → deduct sequence.
-        let mut tracker_guard = self.reservation_tracker.as_ref().map(|t| t.lock().unwrap());
+        // No lock is taken here. A tracker that needs one opens a session and
+        // holds it for the whole packet; one that does not pays nothing. See
+        // the `reservation_tracker` module docs.
+        let tracker_ref = self.reservation_tracker.as_deref();
+        let mut session = self.begin_packet(now);
 
         let hops = self.hops_with_reservation(
             estimated_pkt_len,
-            tracker_guard.as_deref_mut().map(|t| (t, now)),
+            tracker_ref.map(|t| (t, now)),
+            session.as_deref_mut(),
         )?;
 
         // Validate every selected reservation before any byte is written, so
@@ -1247,9 +1303,11 @@ impl HummingbirdPath {
                 meta_header.current_hop_field = laid_out.current_hop_field;
                 template.encoded.raw().len()
             }
-            None => self.apply_header_layout(&mut meta_header, |flat_idx, _| {
-                hops[flat_idx].selection.is_some()
-            })?,
+            None => {
+                self.apply_header_layout(&mut meta_header, |flat_idx, _| {
+                    hops[flat_idx].selection.is_some()
+                })?
+            }
         };
         let pkt_len = u16::try_from(path_header_len)
             .ok()
@@ -1328,14 +1386,8 @@ impl HummingbirdPath {
         };
 
         // Commit the packet against the selected reservations, now that its
-        // exact length is known (still under the same tracker lock).
-        if let Some(ref mut guard) = tracker_guard {
-            for hop in &hops {
-                if let Some(selected) = hop.selection {
-                    guard.commit(&selected, pkt_len as usize);
-                }
-            }
-        }
+        // exact length is known.
+        commit_packet(tracker_ref, session.as_deref_mut(), &hops, pkt_len as usize);
 
         Ok((meta_header, buffer.into()))
     }
@@ -1364,10 +1416,12 @@ impl HummingbirdPath {
             + payload_len as usize;
 
         let now = SystemTime::now();
-        let mut tracker_guard = self.reservation_tracker.as_ref().map(|t| t.lock().unwrap());
+        let tracker_ref = self.reservation_tracker.as_deref();
+        let mut session = self.begin_packet(now);
         let hops = self.hops_with_reservation(
             estimated_pkt_len,
-            tracker_guard.as_deref_mut().map(|t| (t, now)),
+            tracker_ref.map(|t| (t, now)),
+            session.as_deref_mut(),
         )?;
 
         let flyover_count = hops.iter().filter(|h| h.selection.is_some()).count();
@@ -1391,14 +1445,12 @@ impl HummingbirdPath {
     /// length.
     ///
     /// Parameters:
-    /// - `destination`: destination ISD-AS, used for the flyover MAC
-    ///   calculation.
-    /// - `packet_length`: the target total packet length (e.g. path MTU).
-    ///   Used directly in the MAC calculation (see
-    ///   [`crate::hummingbird::Reservation::generate_flyover_mac`]) — the
+    /// - `destination`: destination ISD-AS, used for the flyover MAC calculation.
+    /// - `packet_length`: the target total packet length (e.g. path MTU). Used directly in the MAC
+    ///   calculation (see [`crate::hummingbird::Reservation::generate_flyover_mac`]) — the
     ///   resulting MACs are only valid for a packet of exactly this length.
-    /// - `address_header_len`: not used by the MAC calculation itself —
-    ///   needed solely to derive [`crate::hummingbird::FlyoverMACs::payload_length_suggestion`],
+    /// - `address_header_len`: not used by the MAC calculation itself — needed solely to derive
+    ///   [`crate::hummingbird::FlyoverMACs::payload_length_suggestion`],
     pub fn generate_flyover_macs(
         &self,
         destination: IsdAsn,
@@ -1406,11 +1458,13 @@ impl HummingbirdPath {
         address_header_len: u16,
     ) -> Result<FlyoverMACs, HummingbirdPathError> {
         let now = SystemTime::now();
-        let mut tracker_guard = self.reservation_tracker.as_ref().map(|t| t.lock().unwrap());
+        let tracker_ref = self.reservation_tracker.as_deref();
+        let mut session = self.begin_packet(now);
 
         let hops = self.hops_with_reservation(
             packet_length as usize,
-            tracker_guard.as_deref_mut().map(|t| (t, now)),
+            tracker_ref.map(|t| (t, now)),
+            session.as_deref_mut(),
         )?;
 
         let base_path_header_len = self.base_encoded_length();
@@ -1431,13 +1485,12 @@ impl HummingbirdPath {
         // Commit against the selected reservations, mirroring
         // encode_with_reservations: generating MACs for a packet commits to
         // sending it.
-        if let Some(ref mut guard) = tracker_guard {
-            for hop in &hops {
-                if let Some(selected) = hop.selection {
-                    guard.commit(&selected, packet_length as usize);
-                }
-            }
-        }
+        commit_packet(
+            tracker_ref,
+            session.as_deref_mut(),
+            &hops,
+            packet_length as usize,
+        );
 
         Ok(macs)
     }
@@ -1447,10 +1500,10 @@ impl HummingbirdPath {
     /// fields.
     ///
     /// Parameters:
-    /// - `destination`: The destination ISD-AS of the path, used for calculating the
-    ///   flyover hop field MACs.
-    /// - `payload_len`: the length of the payload contained in the packet
-    ///   (number of bytes). Used for flyover MAC calculations.
+    /// - `destination`: The destination ISD-AS of the path, used for calculating the flyover hop
+    ///   field MACs.
+    /// - `payload_len`: the length of the payload contained in the packet (number of bytes). Used
+    ///   for flyover MAC calculations.
     ///
     /// See [encoded_length][Self::encoded_length] for the length of the resulting encoding.
     pub fn encode_to<T: BufMut>(
@@ -1472,10 +1525,10 @@ impl HummingbirdPath {
     /// Turn this path into an [EncodedHummingbirdPath].
     ///
     /// Parameters:
-    /// - `destination`: The destination ISD-AS of the path, used for calculating the
-    ///   flyover hop field MACs.
-    /// - `payload_len`: the length of the payload contained in the packet
-    ///   (number of bytes). Used for flyover MAC calculations.
+    /// - `destination`: The destination ISD-AS of the path, used for calculating the flyover hop
+    ///   field MACs.
+    /// - `payload_len`: the length of the payload contained in the packet (number of bytes). Used
+    ///   for flyover MAC calculations.
     pub fn to_encoded(
         &self,
         destination: IsdAsn,
@@ -1496,10 +1549,10 @@ impl HummingbirdPath {
     ///
     /// Parameters:
     /// - `source`: The source ISD-AS of the path.
-    /// - `destination`: The destination ISD-AS of the path, used for calculating the
-    ///   flyover hop field MACs.
-    /// - `payload_len`: the length of the payload contained in the packet
-    ///   (number of bytes). Used for flyover MAC calculations.
+    /// - `destination`: The destination ISD-AS of the path, used for calculating the flyover hop
+    ///   field MACs.
+    /// - `payload_len`: the length of the payload contained in the packet (number of bytes). Used
+    ///   for flyover MAC calculations.
     pub fn to_bytes_path(
         &self,
         isd_asn: ByEndpoint<IsdAsn>,
@@ -1554,8 +1607,8 @@ impl HummingbirdPath {
     /// entries to cover every hop field in the path) are left without one.
     ///
     /// Parameters:
-    /// - `data`: byte buffer containing the encoded path. The buffer will be
-    ///   modified by advancing it past the bytes that were decoded.
+    /// - `data`: byte buffer containing the encoded path. The buffer will be modified by advancing
+    ///   it past the bytes that were decoded.
     /// - `ases`: list of ISD-AS numbers corresponding to the ASes along the path, in order.
     pub fn decode(data: &mut Bytes, ases: &[IsdAsn]) -> Result<Self, HummingbirdPathError> {
         let meta_header = HummingbirdMetaHeader::decode(data)?;
@@ -1580,16 +1633,18 @@ impl HummingbirdPath {
                 let hop_field = HummingbirdHopField::decode(data)?;
                 let hop_field = match hop_field {
                     HummingbirdHopField::Standard(h) => h,
-                    HummingbirdHopField::Flyover(h) => StandardHopField {
-                        ingress_router_alert: h.ingress_router_alert,
-                        egress_router_alert: h.egress_router_alert,
-                        exp_time: h.exp_time,
-                        cons_ingress: h.cons_ingress,
-                        cons_egress: h.cons_egress,
-                        // Note: This is where we need to assume that MACs are
-                        // de-aggregated.
-                        mac: h.aggregated_mac,
-                    },
+                    HummingbirdHopField::Flyover(h) => {
+                        StandardHopField {
+                            ingress_router_alert: h.ingress_router_alert,
+                            egress_router_alert: h.egress_router_alert,
+                            exp_time: h.exp_time,
+                            cons_ingress: h.cons_ingress,
+                            cons_egress: h.cons_egress,
+                            // Note: This is where we need to assume that MACs are
+                            // de-aggregated.
+                            mac: h.aggregated_mac,
+                        }
+                    }
                 };
 
                 seg_len -= hop_field.encoded_length();
@@ -1669,6 +1724,8 @@ impl PathProvider for HummingbirdPath {
 mod tests {
     use std::num::NonZeroU16;
 
+    use bytes::Bytes;
+
     use super::*;
     use crate::{
         address::{Asn, Isd, IsdAsn},
@@ -1677,7 +1734,6 @@ mod tests {
         path::{DataPlanePathErrorKind, hummingbird::Lenient},
         wire_encoding::WireDecode,
     };
-    use bytes::Bytes;
 
     // Helpers
 
@@ -2431,14 +2487,14 @@ mod tests {
         struct NeverSelects;
         impl ReservationTracker for NeverSelects {
             fn select<'a>(
-                &mut self,
+                &self,
                 _reservations: &'a [Reservation],
                 _now: SystemTime,
                 _max_pkt_len: usize,
             ) -> Result<Option<Selected<'a>>, ReservationTrackerError> {
                 Err(ReservationTrackerError::BandwidthExceeded)
             }
-            fn commit(&mut self, _selected: &Selected<'_>, _pkt_len: usize) {}
+            fn commit(&self, _selected: &Selected<'_>, _pkt_len: usize) {}
         }
 
         let mut path = HummingbirdPath::new();
@@ -2449,7 +2505,7 @@ mod tests {
         .unwrap();
         path.add_reservation(0, make_reservation(0, 1, 10, 600, 1024))
             .unwrap();
-        path.set_reservation_tracker(Arc::new(Mutex::new(Lenient(NeverSelects))));
+        path.set_reservation_tracker(Arc::new(Lenient(NeverSelects)));
 
         let encoded = path.to_encoded(IsdAsn::new(Isd::new(2), Asn::new(9)), 512, 24);
         let encoded = encoded.expect("a declined reservation is not an error under Lenient");
@@ -2486,9 +2542,7 @@ mod tests {
         );
         assert_eq!(
             template.encoded.raw().len(),
-            hop_fields_start
-                + 2 * StandardHopField::ENCODED_SIZE
-                + FlyoverHopField::ENCODED_SIZE
+            hop_fields_start + 2 * StandardHopField::ENCODED_SIZE + FlyoverHopField::ENCODED_SIZE
         );
     }
 

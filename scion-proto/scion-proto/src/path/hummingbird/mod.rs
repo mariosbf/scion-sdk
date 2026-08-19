@@ -20,7 +20,7 @@ pub(super) mod token_bucket;
 /// Chooses which reservation to apply to each hop when encoding a path.
 pub mod reservation_tracker;
 pub use reservation_tracker::{
-    Lenient, ReservationTracker, ReservationTrackerError, Selected, Ticket,
+    Lenient, PacketSession, ReservationTracker, ReservationTrackerError, Selected, Ticket,
 };
 
 /// Tracks per-flow Hummingbird reservations and enforces bandwidth limits.

@@ -30,10 +30,7 @@
 //! group attaches a [`ProbabilisticTracker`], which selects by bandwidth but
 //! enforces nothing — the gap between the two is the price of enforcement.
 
-use std::{
-    hint::black_box,
-    sync::{Arc, Mutex},
-};
+use std::{hint::black_box, sync::Arc};
 
 use chrono::{Duration, Utc};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
@@ -141,7 +138,7 @@ fn bench_to_encoded_tracked(c: &mut Criterion) {
 
     for (num_hops, num_flyovers) in [(2, 2), (6, 0), (6, 3), (6, 6)] {
         let path = path(num_hops, num_flyovers)
-            .with_reservation_tracker(Arc::new(Mutex::new(TokenBucketTracker::new())));
+            .with_reservation_tracker(Arc::new(TokenBucketTracker::new()));
 
         // Sanity check outside the timed loop: every reservation must
         // actually be applied, otherwise the benchmark measures fallback.
@@ -178,10 +175,8 @@ fn bench_to_encoded_probabilistic(c: &mut Criterion) {
     let destination = destination();
 
     for (num_hops, num_flyovers) in [(2, 2), (6, 0), (6, 3), (6, 6)] {
-        // Fixed seed: selection must not vary between benchmark runs.
-        let path = path(num_hops, num_flyovers).with_reservation_tracker(Arc::new(Mutex::new(
-            ProbabilisticTracker::with_seed(0x5EED),
-        )));
+        let path = path(num_hops, num_flyovers)
+            .with_reservation_tracker(Arc::new(ProbabilisticTracker::new()));
 
         // Sanity check outside the timed loop: every reservation must
         // actually be applied, otherwise the benchmark measures fallback.

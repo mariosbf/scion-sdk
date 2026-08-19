@@ -2,13 +2,16 @@
 
 use std::{
     collections::HashMap,
+    sync::{Mutex, MutexGuard},
     time::{Duration, Instant, SystemTime},
 };
 
 use chrono::{DateTime, Utc};
 
 use super::{
-    reservation_tracker::{ReservationTracker, ReservationTrackerError, Selected, Ticket},
+    reservation_tracker::{
+        PacketSession, ReservationTracker, ReservationTrackerError, Selected, Ticket,
+    },
     token_bucket::TokenBucket,
 };
 use crate::{
@@ -36,11 +39,152 @@ struct BucketEntry {
 /// [`Lenient`][super::reservation_tracker::Lenient] to fall back to standard hop
 /// fields instead.
 ///
+/// # Concurrency
+///
+/// This tracker owns a mutex, because it is the implementation that genuinely
+/// needs one: holding senders to a reserved bandwidth is a claim about their
+/// *combined* rate, which cannot be maintained without shared state. Trackers
+/// with nothing to coordinate — [`ProbabilisticTracker`][super::ProbabilisticTracker]
+/// — pay nothing for this one's requirements, which is why the lock lives here
+/// and not around every tracker in [`HummingbirdPath`][super::HummingbirdPath].
+///
+/// The lock is taken per call rather than across selection and commit together,
+/// so two threads can both pass a check before either deducts, overdrawing a
+/// bucket by at most one packet each before refill catches up. See the
+/// [module documentation][super::reservation_tracker] for why that trade is
+/// made.
+#[derive(Debug)]
+pub struct TokenBucketTracker {
+    inner: Mutex<Inner>,
+}
+
+impl TokenBucketTracker {
+    /// Creates a new [`TokenBucketTracker`].
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(Inner::new()),
+        }
+    }
+
+    /// Takes the lock, recovering from a panic in another holder.
+    ///
+    /// A poisoned tracker is not a reason to fail an encode: the state behind
+    /// it is a set of token buckets, and the worst a partially applied update
+    /// can do is misjudge one bucket's level until it next refills.
+    fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Drops buckets whose reservations have expired, if enough time has passed
+    /// since the last sweep.
+    pub fn cleanup_if_due(&self) {
+        self.lock().cleanup_if_due()
+    }
+
+    /// Returns whether `num_bytes` may be sent over `reservation` now.
+    pub fn check_reservation(
+        &self,
+        reservation: &ReservationInfo,
+        num_bytes: usize,
+    ) -> Result<(), ReservationTrackerError> {
+        self.lock().check_reservation(reservation, num_bytes)
+    }
+
+    /// [`Self::check_reservation`] at an explicit instant.
+    pub fn check_reservation_at(
+        &self,
+        reservation: &ReservationInfo,
+        num_bytes: usize,
+        now: SystemTime,
+    ) -> Result<(), ReservationTrackerError> {
+        self.lock()
+            .check_reservation_at(reservation, num_bytes, now)
+    }
+
+    /// Deducts `num_bytes` from `reservation`'s bucket.
+    pub fn deduct_reservation(&self, reservation: &ReservationInfo, num_bytes: usize) {
+        self.lock().deduct_reservation(reservation, num_bytes)
+    }
+
+    /// Returns how many bytes may currently be sent over `reservation`.
+    pub fn available_bytes(&self, reservation: &ReservationInfo) -> usize {
+        self.lock().available_bytes(reservation)
+    }
+
+    /// [`Self::available_bytes`] at an explicit instant.
+    pub fn available_bytes_at(&self, reservation: &ReservationInfo, now: SystemTime) -> usize {
+        self.lock().available_bytes_at(reservation, now)
+    }
+
+    /// Checks and deducts in one step.
+    pub fn use_reservation(
+        &self,
+        reservation: &ReservationInfo,
+        num_bytes: usize,
+    ) -> Result<(), ReservationTrackerError> {
+        self.lock().use_reservation(reservation, num_bytes)
+    }
+}
+
+/// Holds [`TokenBucketTracker`]'s lock for the duration of one packet.
+struct TokenBucketSession<'s> {
+    guard: MutexGuard<'s, Inner>,
+}
+
+impl PacketSession for TokenBucketSession<'_> {
+    fn select<'a>(
+        &mut self,
+        reservations: &'a [Reservation],
+        now: SystemTime,
+        max_pkt_len: usize,
+    ) -> Result<Option<Selected<'a>>, ReservationTrackerError> {
+        self.guard.select(reservations, now, max_pkt_len)
+    }
+
+    fn commit(&mut self, selected: &Selected<'_>, pkt_len: usize) {
+        self.guard.commit(selected, pkt_len)
+    }
+}
+
+impl ReservationTracker for TokenBucketTracker {
+    /// Opens a session holding the lock for the whole packet.
+    ///
+    /// This is the point of the session mechanism for this tracker: one
+    /// acquisition per packet instead of one per hop, and selection and commit
+    /// in a single critical section, so a bandwidth check cannot be overtaken
+    /// by another thread's deduction. The `&self` `select`/`commit` above still
+    /// work for callers holding a single hop; encoding does not use them.
+    fn begin_packet(&self, now: SystemTime) -> Option<Box<dyn PacketSession + '_>> {
+        let mut guard = self.lock();
+        guard.begin_packet(now);
+        Some(Box::new(TokenBucketSession { guard }))
+    }
+
+    fn select<'a>(
+        &self,
+        reservations: &'a [Reservation],
+        now: SystemTime,
+        max_pkt_len: usize,
+    ) -> Result<Option<Selected<'a>>, ReservationTrackerError> {
+        self.lock().select(reservations, now, max_pkt_len)
+    }
+
+    fn commit(&self, selected: &Selected<'_>, pkt_len: usize) {
+        self.lock().commit(selected, pkt_len)
+    }
+
+    fn available_bytes_for(&self, reservations: &[Reservation], now: SystemTime) -> Option<usize> {
+        self.lock().available_bytes_for(reservations, now)
+    }
+}
+
+/// The mutable state behind [`TokenBucketTracker`], which owns the lock.
+///
 /// Buckets live in a slab rather than directly in the map, so that a selection
 /// can hand its slot to the matching commit through a [`Ticket`] instead of
 /// hashing the key a second time.
 #[derive(Debug)]
-pub struct TokenBucketTracker {
+struct Inner {
     buckets: Vec<BucketEntry>,
     slots: HashMap<BucketKey, usize>,
     /// Bumped whenever cleanup moves buckets within the slab, invalidating every
@@ -50,9 +194,9 @@ pub struct TokenBucketTracker {
     cleanup_interval: Duration,
 }
 
-impl TokenBucketTracker {
-    /// Creates a new [`TokenBucketTracker`].
-    pub fn new() -> Self {
+impl Inner {
+    /// Creates empty tracker state.
+    fn new() -> Self {
         Self {
             buckets: Vec::new(),
             slots: HashMap::new(),
@@ -226,7 +370,8 @@ impl TokenBucketTracker {
     }
 }
 
-impl ReservationTracker for TokenBucketTracker {
+/// The per-packet tracker operations, on the locked state.
+impl Inner {
     fn begin_packet(&mut self, _now: SystemTime) {
         self.cleanup_if_due();
     }
@@ -371,7 +516,7 @@ mod tests {
 
     #[test]
     fn different_start_times_get_independent_buckets() {
-        let mut tracker = TokenBucketTracker::new();
+        let tracker = TokenBucketTracker::new();
         let now = Utc::now();
 
         let res_a = make_reservation(42, now - ChronoDuration::seconds(10), 1024);
@@ -388,7 +533,7 @@ mod tests {
 
     #[test]
     fn same_start_time_shares_bucket() {
-        let mut tracker = TokenBucketTracker::new();
+        let tracker = TokenBucketTracker::new();
         let start = Utc::now() - ChronoDuration::seconds(10);
 
         let res_a = make_reservation(42, start, 1024);
@@ -403,7 +548,7 @@ mod tests {
 
     #[test]
     fn select_picks_the_tightest_bucket() {
-        let mut tracker = TokenBucketTracker::new();
+        let tracker = TokenBucketTracker::new();
         let start = Utc::now() - ChronoDuration::seconds(1);
         let now = SystemTime::now();
 
@@ -417,7 +562,7 @@ mod tests {
 
     #[test]
     fn select_reports_exhaustion_and_expiry_distinctly() {
-        let mut tracker = TokenBucketTracker::new();
+        let tracker = TokenBucketTracker::new();
         let now = SystemTime::now();
 
         let exhausted = reservation(make_reservation(
@@ -447,7 +592,7 @@ mod tests {
 
     #[test]
     fn select_on_empty_candidates_is_none_not_error() {
-        let mut tracker = TokenBucketTracker::new();
+        let tracker = TokenBucketTracker::new();
         assert!(
             tracker
                 .select(&[], SystemTime::now(), 1024)
@@ -458,7 +603,7 @@ mod tests {
 
     #[test]
     fn lenient_turns_failure_into_no_selection() {
-        let mut tracker = Lenient(TokenBucketTracker::new());
+        let tracker = Lenient(TokenBucketTracker::new());
         let expired = reservation(make_reservation(
             1,
             Utc::now() - ChronoDuration::hours(2),
@@ -476,7 +621,7 @@ mod tests {
 
     #[test]
     fn commit_deducts_from_the_selected_bucket() {
-        let mut tracker = TokenBucketTracker::new();
+        let tracker = TokenBucketTracker::new();
         let start = Utc::now() - ChronoDuration::seconds(1);
         let now = SystemTime::now();
 
@@ -499,10 +644,10 @@ mod tests {
         // A tracker that has never seen this reservation issues slot 0 for it;
         // pointing that ticket at a different tracker must not silently deduct
         // from whatever happens to sit in that tracker's slot 0.
-        let mut other = TokenBucketTracker::new();
+        let other = TokenBucketTracker::new();
         let selected = other.select(&candidates, now, 1024).unwrap().unwrap();
 
-        let mut tracker = TokenBucketTracker::new();
+        let tracker = TokenBucketTracker::new();
         tracker.commit(&selected, 512);
         let after = tracker.available_bytes_at(candidates[0].info(), now);
 
@@ -522,7 +667,7 @@ mod tests {
         let long = |res_id| reservation(make_reservation_lasting(res_id, start, 1024, u16::MAX));
         let (b, c, d) = (long(2), long(3), long(4));
 
-        let mut tracker = TokenBucketTracker::new();
+        let tracker = TokenBucketTracker::new();
         for candidate in [&short, &b, &c, &d] {
             let candidates = std::slice::from_ref(candidate);
             tracker.select(candidates, now, 1).unwrap().unwrap();
@@ -533,7 +678,7 @@ mod tests {
         let selected = tracker.select(&candidates, now, 1024).unwrap().unwrap();
 
         // Drop the short reservation: c moves to slot 1, and slot 2 becomes d.
-        tracker.cleanup(now + Duration::from_secs(120));
+        tracker.lock().cleanup(now + Duration::from_secs(120));
 
         tracker.commit(&selected, 512);
 
