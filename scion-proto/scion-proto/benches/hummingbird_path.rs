@@ -292,8 +292,12 @@ fn make_tracker(name: &str) -> Option<Arc<Mutex<dyn ReservationTracker>>> {
 /// E1 — how encoding cost scales with path length, for a regular path, an
 /// unreserved Hummingbird path, and a fully reserved one.
 ///
-/// `fly=0` under a tracker is a null control: a path with no reservations
-/// never consults its tracker, so those points must match `none` exactly.
+/// `fly=0` under a tracker measures what merely *attaching* a tracker costs.
+/// `begin_packet` and `select` are indeed skipped for a path with no
+/// reservations, but `to_encoded` locks the tracker mutex before it knows
+/// that, so the cost is one uncontended acquire per packet and not zero. It
+/// must not grow with hop count: this is a fixed cost, and a slope here would
+/// mean per-hop tracker work on hops that have no reservations.
 fn bench_e1_hops(c: &mut Criterion) {
     let mut group = c.benchmark_group("e1-hops");
 
