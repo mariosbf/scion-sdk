@@ -91,6 +91,16 @@ fn main() -> anyhow::Result<()> {
             use_tonic: false,
         },
         CompileConfig {
+            name: "hbird-redemption-api",
+            out_dir: "crates/apis/hbird-redemption-api/hbird-redemption-api-protobuf/src/proto",
+            proto_dirs: vec![
+                "crates/apis/hbird-redemption-api/hbird-redemption-api-protobuf/protobuf",
+            ],
+            extern_includes: vec![],
+            protoc_args: vec![],
+            use_tonic: false,
+        },
+        CompileConfig {
             name: "snap-control",
             out_dir: "crates/snap/snap-control/src/proto",
             proto_dirs: vec!["crates/snap/snap-control/protobuf"],

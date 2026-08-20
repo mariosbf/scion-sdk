@@ -2267,6 +2267,68 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
+name = "hbird-redemption-api"
+version = "0.6.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "axum-connect-rpc",
+ "hbird-redemption-api-models",
+ "hbird-redemption-api-protobuf",
+ "sciparse",
+ "tokio",
+]
+
+[[package]]
+name = "hbird-redemption-api-client"
+version = "0.6.1"
+dependencies = [
+ "anyhow",
+ "hbird-redemption-api",
+ "hbird-redemption-api-models",
+ "hbird-redemption-api-protobuf",
+ "http",
+ "rand 0.8.7",
+ "reqwest-connect-rpc",
+ "rsa",
+ "scion-connect-rpc",
+ "scion-quic",
+ "scion-stack",
+ "sciparse",
+ "svc-resolution-client",
+ "svc-resolution-models",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "hbird-redemption-api-models"
+version = "0.6.1"
+dependencies = [
+ "async-trait",
+ "reqwest-connect-rpc",
+ "rsa",
+ "scion-connect-rpc",
+ "scion-stack",
+ "sciparse",
+ "svc-resolution-models",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "hbird-redemption-api-protobuf"
+version = "0.6.1"
+dependencies = [
+ "hbird-redemption-api-models",
+ "prost",
+ "prost-types",
+ "rsa",
+ "sciparse",
+ "sha2",
+]
+
+[[package]]
 name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,36 @@
+[package]
+name = "hbird-redemption-api-client"
+version = "0.6.1"
+edition.workspace = true
+authors = ["Anapaya & contributors"]
+license = "Apache-2.0"
+description = "Hummingbird redemption API client"
+repository = "https://github.com/anapaya/scion-sdk"
+keywords = ["SCION", "networking"]
+
+[dependencies]
+# Local Dependencies
+hbird-redemption-api = { workspace = true }
+hbird-redemption-api-models = { workspace = true }
+hbird-redemption-api-protobuf = { workspace = true }
+sciparse = { workspace = true }
+scion-quic = { workspace = true }
+reqwest-connect-rpc = { workspace = true }
+scion-connect-rpc = { workspace = true }
+scion-stack = { workspace = true }
+svc-resolution-client = { workspace = true }
+svc-resolution-models = { workspace = true }
+
+# Global Dependencies
+anyhow = { workspace = true }
+http = { workspace = true }
+rsa = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+# Need rand for generating RSA keys but rsa does not yet work well with rand 0.9
+rand = "0.8"
+
+[lints]
+workspace = true
