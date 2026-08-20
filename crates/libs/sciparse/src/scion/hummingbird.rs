@@ -33,6 +33,7 @@ use aes::{Aes128Enc, cipher::KeyInit};
 use crate::identifier::isd_asn::IsdAsn;
 
 pub mod crypto;
+pub mod probabilistic_tracker;
 mod token_bucket;
 pub mod token_bucket_tracker;
 pub mod tracker;

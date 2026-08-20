@@ -18,6 +18,7 @@ cmac = { workspace = true }
 ecdsa = { workspace = true }
 p256 = { workspace = true }
 prost = { workspace = true }
+rand = { workspace = true }
 prost-types = { workspace = true }
 scion-protobuf = { workspace = true }
 serde = { workspace = true }

@@ -4898,6 +4898,7 @@ dependencies = [
  "proptest-derive",
  "prost",
  "prost-types",
+ "rand 0.10.2",
  "scion-protobuf",
  "sciparse",
  "serde",
