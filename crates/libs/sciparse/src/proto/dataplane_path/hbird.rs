@@ -19,5 +19,6 @@
 //! lines long instead of three, and is marked by the flyover bit in its flags byte.
 
 pub mod layout;
+pub mod model;
 pub mod types;
 pub mod view;
