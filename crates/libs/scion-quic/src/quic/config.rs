@@ -16,6 +16,8 @@
 
 use std::time::Duration;
 
+pub use squiche::{PROTOCOL_VERSION, SCION_PROTOCOL_VERSION};
+
 use crate::DEFAULT_MAX_UDP_PAYLOAD_SIZE;
 
 /// Default handshake timeout.
@@ -27,6 +29,13 @@ const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// QUIC client configuration.
 #[derive(Debug, Clone)]
 pub struct QuicConfig {
+    /// QUIC wire version to use for the handshake.
+    ///
+    /// Defaults to [`SCION_PROTOCOL_VERSION`], which permits shorter Initial packets (600 instead
+    /// of 1200 bytes) but is only understood by squiche peers. Set this to [`PROTOCOL_VERSION`]
+    /// when talking to a stack built on a stock QUIC implementation, such as the quic-go based
+    /// open-source SCION services, which will not negotiate an unknown version.
+    pub protocol_version: u32,
     /// Timeout for QUIC handshake completion.
     pub handshake_timeout: Duration,
     /// Idle timeout for connections.
@@ -37,7 +46,20 @@ pub struct QuicConfig {
     pub application_protos: Vec<Vec<u8>>,
     /// Whether to verify the server certificate.
     pub verify_peer: bool,
+    /// Whether the server certificate must match the server name.
+    ///
+    /// Defaults to `true`. Set this to `false` for peers whose certificates carry no
+    /// `subjectAltName` to match against, such as SCION control-plane PKI certificates, which
+    /// identify the AS through a private OID in the subject instead. Note that squiche couples the
+    /// two uses of the server name, so disabling the check also stops the name from being sent as
+    /// SNI; the `:authority` header is taken from the request URL and is unaffected.
+    pub verify_server_name: bool,
     /// Optional path to CA certificates directory.
+    ///
+    /// This is looked up in OpenSSL hashed-directory form: each trust anchor must be a file named
+    /// `<subject_hash>.<n>`, as produced by `c_rehash` or `openssl x509 -hash -noout -in <cert>`.
+    /// A directory of plainly-named `.crt`/`.pem` files silently yields no trust anchors, and
+    /// every handshake then fails with `TlsFail`.
     pub ca_certs_directory: Option<String>,
     /// Optional path to a CA certificate PEM file for verification.
     pub ca_certs_file: Option<String>,
@@ -62,11 +84,13 @@ pub struct QuicConfig {
 impl Default for QuicConfig {
     fn default() -> Self {
         Self {
+            protocol_version: SCION_PROTOCOL_VERSION,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             max_udp_payload_size: DEFAULT_MAX_UDP_PAYLOAD_SIZE,
             application_protos: vec![b"h3".to_vec()],
             verify_peer: true,
+            verify_server_name: true,
             ca_certs_directory: None,
             ca_certs_file: None,
             verify_algorithm_prefs: None,
@@ -88,7 +112,7 @@ impl QuicConfig {
 
     /// Creates a squiche::Config from this configuration.
     pub fn to_quiche_config(&self) -> Result<squiche::Config, squiche::Error> {
-        let mut config = squiche::Config::new(squiche::SCION_PROTOCOL_VERSION)?;
+        let mut config = squiche::Config::new(self.protocol_version)?;
 
         config.set_application_protos(
             &self
@@ -133,6 +157,12 @@ pub struct QuicConfigBuilder {
 }
 
 impl QuicConfigBuilder {
+    /// Sets the QUIC wire version used for the handshake.
+    pub fn protocol_version(mut self, version: u32) -> Self {
+        self.config.protocol_version = version;
+        self
+    }
+
     /// Sets the handshake timeout.
     pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
         self.config.handshake_timeout = timeout;
@@ -163,7 +193,15 @@ impl QuicConfigBuilder {
         self
     }
 
+    /// Sets whether the peer's certificate must match the server name.
+    pub fn verify_server_name(mut self, verify: bool) -> Self {
+        self.config.verify_server_name = verify;
+        self
+    }
+
     /// Sets the path to a CA certificates directory for verification.
+    ///
+    /// The directory must be in OpenSSL hashed form; see [`QuicConfig::ca_certs_directory`].
     pub fn ca_certs_dir(mut self, path: impl Into<String>) -> Self {
         self.config.ca_certs_directory = Some(path.into());
         self
@@ -184,5 +222,41 @@ impl QuicConfigBuilder {
     /// Builds the configuration.
     pub fn build(self) -> QuicConfig {
         self.config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_the_scion_quic_version_with_full_verification() {
+        let config = QuicConfig::default();
+
+        assert_eq!(config.protocol_version, SCION_PROTOCOL_VERSION);
+        assert!(config.verify_peer);
+        assert!(config.verify_server_name);
+    }
+
+    #[test]
+    fn builder_overrides_the_protocol_version_and_name_check() {
+        let config = QuicConfig::builder()
+            .protocol_version(PROTOCOL_VERSION)
+            .verify_server_name(false)
+            .build();
+
+        assert_eq!(config.protocol_version, PROTOCOL_VERSION);
+        assert!(config.verify_peer);
+        assert!(!config.verify_server_name);
+    }
+
+    #[test]
+    fn quiche_config_rejects_an_unknown_protocol_version() {
+        let config = QuicConfig::builder().protocol_version(0xdead_beef).build();
+
+        assert!(matches!(
+            config.to_quiche_config(),
+            Err(squiche::Error::UnknownVersion)
+        ));
     }
 }

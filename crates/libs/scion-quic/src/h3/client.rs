@@ -161,10 +161,17 @@ impl Http3Client {
             .config
             .to_quiche_config()
             .map_err(EstablishError::Quic)?;
+        // squiche uses the server name both for SNI and for certificate name verification, so it
+        // has to be withheld entirely when the peer's certificate cannot supply a matching name.
+        let server_name = self
+            .config
+            .verify_server_name
+            .then(|| self.server_name.clone())
+            .flatten();
         let handle = connect(
             self.remote,
             self.socket.clone(),
-            self.server_name.clone(),
+            server_name,
             quiche_config,
             self.config.handshake_timeout,
         )
