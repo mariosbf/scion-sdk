@@ -17,6 +17,7 @@
 //! Currently SciParse supports:
 //! * [Standard SCION paths](crate::proto::dataplane_path::standard)
 //! * [One-hop paths](crate::proto::dataplane_path::onehop)
+//! * [Hummingbird paths](crate::proto::dataplane_path::hbird)
 //!
 //! SCION dataplane paths specify the path that a packet should take through the network. They can
 //! be of different types, such as standard SCION paths or one-hop paths between neighboring border
@@ -25,6 +26,7 @@
 //! Dataplane paths usually are supplied by SCION the control plane, contained in a
 //! [ScionPath](crate::path::ScionPath) together with metadata.
 
+pub mod hbird;
 pub mod onehop;
 pub mod standard;
 
