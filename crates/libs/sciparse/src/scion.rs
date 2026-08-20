@@ -16,6 +16,7 @@
 
 pub mod address;
 pub mod checksum;
+pub mod hummingbird;
 pub mod identifier;
 pub mod path;
 pub mod rpc;
