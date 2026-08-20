@@ -18,4 +18,6 @@
 //! millisecond-precision timestamp in the meta header. A hop field carrying a reservation is five
 //! lines long instead of three, and is marked by the flyover bit in its flags byte.
 
+pub mod layout;
 pub mod types;
+pub mod view;
