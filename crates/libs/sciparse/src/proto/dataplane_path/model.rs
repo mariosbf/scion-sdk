@@ -276,7 +276,10 @@ pub mod ptest {
                     .prop_map(|(path_type, data)| {
                         // Should not be a compatible path type
                         let path_type = match path_type {
-                            PathType::Scion|PathType::OneHop|PathType::Empty => {PathType::Other(123)}
+                            PathType::Scion
+                            | PathType::OneHop
+                            | PathType::Empty
+                            | PathType::Hummingbird => PathType::Other(123),
                             PathType::Epic | PathType::Colibri | PathType::Other(_) => path_type,
                         };
 

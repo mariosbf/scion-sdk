@@ -34,6 +34,8 @@ pub enum PathType {
     Epic = 3,
     /// Experimental Colibri path type.
     Colibri = 4,
+    /// Experimental Hummingbird path type, carrying flyover reservations.
+    Hummingbird = 5,
     /// Other, unrecognized path types.
     Other(u8),
 }
@@ -46,6 +48,7 @@ impl From<u8> for PathType {
             2 => PathType::OneHop,
             3 => PathType::Epic,
             4 => PathType::Colibri,
+            5 => PathType::Hummingbird,
             other => PathType::Other(other),
         }
     }
@@ -59,6 +62,7 @@ impl From<PathType> for u8 {
             PathType::OneHop => 2,
             PathType::Epic => 3,
             PathType::Colibri => 4,
+            PathType::Hummingbird => 5,
             PathType::Other(other) => other,
         }
     }
@@ -75,7 +79,8 @@ pub mod ptest {
     ///
     /// Controls the relative probability of each variant being generated.
     ///
-    /// Default weights: `empty = 1, scion = 4, one_hop = 2, epic = 1, colibri = 1, other = 1`.
+    /// Default weights: `empty = 1, scion = 4, one_hop = 2, epic = 1, colibri = 1,
+    /// hummingbird = 1, other = 1`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct ArbitraryPathTypeParams {
         /// Weight for generating Empty path type.
@@ -88,6 +93,8 @@ pub mod ptest {
         pub epic: u32,
         /// Weight for generating Colibri path type.
         pub colibri: u32,
+        /// Weight for generating Hummingbird path type.
+        pub hummingbird: u32,
         /// Weight for generating Other (unknown) path types.
         pub other: u32,
     }
@@ -99,6 +106,7 @@ pub mod ptest {
                 one_hop: 2,
                 epic: 1,
                 colibri: 1,
+                hummingbird: 1,
                 other: 1,
             }
         }
@@ -115,7 +123,10 @@ pub mod ptest {
                 params.one_hop => Just(PathType::OneHop),
                 params.epic => Just(PathType::Epic),
                 params.colibri => Just(PathType::Colibri),
-                params.other => (5u8..=255).prop_map(PathType::Other),
+                params.hummingbird => Just(PathType::Hummingbird),
+                // Starts at 6: 5 is Hummingbird, and `Other(5)` would decode back to that
+                // variant, breaking round-trip properties.
+                params.other => (6u8..=255).prop_map(PathType::Other),
             ]
             .boxed()
         }
@@ -136,5 +147,33 @@ impl PathReverseError {
         Self {
             reason: reason.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hummingbird_path_type_round_trips_through_u8() {
+        assert_eq!(PathType::from(5u8), PathType::Hummingbird);
+        assert_eq!(u8::from(PathType::Hummingbird), 5u8);
+    }
+
+    #[test]
+    fn hummingbird_is_not_classified_as_other() {
+        // Before Hummingbird had a variant, 5 fell through to PathType::Other(5).
+        assert_ne!(PathType::from(5u8), PathType::Other(5));
+    }
+
+    #[test]
+    fn every_discriminant_round_trips_through_u8() {
+        // `Other(5)` is the one value that does not survive the round trip: it decodes back as
+        // Hummingbird. Generators must avoid producing it.
+        for value in 0u8..=255 {
+            assert_eq!(u8::from(PathType::from(value)), value);
+        }
+        assert_eq!(u8::from(PathType::Other(5)), 5);
+        assert_eq!(PathType::from(5), PathType::Hummingbird);
     }
 }
