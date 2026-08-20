@@ -182,8 +182,8 @@ mod tests {
     fn flyover_mac_matches_the_go_reference_vector() {
         // Generated with the Go reference implementation. The aggregated MAC is what the wire
         // carries; the flyover MAC is that XORed with the standard SCION MAC, which is what this
-        // function computes. Nothing else in this module ties the computation to the reference —
-        // every other test here would pass just as well against a subtly wrong block layout.
+        // function computes. This vector is the module's only tie to the reference: every other
+        // test here compares Rust against Rust and would pass against a wrong block layout.
         let aggregated = [0x39, 0xe6, 0x85, 0x2b, 0x6e, 0x88];
         let scion_mac = [0xc8, 0xca, 0x9c, 0xeb, 0x30, 0x60];
         let mut expected = aggregated;
@@ -209,8 +209,8 @@ mod tests {
 
     #[test]
     fn every_mac_input_reaches_the_block() {
-        // Guards the block layout in the cheapest way that catches a field written to the wrong
-        // offset or not written at all: change one input, expect a different MAC.
+        // A field written to the wrong offset, or not written at all, surfaces here as two
+        // different inputs producing one MAC.
         let base = flyover_mac(dst_ia(), 100, 7, 5, 9, &cipher());
 
         assert_ne!(
@@ -232,8 +232,8 @@ mod tests {
 
     #[test]
     fn the_key_selects_the_mac() {
-        // The reservation's key is what makes the MAC unforgeable; a computation that ignored it
-        // would still satisfy every layout test above.
+        // The reservation's key is what makes the MAC unforgeable. A computation that ignored
+        // it would still satisfy every layout test above.
         let other = Aes128Enc::new(&[0x33u8; 16].into());
         assert_ne!(
             flyover_mac(dst_ia(), 100, 7, 5, 9, &cipher()),
@@ -243,8 +243,7 @@ mod tests {
 
     #[test]
     fn the_millis_timestamp_is_truncated_to_ten_bits() {
-        // 1024 == 0b100_0000_0000: its low ten bits are zero, so it must be indistinguishable
-        // from zero.
+        // 1024 == 0b100_0000_0000, whose low ten bits are zero: indistinguishable from zero.
         assert_eq!(
             flyover_mac(dst_ia(), 100, 0, 1024, 0, &cipher()),
             flyover_mac(dst_ia(), 100, 0, 0, 0, &cipher()),
@@ -261,9 +260,9 @@ mod tests {
 
     #[test]
     fn the_millis_timestamp_does_not_bleed_into_the_counter() {
-        // The two share one 32-bit word. Without the masks a millis value of 1 would be
-        // indistinguishable from a counter of 4_194_304 — a collision neither field's own
-        // truncation test would catch, because each is correct in isolation.
+        // The two share one 32-bit word. Unmasked, a millis value of 1 collides with a counter
+        // of 4_194_304 — a collision neither field's own truncation test sees, since each is
+        // correct in isolation.
         assert_ne!(
             flyover_mac(dst_ia(), 100, 0, 1, 0, &cipher()),
             flyover_mac(dst_ia(), 100, 0, 0, 0, &cipher()),
@@ -276,9 +275,8 @@ mod tests {
 
     #[test]
     fn a_derived_key_is_a_function_of_its_reservation() {
-        // Deriving twice from the same parameters must give the same key: the AS derives it once
-        // to hand out, the router derives it again to verify, and a packet only forwards if the
-        // two agree.
+        // The AS derives the key once to hand out and the router derives it again to verify, so
+        // a packet forwards only if two derivations from the same parameters agree.
         let sv: HbirdKey = [0x11; 16];
         let derive = || derive_auth_key(2, 3, 0x1234, bw(1024), 1_700_000_000, 60, &sv);
 
@@ -294,8 +292,8 @@ mod tests {
 
     #[test]
     fn changing_any_reservation_parameter_changes_the_derived_key() {
-        // Guards the derivation block layout the same way the MAC's layout is guarded. Two
-        // different reservations sharing a key would let one be used in place of the other.
+        // Two different reservations sharing a key would let either be used in place of the
+        // other.
         let sv: HbirdKey = [0x11; 16];
         let base = derive_auth_key(2, 3, 0x1234, bw(1024), 1_700_000_000, 60, &sv);
 
@@ -331,8 +329,9 @@ mod tests {
 
     #[test]
     fn the_res_id_does_not_bleed_into_the_bandwidth() {
-        // The mirror of the millis/counter case: ResID and BW share a 32-bit word, and the
-        // res_id mask is what keeps a 23-bit id from corrupting the bandwidth it is packed with.
+        // ResID and BW share a 32-bit word, and the res_id mask keeps a 23-bit id from
+        // corrupting the bandwidth packed beside it. Bit 22 lies outside the field, so dropping
+        // it is correct.
         let sv: HbirdKey = [0x11; 16];
         let with_high_bit = derive_auth_key(2, 3, 1 << 22, bw(1024), 1_700_000_000, 60, &sv);
         let without = derive_auth_key(2, 3, 0, bw(1024), 1_700_000_000, 60, &sv);

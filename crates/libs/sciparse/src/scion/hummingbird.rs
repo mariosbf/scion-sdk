@@ -33,6 +33,7 @@ use aes::{Aes128Enc, cipher::KeyInit};
 use crate::identifier::isd_asn::IsdAsn;
 
 pub mod crypto;
+pub mod tracker;
 
 /// The key that authenticates use of a flyover reservation.
 ///
@@ -310,6 +311,40 @@ impl Reservation {
     pub fn cipher(&self) -> &Aes128Enc {
         self.cipher
             .get_or_init(|| Aes128Enc::new(&self.auth_key.into()))
+    }
+}
+
+/// Reservation builders shared by the tracker tests in this module's children.
+///
+/// Central so that all three trackers are tested against identically shaped reservations.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// A reservation over interfaces 1 to 2 of `1-ff00:0:110`, valid from `start` for one hour.
+    pub(crate) fn reservation(res_id: u32, bytes_per_sec: u64, start: SystemTime) -> Reservation {
+        reservation_for(res_id, bytes_per_sec, start, 3600)
+    }
+
+    /// [`reservation`], with an explicit validity window length in seconds.
+    pub(crate) fn reservation_for(
+        res_id: u32,
+        bytes_per_sec: u64,
+        start: SystemTime,
+        duration: u16,
+    ) -> Reservation {
+        Reservation::new(
+            ReservationInfo {
+                isd_as: IsdAsn(0x1_ff00_0000_0110),
+                ingress_interface: 1,
+                egress_interface: 2,
+                res_id,
+                bandwidth: Bandwidth::from_bytes_per_sec(bytes_per_sec).expect("representable"),
+                start,
+                duration,
+            },
+            [0x11; 16],
+        )
     }
 }
 
