@@ -128,7 +128,8 @@ impl DpPath {
 
     /// Attempts to reverse the path in place, if supported.
     ///
-    /// Note: A OneHop path will be converted into a Standard path upon reversal.
+    /// Note: A OneHop path will be converted into a Standard path upon reversal, as will a
+    /// Hummingbird path — its flyover reservations are directional and do not survive.
     ///
     /// Returns an error if the path type is unsupported or if the path is invalid for reversal.
     #[inline]
@@ -144,10 +145,14 @@ impl DpPath {
                 Ok(())
             }
             DpPath::Empty => Ok(()),
-            DpPath::Hummingbird(_) => {
-                Err(PathReverseError::new(
-                    "Hummingbird path reversal not yet implemented",
-                ))
+            DpPath::Hummingbird(path) => {
+                // Flyover reservations are directional — they are valid only in the direction they
+                // were bought — so the reverse of a Hummingbird path is a plain standard path over
+                // the same hops.
+                let mut reversed = path.to_standard_path();
+                reversed.try_reverse()?;
+                *self = DpPath::Standard(reversed);
+                Ok(())
             }
             DpPath::Unsupported { .. } => {
                 Err(PathReverseError::new(
@@ -159,7 +164,8 @@ impl DpPath {
 
     /// Attempts to reverse the path in place, returning the reversed path on success.
     ///
-    /// Note: A OneHop path will be converted into a Standard path upon reversal.
+    /// Note: A OneHop path will be converted into a Standard path upon reversal, as will a
+    /// Hummingbird path — its flyover reservations are directional and do not survive.
     ///
     /// Returns an error containing the original path and the reason for failure if reversal is not
     /// possible.

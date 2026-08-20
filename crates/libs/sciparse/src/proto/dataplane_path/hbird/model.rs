@@ -33,7 +33,7 @@ use crate::{
         },
         standard::{
             layout::InfoFieldLayout,
-            model::{HopField, InfoField},
+            model::{HopField, InfoField, Segment, StandardPath},
             types::{HopFieldFlags, HopFieldMac, InfoFieldFlags},
             view::HopFieldView,
         },
@@ -160,6 +160,55 @@ impl HummingbirdPath {
                 .sum::<usize>()
         });
         (seg0, seg1, seg2)
+    }
+
+    /// Converts this path into the standard SCION path over the same hops.
+    ///
+    /// Every flyover hop field is replaced by the standard hop field it extends, dropping the
+    /// reservation fields. 
+    ///
+    /// The resulting path's hop field MACs are those carried by this path. For a path taken from
+    /// a received packet they are plain standard MACs, because border routers de-aggregate the
+    /// flyover MAC out of each hop field before forwarding it onward. For a path assembled
+    /// locally with aggregated MACs they are not, and the result will not forward.
+    pub fn to_standard_path(&self) -> StandardPath {
+        StandardPath {
+            current_info_field: self.current_info_field,
+            current_hop_field: self.current_hop_field_index() as u8,
+            segments: self
+                .segments
+                .iter()
+                .map(|segment| {
+                    Segment {
+                        info_field: segment.info_field,
+                        hop_fields: segment
+                            .hop_fields
+                            .iter()
+                            .map(HbirdHopField::to_standard_hop_field)
+                            .collect(),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Returns the index of the current hop field.
+    ///
+    /// `current_hop_field` addresses a hop field by its offset in 4-byte lines, because hop fields
+    /// vary in width; converting to an index means walking them. Returns the hop field count if
+    /// the offset does not name a hop field.
+    pub fn current_hop_field_index(&self) -> usize {
+        let target = self.current_hop_field as usize * 4;
+        let mut byte_offset = 0;
+
+        for (index, hop_field) in self.iter_hop_fields().enumerate() {
+            if byte_offset == target {
+                return index;
+            }
+            byte_offset += hop_field.required_size();
+        }
+
+        self.hop_field_count()
     }
 
     /// Returns an iterator over all hop fields in the path
@@ -379,6 +428,22 @@ impl HbirdHopField {
     pub fn is_flyover(&self) -> bool {
         matches!(self, HbirdHopField::Flyover(_))
     }
+
+    /// Returns the standard hop field this one extends, discarding any reservation fields.
+    pub fn to_standard_hop_field(&self) -> HopField {
+        match self {
+            HbirdHopField::Standard(hop_field) => *hop_field,
+            HbirdHopField::Flyover(hop_field) => {
+                HopField {
+                    flags: hop_field.flags,
+                    expiration_units: hop_field.expiration_units,
+                    cons_ingress: hop_field.cons_ingress,
+                    cons_egress: hop_field.cons_egress,
+                    mac: hop_field.mac,
+                }
+            }
+        }
+    }
 }
 
 impl WireEncode for HbirdHopField {
@@ -391,12 +456,12 @@ impl WireEncode for HbirdHopField {
 
     fn wire_valid(&self) -> Result<(), InvalidStructureError> {
         match self {
-            // In a Hummingbird path the first flags bit *is* the flyover 
-            // discriminator, and it also sets the hop field's width. A standard 
-            // hop field carrying it would be encoded as 12 bytes and read back 
-            // as a 20-byte flyover, swallowing whatever follows it, so the model 
-            // must not be allowed to express it. (The bit is merely reserved in a 
-            // standard SCION path, which is why `HopFieldFlags` itself permits 
+            // In a Hummingbird path the first flags bit *is* the flyover
+            // discriminator, and it also sets the hop field's width. A standard
+            // hop field carrying it would be encoded as 12 bytes and read back
+            // as a 20-byte flyover, swallowing whatever follows it, so the model
+            // must not be allowed to express it. (The bit is merely reserved in a
+            // standard SCION path, which is why `HopFieldFlags` itself permits
             // it.)
             HbirdHopField::Standard(hf) => {
                 if hf.flags.bits() & HbirdHopFieldFlags::FLYOVER.bits() != 0 {
@@ -766,9 +831,14 @@ mod tests {
     use super::*;
     use crate::{
         core::{convert::ToModel, view::View},
-        dataplane_path::standard::{
-            layout::HopFieldLayout,
-            types::{EXP_TIME_UNIT, exp_time_to_duration},
+        dataplane_path::{
+            model::DpPath,
+            standard::{
+                layout::HopFieldLayout,
+                types::{EXP_TIME_UNIT, exp_time_to_duration},
+            },
+            types::PathType,
+            view::ScionDpPathViewExt,
         },
     };
 
@@ -971,6 +1041,97 @@ mod tests {
 
         let view = path.try_encode_to_owned_view().expect("path should encode");
         assert_eq!(view.to_model(), path);
+    }
+
+    #[test]
+    fn reversal_yields_a_standard_path_over_the_same_hops_in_reverse() {
+        // Flyover reservations are directional, so the reverse is a plain standard path. What must
+        // survive is the route: the same interface pairs, walked backwards and with each hop's
+        // ingress and egress swapped by the flipped construction direction.
+        let path = mixed_path();
+        let forward: Vec<(u16, u16)> = path
+            .iter_hop_fields()
+            .map(|hop| {
+                let hop = hop.to_standard_hop_field();
+                (hop.cons_ingress, hop.cons_egress)
+            })
+            .collect();
+
+        let mut dp_path = DpPath::Hummingbird(path);
+        dp_path.try_reverse().expect("path should reverse");
+
+        let DpPath::Standard(reversed) = dp_path else {
+            panic!("reversing a Hummingbird path must yield a standard path");
+        };
+        let backward: Vec<(u16, u16)> = reversed
+            .iter_hop_fields()
+            .map(|hop| (hop.cons_ingress, hop.cons_egress))
+            .collect();
+
+        assert_eq!(
+            backward,
+            forward.into_iter().rev().collect::<Vec<_>>(),
+            "reversal must preserve the route"
+        );
+    }
+
+    #[test]
+    fn reversal_drops_every_reservation() {
+        let mut dp_path = DpPath::Hummingbird(mixed_path());
+        dp_path.try_reverse().expect("path should reverse");
+
+        assert_eq!(dp_path.path_type(), PathType::Scion);
+        assert!(
+            dp_path.required_size() < DpPath::Hummingbird(mixed_path()).required_size(),
+            "dropping two flyovers must make the path shorter"
+        );
+    }
+
+    #[test]
+    fn reversal_flips_the_construction_direction() {
+        let mut dp_path = DpPath::Hummingbird(mixed_path());
+        let was_cons_dir = matches!(&dp_path, DpPath::Hummingbird(p)
+            if p.segments[0].info_field.flags.contains(InfoFieldFlags::CONS_DIR));
+        dp_path.try_reverse().expect("path should reverse");
+
+        let DpPath::Standard(reversed) = dp_path else {
+            panic!("expected a standard path");
+        };
+        assert_ne!(
+            reversed.segments[0]
+                .info_field
+                .flags
+                .contains(InfoFieldFlags::CONS_DIR),
+            was_cons_dir
+        );
+    }
+
+    #[test]
+    fn to_standard_path_keeps_the_current_hop_field() {
+        // The Hummingbird index is a line offset while the standard one is a hop field index, so
+        // the conversion has to walk the hop fields rather than copy the number across.
+        let mut path = mixed_path();
+        // The second hop field starts one flyover (5 lines) in.
+        path.current_hop_field = 5;
+
+        let standard = path.to_standard_path();
+        assert_eq!(standard.current_hop_field, 1);
+
+        // The third starts after a flyover and a standard hop field: 5 + 3 lines.
+        path.current_hop_field = 8;
+        assert_eq!(path.to_standard_path().current_hop_field, 2);
+    }
+
+    #[test]
+    fn a_reversed_path_re_encodes() {
+        // Reversal changes the encoded length, so the result has to survive a fresh encode.
+        let mut dp_path = DpPath::Hummingbird(mixed_path());
+        dp_path.try_reverse().expect("path should reverse");
+
+        let view = dp_path
+            .try_encode_to_owned_view()
+            .expect("reversed path should encode");
+        assert_eq!(DpPath::from_view(&view.as_ref()), dp_path);
     }
 
     #[test]

@@ -197,6 +197,43 @@ impl ScionDpPathViewExt for ScionDpPathView {
     }
 }
 impl ScionDpPathViewExtMut for ScionDpPathView {
+    /// Reverses the path, replacing a Hummingbird path with the standard path over the same hops.
+    ///
+    /// Flyover reservations are valid only in the direction they were bought, so reversal drops
+    /// them. That changes both the path's type and its length, which is why this is overridden
+    /// here rather than handled by the borrowed default.
+    #[inline]
+    fn try_reverse(&mut self) -> Result<&mut Self, PathReverseError> {
+        if matches!(self, ScionDpPathView::Hummingbird(_)) {
+            let mut model = self.to_model();
+            model.try_reverse()?;
+            *self = model.try_encode_to_owned_view().map_err(|e| {
+                PathReverseError::new(format!("re-encoding the reversed path failed: {e}"))
+            })?;
+            return Ok(self);
+        }
+
+        match self.as_mut() {
+            ScionDpPathViewRefMut::Standard(standard_path_view) => {
+                standard_path_view.try_reverse()?;
+            }
+            ScionDpPathViewRefMut::OneHop(one_hop_path_view) => {
+                one_hop_path_view.try_reverse()?;
+            }
+            ScionDpPathViewRefMut::Empty => {}
+            ScionDpPathViewRefMut::Hummingbird(_) => {
+                unreachable!("the Hummingbird variant is handled above")
+            }
+            ScionDpPathViewRefMut::Unsupported { .. } => {
+                return Err(PathReverseError::new(
+                    "Cannot reverse unsupported path type",
+                ));
+            }
+        }
+
+        Ok(self)
+    }
+
     #[inline]
     fn as_mut(&mut self) -> ScionDpPathViewRefMut<'_> {
         match self {
@@ -478,10 +515,13 @@ pub trait ScionDpPathViewExtMut: ScionDpPathViewExt {
                 standard_path_view.try_reverse()?;
                 Ok(self)
             }
-            // Replaced in Task 8 with real Hummingbird reversal.
+            // Reversal drops the flyover reservations, which makes the path shorter and changes
+            // its type. Neither is expressible through a borrowed view of fixed length, so only
+            // the owned `ScionDpPathView` can do it.
             ScionDpPathViewRefMut::Hummingbird(_) => {
                 Err(PathReverseError::new(
-                    "Hummingbird path reversal not yet implemented",
+                    "Cannot reverse a Hummingbird path in place: reversal yields a standard path \
+                     of a different length; reverse the owned ScionDpPathView instead",
                 ))
             }
             ScionDpPathViewRefMut::OneHop(one_hop_path_view) => {
@@ -509,5 +549,109 @@ pub trait ScionDpPathViewExtMut: ScionDpPathViewExt {
             Ok(_) => Ok(self),
             Err(e) => Err((self, e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod hbird_reversal_tests {
+    use super::*;
+    use crate::{
+        core::model::Model,
+        dataplane_path::{
+            hbird::model::HummingbirdPath,
+            standard::{
+                model::{HopField, InfoField},
+                types::{HopFieldMac, InfoFieldFlags},
+            },
+        },
+    };
+
+    fn hbird_view() -> ScionDpPathView {
+        let path = HummingbirdPath {
+            current_info_field: 0,
+            current_hop_field: 0,
+            segments: vec![crate::dataplane_path::hbird::model::HbirdSegment {
+                info_field: InfoField {
+                    flags: InfoFieldFlags::CONS_DIR,
+                    segment_id: 1,
+                    timestamp: 1_700_000_000,
+                },
+                hop_fields: [
+                    crate::dataplane_path::hbird::model::HbirdHopField::Flyover(
+                        crate::dataplane_path::hbird::model::FlyoverHopField {
+                            flags: Default::default(),
+                            expiration_units: 63,
+                            cons_ingress: 0,
+                            cons_egress: 1,
+                            mac: HopFieldMac::zero(),
+                            res_id: 5,
+                            bw: 10,
+                            res_start_offset: 0,
+                            res_duration: 60,
+                        },
+                    ),
+                    crate::dataplane_path::hbird::model::HbirdHopField::Standard(HopField {
+                        flags: Default::default(),
+                        expiration_units: 63,
+                        cons_ingress: 2,
+                        cons_egress: 0,
+                        mac: HopFieldMac::zero(),
+                    }),
+                ]
+                .into_iter()
+                .collect(),
+            }],
+            base_timestamp: 1_700_000_000,
+            millis_timestamp: 0,
+            counter: 0,
+        };
+        ScionDpPathView::Hummingbird(path.try_encode_to_owned_view().expect("must encode"))
+    }
+
+    #[test]
+    fn an_owned_hummingbird_view_reverses_into_a_standard_view() {
+        let mut view = hbird_view();
+        let before = view.as_slice().len();
+
+        view.try_reverse().expect("owned view should reverse");
+
+        assert!(matches!(view, ScionDpPathView::Standard(_)));
+        assert!(
+            view.as_slice().len() < before,
+            "dropping the flyover must shorten the path"
+        );
+        assert!(matches!(
+            DpPath::from_view(&view.as_ref()),
+            DpPath::Standard(_)
+        ));
+    }
+
+    #[test]
+    fn a_borrowed_hummingbird_view_refuses_to_reverse() {
+        // A borrowed view is fixed-length, so it cannot express the shorter standard path that
+        // reversal produces. The error must say so rather than silently doing nothing.
+        let mut view = hbird_view();
+        let mut borrowed = view.as_mut();
+
+        let err = borrowed
+            .try_reverse()
+            .expect_err("a borrowed Hummingbird view must not reverse");
+        assert!(
+            err.to_string().contains("owned"),
+            "error should point at the owned view: {err}"
+        );
+    }
+
+    #[test]
+    fn reversing_twice_returns_a_standard_path_over_the_original_route() {
+        // The second reversal goes through the standard path, so the route must come back.
+        let mut view = hbird_view();
+        view.try_reverse().expect("first reversal");
+        let once = view.as_slice().to_vec();
+
+        view.try_reverse().expect("second reversal");
+        view.try_reverse().expect("third reversal");
+
+        assert_eq!(view.as_slice(), once.as_slice());
     }
 }
