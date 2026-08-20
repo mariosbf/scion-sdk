@@ -198,6 +198,9 @@ pub enum ScmpParameterProblemCode {
     UnknownHopByHopOption = 65,
     /// Unknown End-to-End Option.
     UnknownEndToEndOption = 66,
+    /// A flyover reservation on the packet's path had expired.
+    /// Hummingbird-specific.
+    ReservationExpired = 71,
     /// Unassigned code.
     Unassigned(u8),
 }
@@ -225,6 +228,7 @@ impl From<u8> for ScmpParameterProblemCode {
             64 => ScmpParameterProblemCode::InvalidExtensionHeader,
             65 => ScmpParameterProblemCode::UnknownHopByHopOption,
             66 => ScmpParameterProblemCode::UnknownEndToEndOption,
+            71 => ScmpParameterProblemCode::ReservationExpired,
             other => ScmpParameterProblemCode::Unassigned(other),
         }
     }
@@ -253,6 +257,7 @@ impl From<ScmpParameterProblemCode> for u8 {
             ScmpParameterProblemCode::InvalidExtensionHeader => 64,
             ScmpParameterProblemCode::UnknownHopByHopOption => 65,
             ScmpParameterProblemCode::UnknownEndToEndOption => 66,
+            ScmpParameterProblemCode::ReservationExpired => 71,
             ScmpParameterProblemCode::Unassigned(value) => value,
         }
     }
@@ -441,6 +446,7 @@ pub mod ptest {
                     ScmpParameterProblemCode::InvalidExtensionHeader,
                     ScmpParameterProblemCode::UnknownHopByHopOption,
                     ScmpParameterProblemCode::UnknownEndToEndOption,
+                    ScmpParameterProblemCode::ReservationExpired,
                 ]),
                 params.unknown => any::<u8>().prop_map(|v| {
                     let mut v = v;
@@ -454,6 +460,46 @@ pub mod ptest {
                 }),
             ]
             .boxed()
+        }
+    }
+}
+
+#[cfg(test)]
+mod hbird_tests {
+    use super::*;
+
+    #[test]
+    fn reservation_expired_round_trips_through_u8() {
+        // 71 is `SCMPCodeReservationExpired` in the Go reference implementation
+        // (pkg/slayers/scmp_typecode.go), in the parameter-problem code space.
+        assert_eq!(
+            ScmpParameterProblemCode::from(71u8),
+            ScmpParameterProblemCode::ReservationExpired
+        );
+        assert_eq!(u8::from(ScmpParameterProblemCode::ReservationExpired), 71u8);
+    }
+
+    #[test]
+    fn reservation_expired_is_distinguishable_from_a_malformed_header() {
+        // The point of the variant: an end host must be able to tell "renew the reservation" from
+        // "your header was wrong", which is what the unassigned catch-all would have said.
+        let code = ScmpParameterProblemCode::from(71u8);
+
+        assert_ne!(code, ScmpParameterProblemCode::Unassigned(71));
+        assert_ne!(code, ScmpParameterProblemCode::ErroneousHeaderField);
+        assert_ne!(code, ScmpParameterProblemCode::InvalidPath);
+        assert_ne!(code, ScmpParameterProblemCode::PathExpired);
+    }
+
+    #[test]
+    fn every_code_round_trips_through_u8() {
+        // 71 was previously unassigned, so this also guards the catch-all against reclaiming it.
+        for value in 0u8..=255 {
+            assert_eq!(
+                u8::from(ScmpParameterProblemCode::from(value)),
+                value,
+                "code {value} did not round-trip"
+            );
         }
     }
 }
