@@ -32,5 +32,6 @@ pub mod standard;
 
 pub mod layout;
 pub mod model;
+pub mod resolve;
 pub mod types;
 pub mod view;

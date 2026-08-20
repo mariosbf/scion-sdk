@@ -26,6 +26,7 @@ use scion_protobuf::daemon::v1 as rpc;
 use crate::{
     core::view::View,
     dataplane_path::{
+        resolve::{PacketFrame, PathResolveError, ResolvedPath},
         standard::view::StandardPathView,
         types::PathReverseError,
         view::{ScionDpPathView, ScionDpPathViewExt, ScionDpPathViewExtMut},
@@ -208,6 +209,20 @@ impl ScionPath {
         );
 
         Ok(())
+    }
+
+    /// Resolves this path for exactly one packet.
+    ///
+    /// A path's encoding can depend on the packet carrying it — a Hummingbird flyover MAC covers
+    /// the destination AS, the packet length and the send time — and so, therefore, can its
+    /// length. Resolution takes those decisions once and hands back a
+    /// [`ResolvedPath`] whose length is fixed, which is the only form an encoder accepts.
+    ///
+    /// For paths whose bytes do not vary per packet this is close to free: the frame is consulted
+    /// only to check that the resulting packet is short enough to encode.
+    #[inline]
+    pub fn resolve(&self, frame: PacketFrame) -> Result<ResolvedPath<'_>, PathResolveError> {
+        ResolvedPath::resolve_static(self.dp_path.as_ref(), frame)
     }
 
     /// Attempts to reverse the path by reversing the dataplane path and swapping the source and

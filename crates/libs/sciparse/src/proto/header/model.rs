@@ -35,20 +35,42 @@ use crate::{
     },
 };
 
+/// A dataplane path in a form a packet header can encode.
+///
+/// Implemented by [`DpPath`], the owned model used when building packets from parts, and by
+/// [`ResolvedPath`](crate::dataplane_path::resolve::ResolvedPath), the per-packet form whose
+/// encoded length is fixed at resolution. Encoding a header only ever needs these two things
+/// beyond [`WireEncode`].
+pub trait PacketPath: WireEncode {
+    /// The path type to record in the common header.
+    fn path_type(&self) -> PathType;
+}
+
+impl PacketPath for DpPath {
+    #[inline]
+    fn path_type(&self) -> PathType {
+        DpPath::path_type(self)
+    }
+}
+
 /// Represents a SCION packet header
 ///
-/// This structure contains all the fields of a SCION packet header,
-/// including the common header, address header, and path information.
+/// This structure contains all the fields of a SCION packet header, including the common header,
+/// address header, and path information.
+///
+/// The path is generic so that the same encoding logic serves both the owned [`DpPath`] model and
+/// the per-packet [`ResolvedPath`](crate::dataplane_path::resolve::ResolvedPath). It defaults to
+/// `DpPath`, which is what a header parsed from the wire carries.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ScionPacketHeader {
+pub struct ScionPacketHeader<P = DpPath> {
     /// The common header of the SCION packet
     pub common: CommonHeader,
     /// The address header of the SCION packet
     pub address: AddressHeader,
     /// The path information of the SCION packet
-    pub path: DpPath,
+    pub path: P,
 }
-impl ScionPacketHeader {
+impl<P: PacketPath> ScionPacketHeader<P> {
     /// Returns the size of the SCION packet header in 4-byte units used in the header length field.
     #[inline]
     fn size_units(&self) -> u8 {
@@ -56,7 +78,7 @@ impl ScionPacketHeader {
     }
 }
 // Wire Encode (needs size, so can't use trait)
-impl ScionPacketHeader {
+impl<P: PacketPath> ScionPacketHeader<P> {
     /// Returns the size required for the wire encoding.
     ///
     /// ## Safety

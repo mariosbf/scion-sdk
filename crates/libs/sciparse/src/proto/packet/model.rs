@@ -14,19 +14,23 @@
 
 //! SCION packet models
 
-use std::{fmt::Debug, ops::Deref};
+use std::{fmt::Debug, ops::Deref, time::SystemTime};
 
 use crate::{
     address::{addr::ScionAddr, host_addr::UnknownAddressTypeError, socket_addr::ScionSocketAddr},
     core::{
         convert::{TryFromModel, TryFromView},
-        encode::{InvalidStructureError, WireEncode},
+        encode::{EncodeError, InvalidStructureError, WireEncode},
         macros::impl_from,
         model::Model,
         view::{View, ViewConversionError},
     },
-    dataplane_path::model::DpPath,
+    dataplane_path::{
+        model::DpPath,
+        resolve::{PacketFrame, PathResolveError, ResolvedPath},
+    },
     header::{
+        layout::CommonHeaderLayout,
         model::{AddressHeader, CommonHeader, ScionPacketHeader},
         view::ScionHeaderView,
     },
@@ -34,6 +38,7 @@ use crate::{
         classify::{ClassifiedPacket, ClassifyError},
         view::{ScionPacketView, ScionRawPacketView, ScionScmpPacketView, ScionUdpPacketView},
     },
+    path::ScionPath,
     payload::{
         ProtocolNumber, encode::PayloadEncode, scmp::model::ScmpMessage, udp::model::UdpDatagram,
     },
@@ -405,6 +410,42 @@ impl ScionUdpPacket {
         }
     }
 
+    /// Builds a UDP packet whose path has been resolved for exactly this packet.
+    #[inline]
+    pub fn build(
+        src: ScionSocketAddr,
+        dst: ScionSocketAddr,
+        path: &ScionPath,
+        payload: Vec<u8>,
+        now: SystemTime,
+    ) -> Result<ResolvedUdpPacket<'_>, PathResolveError> {
+        let address = AddressHeader::new(src.scion_addr(), dst.scion_addr());
+        let payload = UdpDatagram::new(src.port(), dst.port(), payload);
+
+        let exterior_len = CommonHeaderLayout::SIZE_BYTES + address.required_size();
+        let payload_size = payload.required_size(exterior_len);
+
+        let frame = PacketFrame::new(
+            &address,
+            u16::try_from(payload_size)
+                .map_err(|_| PathResolveError::PacketTooLong(exterior_len + payload_size))?,
+            now,
+        );
+
+        Ok(ResolvedUdpPacket {
+            header: ScionPacketHeader {
+                common: CommonHeader {
+                    traffic_class: 0,
+                    flow_id: 0,
+                    next_header: ProtocolNumber::Udp,
+                },
+                address,
+                path: path.resolve(frame)?,
+            },
+            payload,
+        })
+    }
+
     /// Constructs a [ScionUdpPacket] from the given parts, inferring header fields as needed.
     #[inline]
     pub fn new_from_parts(address: AddressHeader, path: DpPath, payload: UdpDatagram) -> Self {
@@ -595,5 +636,67 @@ pub mod ptest {
                 })
                 .boxed()
         }
+    }
+}
+
+/// A UDP packet whose path has been resolved for this packet, ready to encode.
+///
+/// This is the only packet form that can carry a [`ResolvedPath`], and a `ResolvedPath` is the
+/// only path form an encoder accepts. Together those two facts mean a path can never reach the
+/// wire without its per-packet decisions having been made first — the length
+/// [`WireEncode::required_size`] reports cannot change between the call that sizes the buffer and
+/// the call that fills it.
+///
+/// It borrows the path it resolved, so it is short-lived by construction: build it, encode it,
+/// drop it. Build a [`ScionUdpPacket`] instead when a packet needs to outlive its path.
+#[derive(Debug)]
+pub struct ResolvedUdpPacket<'a> {
+    /// SCION packet header, holding the resolved path.
+    pub header: ScionPacketHeader<ResolvedPath<'a>>,
+    /// UDP payload.
+    pub payload: UdpDatagram,
+}
+
+impl ResolvedUdpPacket<'_> {
+    /// Encodes the packet into a freshly allocated raw packet.
+    #[inline]
+    pub fn try_encode_to_raw(&self) -> Result<Vec<u8>, EncodeError> {
+        let mut buf = vec![0u8; self.required_size()];
+        self.try_encode(&mut buf)?;
+        Ok(buf)
+    }
+}
+
+impl WireEncode for ResolvedUdpPacket<'_> {
+    #[inline]
+    fn required_size(&self) -> usize {
+        let header_size = self.header.required_size();
+        header_size + self.payload.required_size(header_size)
+    }
+
+    #[inline]
+    fn wire_valid(&self) -> Result<(), InvalidStructureError> {
+        self.header.wire_valid()?;
+        self.payload.wire_valid()?;
+        Ok(())
+    }
+
+    #[inline]
+    unsafe fn encode_unchecked(&self, buf: &mut [u8]) -> usize {
+        let header_size = self.header.required_size();
+        let payload_size = self.payload.required_size(header_size);
+
+        unsafe {
+            {
+                let header_buf = buf.get_unchecked_mut(0..header_size);
+                self.header
+                    .encode_unchecked(header_buf, payload_size as u16);
+            }
+            let payload_buf = buf.get_unchecked_mut(header_size..(header_size + payload_size));
+            self.payload
+                .encode_unchecked(payload_buf, &self.header.address, header_size);
+        }
+
+        self.required_size()
     }
 }
