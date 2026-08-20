@@ -22,6 +22,7 @@ use crate::{
         model::Model,
     },
     dataplane_path::{
+        hbird::model::HummingbirdPath,
         layout::ScionHeaderPathLayout,
         onehop::model::OneHopPath,
         standard::model::StandardPath,
@@ -41,6 +42,8 @@ pub enum DpPath {
     Standard(StandardPath),
     /// One-hop SCION path
     OneHop(OneHopPath),
+    /// Hummingbird SCION path, whose hop fields may carry flyover reservations
+    Hummingbird(HummingbirdPath),
     /// Empty path
     Empty,
     /// Unsupported path type with raw data
@@ -58,6 +61,9 @@ impl DpPath {
         match *view {
             ScionDpPathViewRef::Standard(standard_view) => {
                 DpPath::Standard(standard_view.to_model())
+            }
+            ScionDpPathViewRef::Hummingbird(hbird_view) => {
+                DpPath::Hummingbird(hbird_view.to_model())
             }
             ScionDpPathViewRef::OneHop(onehop_view) => DpPath::OneHop(onehop_view.to_model()),
             ScionDpPathViewRef::Empty => DpPath::Empty,
@@ -79,6 +85,9 @@ impl DpPath {
         let res = match self {
             DpPath::Standard(standard_path) => {
                 ScionDpPathView::Standard(standard_path.try_encode_to_owned_view()?)
+            }
+            DpPath::Hummingbird(hbird_path) => {
+                ScionDpPathView::Hummingbird(hbird_path.try_encode_to_owned_view()?)
             }
             DpPath::OneHop(onehop_path) => {
                 ScionDpPathView::OneHop(*onehop_path.try_encode_to_owned_view()?)
@@ -102,6 +111,7 @@ impl DpPath {
         match self {
             DpPath::Standard(_) => PathType::Scion,
             DpPath::OneHop(_) => PathType::OneHop,
+            DpPath::Hummingbird(_) => PathType::Hummingbird,
             DpPath::Empty => PathType::Empty,
             DpPath::Unsupported { path_type, .. } => PathType::Other((*path_type).into()),
         }
@@ -134,6 +144,11 @@ impl DpPath {
                 Ok(())
             }
             DpPath::Empty => Ok(()),
+            DpPath::Hummingbird(_) => {
+                Err(PathReverseError::new(
+                    "Hummingbird path reversal not yet implemented",
+                ))
+            }
             DpPath::Unsupported { .. } => {
                 Err(PathReverseError::new(
                     "Cannot reverse an unsupported path type",
@@ -159,6 +174,7 @@ impl DpPath {
 }
 impl_from!(StandardPath, DpPath, |p| DpPath::Standard(p));
 impl_from!(OneHopPath, DpPath, |p| DpPath::OneHop(p));
+impl_from!(HummingbirdPath, DpPath, |p| DpPath::Hummingbird(p));
 impl From<&ScionDpPathViewRef<'_>> for DpPath {
     #[inline]
     fn from(view: &ScionDpPathViewRef<'_>) -> Self {
@@ -172,6 +188,7 @@ impl WireEncode for DpPath {
         match self {
             DpPath::Standard(path) => path.required_size(),
             DpPath::OneHop(path) => path.required_size(),
+            DpPath::Hummingbird(path) => path.required_size(),
             DpPath::Unsupported { data, .. } => data.len(),
             DpPath::Empty => 0,
         }
@@ -186,6 +203,7 @@ impl WireEncode for DpPath {
         match self {
             Self::Standard(standard_path) => standard_path.wire_valid()?,
             Self::OneHop(onehop_path) => onehop_path.wire_valid()?,
+            Self::Hummingbird(hbird_path) => hbird_path.wire_valid()?,
             Self::Empty => {}
             Self::Unsupported { path_type: _, data } => {
                 if !data.len().is_multiple_of(4) {
@@ -202,6 +220,7 @@ impl WireEncode for DpPath {
         match self {
             DpPath::Standard(path) => unsafe { path.encode_unchecked(buf) },
             DpPath::OneHop(path) => unsafe { path.encode_unchecked(buf) },
+            DpPath::Hummingbird(path) => unsafe { path.encode_unchecked(buf) },
             DpPath::Empty => 0,
             DpPath::Unsupported { data, .. } => {
                 let len = data.len();
@@ -229,13 +248,16 @@ pub mod ptest {
     /// Controls the relative probability of each path variant being generated,
     /// and allows passing sub-parameters to the generators for specific path types.
     ///
-    /// Default weights: `standard = 8, one_hop = 2, empty = 1, unsupported = 1`.
+    /// Default weights: `standard = 8, one_hop = 2, hummingbird = 4, empty = 1,
+    /// unsupported = 1`.
     #[derive(Debug, Clone)]
     pub struct ArbitraryPathParams {
         /// Weight for generating standard SCION paths.
         pub standard: u32,
         /// Weight for generating one-hop paths.
         pub one_hop: u32,
+        /// Weight for generating Hummingbird paths.
+        pub hummingbird: u32,
         /// Weight for generating empty paths.
         pub empty: u32,
         /// Weight for generating unsupported path types.
@@ -244,16 +266,20 @@ pub mod ptest {
         pub standard_params: <StandardPath as Arbitrary>::Parameters,
         /// Parameters for generating one-hop paths.
         pub one_hop_params: <OneHopPath as Arbitrary>::Parameters,
+        /// Parameters for generating Hummingbird paths.
+        pub hummingbird_params: <HummingbirdPath as Arbitrary>::Parameters,
     }
     impl Default for ArbitraryPathParams {
         fn default() -> Self {
             Self {
                 standard: 8,
                 one_hop: 2,
+                hummingbird: 4,
                 empty: 1,
                 unsupported: 1,
                 standard_params: Default::default(),
                 one_hop_params: Default::default(),
+                hummingbird_params: Default::default(),
             }
         }
     }
@@ -268,6 +294,8 @@ pub mod ptest {
                     .prop_map(DpPath::Standard),
                 params.one_hop => OneHopPath::arbitrary_with(params.one_hop_params)
                     .prop_map(DpPath::OneHop),
+                params.hummingbird => HummingbirdPath::arbitrary_with(params.hummingbird_params)
+                    .prop_map(DpPath::Hummingbird),
                 params.empty => Just(DpPath::Empty),
                 params.unsupported => (
                     any::<PathType>(),

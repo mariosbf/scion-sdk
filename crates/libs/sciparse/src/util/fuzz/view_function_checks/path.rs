@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Exhaustive exercisers for SCION path views (standard and one-hop).
+//! Exhaustive exercisers for SCION path views (standard, one-hop and Hummingbird).
 
 #![allow(dead_code, unused_imports)]
 
@@ -20,6 +20,7 @@ use super::{black_box, read_slice_bounds};
 use crate::{
     core::view::View,
     dataplane_path::{
+        hbird::view::{FlyoverHopFieldView, HbirdPathView},
         onehop::view::OneHopPathView,
         standard::{
             mac::ForwardingKey,
@@ -217,5 +218,101 @@ pub fn exec_onehop_path_view_mut(view: &mut OneHopPathView) {
     unsafe {
         let [_, hop2] = view.mut_hop_fields();
         hop2.as_slice_mut().copy_from_slice(&h2);
+    }
+}
+
+// ── Hummingbird path ───────────────────────────────────────────────────
+
+/// Exercises every read accessor of a flyover hop field view.
+pub fn exec_flyover_hop_field_view(view: &FlyoverHopFieldView) {
+    black_box(view.flags());
+    black_box(view.exp_time());
+    black_box(view.cons_ingress());
+    black_box(view.cons_egress());
+    black_box(view.mac());
+    black_box(view.res_id());
+    black_box(view.res_bw());
+    black_box(view.res_start_offset());
+    black_box(view.res_duration());
+    read_slice_bounds(view.as_slice());
+}
+
+/// Exercises every read accessor of a Hummingbird path view.
+///
+/// Hummingbird hop fields vary in width, so the view addresses them by byte offset and derives
+/// each successive offset from the preceding hop field's flyover bit. Every offset in the segment
+/// range is probed, not just the valid hop field starts, so that an offset landing inside a hop
+/// field is exercised too.
+pub fn exec_hbird_path_view(view: &HbirdPathView) {
+    black_box(view.curr_info_field_idx());
+    black_box(view.curr_hop_field_line());
+    black_box(view.seg0_len());
+    black_box(view.seg1_len());
+    black_box(view.seg2_len());
+    black_box(view.seg0_len_bytes());
+    black_box(view.seg1_len_bytes());
+    black_box(view.seg2_len_bytes());
+    black_box(view.total_seg_len_bytes());
+    black_box(view.base_timestamp());
+    black_box(view.millis_timestamp());
+    black_box(view.counter());
+    black_box(view.info_field_count());
+    black_box(view.expiration());
+    black_box(view.curr_info_field());
+    black_box(view.curr_hop_field());
+    read_slice_bounds(view.as_slice());
+
+    for info_field in view.info_fields() {
+        exec_info_field_view(info_field);
+    }
+
+    for hop_field in view.hop_fields() {
+        match hop_field {
+            crate::dataplane_path::hbird::view::HbirdHopFieldView::Standard(f) => {
+                exec_hop_field_view(f)
+            }
+            crate::dataplane_path::hbird::view::HbirdHopFieldView::Flyover(f) => {
+                exec_flyover_hop_field_view(f)
+            }
+        }
+    }
+
+    for (info_field, hop_fields) in view.segments() {
+        exec_info_field_view(info_field);
+        black_box(hop_fields.len());
+    }
+
+    for idx in 0..view.info_field_count() as usize {
+        if let Some(f) = view.info_field(idx) {
+            exec_info_field_view(f);
+        }
+    }
+    assert!(view.info_field(view.info_field_count() as usize).is_none());
+
+    // Probe every 4-byte offset in and just past the segment range: offsets that do not start a
+    // hop field, and offsets past the end, must answer None rather than read out of bounds.
+    let probe_end = view.total_seg_len_bytes() as usize + 3 * 4;
+    for byte_offset in (0..probe_end).step_by(4) {
+        black_box(view.is_flyover_checked(byte_offset));
+        black_box(view.hop_field_index(byte_offset));
+        if let Some(range) = view.checked_hop_field_range(byte_offset) {
+            assert!(range.end <= view.as_slice().len());
+        }
+        black_box(view.hop_field(byte_offset));
+    }
+}
+
+/// Exercises the mutable accessors of a Hummingbird path view.
+pub fn exec_hbird_path_view_mut(view: &mut HbirdPathView) {
+    exec_hbird_path_view(view);
+
+    view.set_curr_info_field(black_box(view.curr_info_field_idx()));
+    view.set_curr_hop_field(black_box(view.curr_hop_field_line()));
+    view.set_base_timestamp(black_box(view.base_timestamp()));
+
+    for idx in 0..view.info_field_count() as usize {
+        if let Some(f) = view.info_field_mut(idx) {
+            f.set_segment_id(black_box(f.segment_id()));
+        }
     }
 }

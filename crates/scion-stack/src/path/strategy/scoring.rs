@@ -63,6 +63,11 @@ impl PathScoring for PathLengthScorer {
             ScionDpPathView::Standard(encoded_standard_path) => {
                 encoded_standard_path.hop_field_count()
             }
+            ScionDpPathView::Hummingbird(hbird_path) => {
+                // Flyovers do not change the route, so a Hummingbird path scores on its hop count
+                // exactly as the equivalent standard path does.
+                hbird_path.hop_fields().count() as u8
+            }
             ScionDpPathView::OneHop(_) => 0,
             ScionDpPathView::Unsupported { .. } => HOP_COUNT_FOR_MIN_SCORE as u8,
         };

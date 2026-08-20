@@ -22,6 +22,7 @@ use crate::{
         layout::{BitRange, Layout},
     },
     dataplane_path::{
+        hbird::layout::{HbirdPathDataLayout, HbirdPathMetaLayout},
         onehop::layout::OneHopPathLayout,
         standard::layout::{StdPathDataLayout, StdPathMetaLayout},
         types::PathType,
@@ -36,6 +37,8 @@ pub enum ScionHeaderPathLayout {
     Standard(StdPathMetaLayout, StdPathDataLayout),
     /// Layout for a one-hop path
     OneHop(OneHopPathLayout),
+    /// Layout for a Hummingbird path
+    Hummingbird(HbirdPathMetaLayout, HbirdPathDataLayout),
     /// Layout for an empty path
     Empty,
     /// Layout for an unknown path type
@@ -58,6 +61,7 @@ impl ScionHeaderPathLayout {
         match self {
             ScionHeaderPathLayout::Standard(..) => PathType::Scion,
             ScionHeaderPathLayout::OneHop(_) => PathType::OneHop,
+            ScionHeaderPathLayout::Hummingbird(..) => PathType::Hummingbird,
             ScionHeaderPathLayout::Empty => PathType::Empty,
             ScionHeaderPathLayout::Unknown { path_type, .. } => *path_type,
         }
@@ -74,6 +78,10 @@ impl ScionHeaderPathLayout {
             }
             ScionHeaderPathLayout::OneHop(layout) => {
                 annotations.extend(layout.annotations());
+            }
+            ScionHeaderPathLayout::Hummingbird(meta_layout, data_layout) => {
+                annotations.extend(meta_layout.annotations());
+                annotations.extend(data_layout.annotations());
             }
             ScionHeaderPathLayout::Empty => {}
             ScionHeaderPathLayout::Unknown { range, .. } => {
@@ -92,6 +100,9 @@ impl Layout for ScionHeaderPathLayout {
                 meta.size_bytes() + data_layout.size_bytes()
             }
             ScionHeaderPathLayout::OneHop(onehop_layout) => onehop_layout.size_bytes(),
+            ScionHeaderPathLayout::Hummingbird(meta, data_layout) => {
+                meta.size_bytes() + data_layout.size_bytes()
+            }
             ScionHeaderPathLayout::Empty => 0,
             ScionHeaderPathLayout::Unknown { range, .. } => range.size_bytes(),
         }

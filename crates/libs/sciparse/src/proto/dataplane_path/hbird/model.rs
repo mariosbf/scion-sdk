@@ -104,8 +104,8 @@ impl FromView for HummingbirdPath {
         }
 
         HummingbirdPath {
-            current_info_field: view.curr_info_field(),
-            current_hop_field: view.curr_hop_field(),
+            current_info_field: view.curr_info_field_idx(),
+            current_hop_field: view.curr_hop_field_line(),
             base_timestamp: view.base_timestamp(),
             millis_timestamp: view.millis_timestamp(),
             counter: view.counter(),
@@ -390,8 +390,25 @@ impl WireEncode for HbirdHopField {
     }
 
     fn wire_valid(&self) -> Result<(), InvalidStructureError> {
-        // All values are full range, so always valid
-        Ok(())
+        match self {
+            // In a Hummingbird path the first flags bit *is* the flyover 
+            // discriminator, and it also sets the hop field's width. A standard 
+            // hop field carrying it would be encoded as 12 bytes and read back 
+            // as a 20-byte flyover, swallowing whatever follows it, so the model 
+            // must not be allowed to express it. (The bit is merely reserved in a 
+            // standard SCION path, which is why `HopFieldFlags` itself permits 
+            // it.)
+            HbirdHopField::Standard(hf) => {
+                if hf.flags.bits() & HbirdHopFieldFlags::FLYOVER.bits() != 0 {
+                    return Err(
+                        "standard hop field in a Hummingbird path must not set the flyover bit"
+                            .into(),
+                    );
+                }
+                hf.wire_valid()
+            }
+            HbirdHopField::Flyover(fhf) => fhf.wire_valid(),
+        }
     }
 
     unsafe fn encode_unchecked(&self, buf: &mut [u8]) -> usize {
@@ -409,7 +426,11 @@ impl WireEncode for HbirdHopField {
 /// Hop fields contain information about individual hops in a SCION path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FlyoverHopField {
-    /// Hop field flags
+    /// Hop field flags.
+    ///
+    /// These are the *standard* hop field flags. The flyover bit is not among them: it is implied
+    /// by this type and written by the encoder, so setting it here is rejected by
+    /// [`wire_valid`](WireEncode::wire_valid).
     pub flags: HopFieldFlags,
     /// Hop field expiration units
     ///
@@ -496,7 +517,14 @@ impl WireEncode for FlyoverHopField {
     }
 
     fn wire_valid(&self) -> Result<(), InvalidStructureError> {
-        // All values are full range, so always valid
+        // `flags` holds the standard hop field flags only; being a flyover is carried by the type
+        // itself and written by the encoder. Storing the bit here as well is redundant state that
+        // decoding cannot give back, since the view masks it out of `flags`.
+        if self.flags.bits() & HbirdHopFieldFlags::FLYOVER.bits() != 0 {
+            return Err(
+                "flyover hop field must not repeat the flyover bit in its standard flags".into(),
+            );
+        }
         Ok(())
     }
 
@@ -666,7 +694,14 @@ pub mod ptest {
 
         fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
             prop_oneof![
-                any::<HopField>().prop_map(HbirdHopField::Standard),
+                any::<HopField>().prop_map(|mut hf| {
+                    // The flyover bit is the width discriminator; a standard hop field carrying it
+                    // is not a representable Hummingbird hop field. See `wire_valid`.
+                    hf.flags = HopFieldFlags::from_bits_retain(
+                        hf.flags.bits() & !HbirdHopFieldFlags::FLYOVER.bits(),
+                    );
+                    HbirdHopField::Standard(hf)
+                }),
                 any::<FlyoverHopField>().prop_map(HbirdHopField::Flyover),
             ]
             .boxed()
@@ -679,7 +714,12 @@ pub mod ptest {
 
         fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
             (
-                any::<HopFieldFlags>(),
+                any::<HopFieldFlags>().prop_map(|flags| {
+                    // The flyover bit belongs to the variant, not to `flags`. See `wire_valid`.
+                    HopFieldFlags::from_bits_retain(
+                        flags.bits() & !HbirdHopFieldFlags::FLYOVER.bits(),
+                    )
+                }),
                 any::<u8>(),
                 any::<u16>(),
                 any::<u16>(),
@@ -885,6 +925,52 @@ mod tests {
 
         assert!(path.wire_valid().is_err());
         assert!(path.try_encode_to_owned_view().is_err());
+    }
+
+    #[test]
+    fn a_standard_hop_field_may_not_set_the_flyover_bit() {
+        // Encoded as 12 bytes but read back as a 20-byte flyover, this would swallow whatever
+        // follows it in the segment. Found by the packet round-trip property test.
+        let mut path = mixed_path();
+        let HbirdHopField::Standard(hop) = &mut path.segments[0].hop_fields[1] else {
+            panic!("second hop field should be standard");
+        };
+        hop.flags = HopFieldFlags::from_bits_retain(HbirdHopFieldFlags::FLYOVER.bits());
+
+        assert!(path.wire_valid().is_err());
+        assert!(path.try_encode_to_owned_view().is_err());
+    }
+
+    #[test]
+    fn a_flyover_hop_field_may_not_repeat_the_flyover_bit_in_its_flags() {
+        // Being a flyover is carried by the variant; the view masks the bit out of `flags`, so a
+        // model that also stores it there cannot round-trip.
+        let mut path = mixed_path();
+        let HbirdHopField::Flyover(hop) = &mut path.segments[0].hop_fields[0] else {
+            panic!("first hop field should be a flyover");
+        };
+        hop.flags = HopFieldFlags::from_bits_retain(HbirdHopFieldFlags::FLYOVER.bits());
+
+        assert!(path.wire_valid().is_err());
+    }
+
+    #[test]
+    fn router_alert_flags_survive_on_both_hop_field_kinds() {
+        // The bits that *are* allowed must still make it through, on either width of hop field.
+        let mut path = mixed_path();
+        let alerts =
+            HopFieldFlags::CONS_INGRESS_ROUTER_ALERT | HopFieldFlags::CONS_EGRESS_ROUTER_ALERT;
+        match &mut path.segments[0].hop_fields[0] {
+            HbirdHopField::Flyover(hop) => hop.flags = alerts,
+            _ => panic!("first hop field should be a flyover"),
+        }
+        match &mut path.segments[0].hop_fields[1] {
+            HbirdHopField::Standard(hop) => hop.flags = alerts,
+            _ => panic!("second hop field should be standard"),
+        }
+
+        let view = path.try_encode_to_owned_view().expect("path should encode");
+        assert_eq!(view.to_model(), path);
     }
 
     #[test]

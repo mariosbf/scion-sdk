@@ -19,6 +19,7 @@ use std::fmt::Display;
 use crate::{
     core::{macros::impl_from, view::View},
     dataplane_path::{
+        hbird::view::HbirdPathView,
         model::DpPath,
         onehop::view::OneHopPathView,
         standard::view::StandardPathView,
@@ -33,6 +34,8 @@ pub enum ScionDpPathViewRef<'a> {
     Standard(&'a StandardPathView),
     /// View over a one-hop SCION path
     OneHop(&'a OneHopPathView),
+    /// View over a Hummingbird SCION path
+    Hummingbird(&'a HbirdPathView),
     /// View over an unsupported path type
     Unsupported {
         /// The unsupported path type
@@ -76,6 +79,8 @@ pub enum ScionDpPathViewRefMut<'a> {
     Standard(&'a mut StandardPathView),
     /// Mutable view over a one-hop SCION path
     OneHop(&'a mut OneHopPathView),
+    /// Mutable view over a Hummingbird SCION path
+    Hummingbird(&'a mut HbirdPathView),
     /// Mutable view over an unsupported path type
     Unsupported {
         /// The unsupported path type
@@ -93,6 +98,9 @@ impl ScionDpPathViewExt for ScionDpPathViewRefMut<'_> {
         match self {
             ScionDpPathViewRefMut::Standard(standard_path_view) => {
                 ScionDpPathViewRef::Standard(standard_path_view)
+            }
+            ScionDpPathViewRefMut::Hummingbird(hbird_path_view) => {
+                ScionDpPathViewRef::Hummingbird(hbird_path_view)
             }
             ScionDpPathViewRefMut::OneHop(one_hop_path_view) => {
                 ScionDpPathViewRef::OneHop(one_hop_path_view)
@@ -114,6 +122,7 @@ impl ScionDpPathViewExtMut for ScionDpPathViewRefMut<'_> {
         // preserving the lifetime.
         match self {
             ScionDpPathViewRefMut::Standard(v) => ScionDpPathViewRefMut::Standard(v),
+            ScionDpPathViewRefMut::Hummingbird(v) => ScionDpPathViewRefMut::Hummingbird(v),
             ScionDpPathViewRefMut::OneHop(v) => ScionDpPathViewRefMut::OneHop(v),
             ScionDpPathViewRefMut::Unsupported { path_type, buf } => {
                 ScionDpPathViewRefMut::Unsupported {
@@ -151,6 +160,8 @@ pub enum ScionDpPathView {
     Standard(Box<StandardPathView>),
     /// Owned view over a one-hop SCION path
     OneHop(OneHopPathView),
+    /// Owned view over a Hummingbird SCION path
+    Hummingbird(Box<HbirdPathView>),
     /// Owned view over an unsupported path type
     Unsupported {
         /// The unsupported path type
@@ -168,6 +179,9 @@ impl ScionDpPathViewExt for ScionDpPathView {
         match self {
             ScionDpPathView::Standard(standard_path_view) => {
                 ScionDpPathViewRef::Standard(standard_path_view.as_ref())
+            }
+            ScionDpPathView::Hummingbird(hbird_path_view) => {
+                ScionDpPathViewRef::Hummingbird(hbird_path_view.as_ref())
             }
             ScionDpPathView::OneHop(one_hop_path_view) => {
                 ScionDpPathViewRef::OneHop(one_hop_path_view)
@@ -189,6 +203,9 @@ impl ScionDpPathViewExtMut for ScionDpPathView {
             ScionDpPathView::Standard(standard_path_view) => {
                 ScionDpPathViewRefMut::Standard(standard_path_view.as_mut())
             }
+            ScionDpPathView::Hummingbird(hbird_path_view) => {
+                ScionDpPathViewRefMut::Hummingbird(hbird_path_view.as_mut())
+            }
             ScionDpPathView::OneHop(one_hop_path_view) => {
                 ScionDpPathViewRefMut::OneHop(one_hop_path_view)
             }
@@ -208,6 +225,21 @@ impl_from!(Box<StandardPathView>, ScionDpPathView, |v| {
 impl_from!(OneHopPathView, ScionDpPathView, |v| {
     ScionDpPathView::OneHop(v)
 });
+impl_from!(Box<HbirdPathView>, ScionDpPathView, |v| {
+    ScionDpPathView::Hummingbird(v)
+});
+impl<'a> From<&'a HbirdPathView> for ScionDpPathViewRef<'a> {
+    #[inline]
+    fn from(value: &'a HbirdPathView) -> Self {
+        ScionDpPathViewRef::Hummingbird(value)
+    }
+}
+impl<'a> From<&'a mut HbirdPathView> for ScionDpPathViewRefMut<'a> {
+    #[inline]
+    fn from(value: &'a mut HbirdPathView) -> Self {
+        ScionDpPathViewRefMut::Hummingbird(value)
+    }
+}
 impl Display for ScionDpPathView {
     #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -228,6 +260,9 @@ pub trait ScionDpPathViewExt {
             ScionDpPathViewRef::Standard(standard_path_view) => {
                 ScionDpPathView::Standard(standard_path_view.to_boxed())
             }
+            ScionDpPathViewRef::Hummingbird(hbird_path_view) => {
+                ScionDpPathView::Hummingbird(hbird_path_view.to_boxed())
+            }
             ScionDpPathViewRef::OneHop(one_hop_path_view) => {
                 ScionDpPathView::OneHop(one_hop_path_view.clone())
             }
@@ -246,6 +281,7 @@ pub trait ScionDpPathViewExt {
     fn as_slice(&self) -> &[u8] {
         match self.as_ref() {
             ScionDpPathViewRef::Standard(standard_path_view) => standard_path_view.as_slice(),
+            ScionDpPathViewRef::Hummingbird(hbird_path_view) => hbird_path_view.as_slice(),
             ScionDpPathViewRef::OneHop(one_hop_path_view) => one_hop_path_view.as_slice(),
             ScionDpPathViewRef::Unsupported { data, .. } => data,
             ScionDpPathViewRef::Empty => &[],
@@ -262,6 +298,7 @@ pub trait ScionDpPathViewExt {
             ScionDpPathViewRef::Standard(standard_path_view) => {
                 Some(standard_path_view.expiration())
             }
+            ScionDpPathViewRef::Hummingbird(hbird_path_view) => Some(hbird_path_view.expiration()),
             ScionDpPathViewRef::OneHop(one_hop_path_view) => Some(one_hop_path_view.expiration()),
             ScionDpPathViewRef::Empty => Some(u32::MAX),
             ScionDpPathViewRef::Unsupported { .. } => None,
@@ -275,6 +312,11 @@ pub trait ScionDpPathViewExt {
             ScionDpPathViewRef::Standard(standard_path_view) => {
                 let info_field = standard_path_view.info_fields().first()?;
                 let hop_field = standard_path_view.hop_fields().first()?;
+                Some(hop_field.egress_interface(info_field))
+            }
+            ScionDpPathViewRef::Hummingbird(hbird_path_view) => {
+                let info_field = hbird_path_view.info_fields().first()?;
+                let hop_field = hbird_path_view.hop_fields().next()?;
                 Some(hop_field.egress_interface(info_field))
             }
             ScionDpPathViewRef::OneHop(one_hop_path_view) => {
@@ -302,6 +344,14 @@ pub trait ScionDpPathViewExt {
                         .egress_interface(info_field),
                 )
             }
+            ScionDpPathViewRef::Hummingbird(hbird_path_view) => {
+                let info_field = hbird_path_view.curr_info_field()?;
+                Some(
+                    hbird_path_view
+                        .curr_hop_field()?
+                        .egress_interface(info_field),
+                )
+            }
             ScionDpPathViewRef::OneHop(one_hop_path_view) => {
                 let info_field = one_hop_path_view.info_field();
                 let [hop_field, _] = one_hop_path_view.hop_fields();
@@ -320,6 +370,15 @@ pub trait ScionDpPathViewExt {
                 let info_field = standard_path_view.info_fields().last()?;
                 Some(
                     standard_path_view
+                        .hop_fields()
+                        .last()?
+                        .ingress_interface(info_field),
+                )
+            }
+            ScionDpPathViewRef::Hummingbird(hbird_path_view) => {
+                let info_field = hbird_path_view.info_fields().last()?;
+                Some(
+                    hbird_path_view
                         .hop_fields()
                         .last()?
                         .ingress_interface(info_field),
@@ -353,6 +412,14 @@ pub trait ScionDpPathViewExt {
                         .ingress_interface(info_field),
                 )
             }
+            ScionDpPathViewRef::Hummingbird(hbird_path_view) => {
+                let info_field = hbird_path_view.curr_info_field()?;
+                Some(
+                    hbird_path_view
+                        .curr_hop_field()?
+                        .ingress_interface(info_field),
+                )
+            }
             ScionDpPathViewRef::OneHop(one_hop_path_view) => {
                 let info_field = one_hop_path_view.info_field();
                 let [_, hop_field] = one_hop_path_view.hop_fields();
@@ -374,6 +441,7 @@ pub trait ScionDpPathViewExt {
     fn display(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.as_ref() {
             ScionDpPathViewRef::Standard(standard_path_view) => write!(f, "{}", standard_path_view),
+            ScionDpPathViewRef::Hummingbird(hbird_path_view) => write!(f, "{}", hbird_path_view),
             ScionDpPathViewRef::OneHop(one_hop_path_view) => write!(f, "{}", one_hop_path_view),
             ScionDpPathViewRef::Unsupported { path_type, .. } => {
                 write!(f, "[unsupported] {:?}", path_type)
@@ -409,6 +477,12 @@ pub trait ScionDpPathViewExtMut: ScionDpPathViewExt {
             ScionDpPathViewRefMut::Standard(standard_path_view) => {
                 standard_path_view.try_reverse()?;
                 Ok(self)
+            }
+            // Replaced in Task 8 with real Hummingbird reversal.
+            ScionDpPathViewRefMut::Hummingbird(_) => {
+                Err(PathReverseError::new(
+                    "Hummingbird path reversal not yet implemented",
+                ))
             }
             ScionDpPathViewRefMut::OneHop(one_hop_path_view) => {
                 one_hop_path_view.try_reverse()?;

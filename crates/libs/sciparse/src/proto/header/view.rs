@@ -33,6 +33,7 @@ use crate::{
         write::unchecked_bit_range_be_write,
     },
     dataplane_path::{
+        hbird::view::HbirdPathView,
         standard::view::StandardPathView,
         types::PathType,
         view::{ScionDpPathViewRef, ScionDpPathViewRefMut},
@@ -435,6 +436,13 @@ impl ScionHeaderView {
 
                 ScionDpPathViewRef::Standard(path)
             }
+            PathType::Hummingbird => {
+                // SAFETY: min buffer size is checked on construction
+                let path_buf = unsafe { self.0.get_unchecked(path_offset..len) };
+                let path = unsafe { HbirdPathView::from_slice_unchecked(path_buf) };
+
+                ScionDpPathViewRef::Hummingbird(path)
+            }
             PathType::OneHop => {
                 // SAFETY: min buffer size is checked on construction
                 let path_size =
@@ -477,6 +485,13 @@ impl ScionHeaderView {
                 let path = unsafe { StandardPathView::from_mut_slice_unchecked(path_buf) };
 
                 ScionDpPathViewRefMut::Standard(path)
+            }
+            PathType::Hummingbird => {
+                // SAFETY: min size is checked on construction of ScionHeaderView
+                let path_buf = unsafe { self.0.get_unchecked_mut(path_offset..len) };
+                let path = unsafe { HbirdPathView::from_mut_slice_unchecked(path_buf) };
+
+                ScionDpPathViewRefMut::Hummingbird(path)
             }
             PathType::OneHop => {
                 // SAFETY: min size is checked on construction of ScionHeaderView

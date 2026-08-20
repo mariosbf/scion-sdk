@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5b5f0a256b6df88365da692f4393ce1088fa202735bf57cc6544738b927ac959 # shrinks to pkt = Udp(ScionUdpPacket { header: ScionPacketHeader { common: CommonHeader { traffic_class: 0, flow_id: 0, next_header: Udp }, address: AddressHeader { dst_ia: 0-0, src_ia: 0-0, dst_host_addr: V4(0.0.0.0), src_host_addr: V4(0.0.0.0) }, path: Hummingbird(HummingbirdPath { current_info_field: 0, current_hop_field: 0, segments: [HbirdSegment { info_field: InfoField { flags: InfoFieldFlags(0x0), segment_id: 0, timestamp: 0 }, hop_fields: [Standard(HopField { flags: HopFieldFlags(0x80), expiration_units: 0, cons_ingress: 1, cons_egress: 1, mac: 00:00:00:00:00:00 })] }], base_timestamp: 0, millis_timestamp: 0, counter: 0 }) }, payload: UdpDatagram { src_port: 0, dst_port: 0, payload_len: 0 } })

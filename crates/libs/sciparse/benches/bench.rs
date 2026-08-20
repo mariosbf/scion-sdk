@@ -48,6 +48,7 @@ fn generate_packet_bytes() -> Vec<Bytes> {
             path: ArbitraryPathParams {
                 standard: 1,
                 one_hop: 0,
+                hummingbird: 0,
                 empty: 0,
                 unsupported: 0,
                 standard_params: ArbitraryPathContext {
@@ -55,6 +56,7 @@ fn generate_packet_bytes() -> Vec<Bytes> {
                     ..Default::default()
                 },
                 one_hop_params: Default::default(),
+                hummingbird_params: Default::default(),
             },
             ..Default::default()
         },

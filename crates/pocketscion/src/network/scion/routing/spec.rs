@@ -94,6 +94,14 @@ impl RoutingLogic for SpecRoutingLogic {
                 }
             }
             ScionDpPathViewRefMut::Empty => Ok(LocalAsRoutingAction::ForwardLocal.into()),
+            ScionDpPathViewRefMut::Hummingbird(_) => {
+                // The simulated router cannot forward Hummingbird paths yet: doing so requires
+                // verifying flyover MACs, which the router has no reservation keys for. Dropping
+                // is the honest behaviour — forwarding without verification would let tests pass
+                // against a router that never checks the reservations they are exercising.
+                tracing::warn!("dropping Hummingbird packet: forwarding is not implemented");
+                return Ok(AsRoutingAction::Drop);
+            }
             ScionDpPathViewRefMut::Unsupported { .. } => {
                 // Can't send a reply, since we don't know the path type, so we just drop
                 // the packet

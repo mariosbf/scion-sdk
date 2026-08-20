@@ -79,6 +79,7 @@ pub fn exec_every_view_function(view: &mut ScionHeaderView) {
     match view.path() {
         ScionDpPathViewRef::Standard(p) => path::exec_standard_path_view(p),
         ScionDpPathViewRef::OneHop(p) => path::exec_onehop_path_view(p),
+        ScionDpPathViewRef::Hummingbird(p) => path::exec_hbird_path_view(p),
         ScionDpPathViewRef::Unsupported { path_type: _, data } => {
             read_slice_bounds(data);
         }
@@ -89,6 +90,7 @@ pub fn exec_every_view_function(view: &mut ScionHeaderView) {
     match view.path_mut() {
         ScionDpPathViewRefMut::Standard(p) => path::exec_standard_path_view_mut(p),
         ScionDpPathViewRefMut::OneHop(p) => path::exec_onehop_path_view_mut(p),
+        ScionDpPathViewRefMut::Hummingbird(p) => path::exec_hbird_path_view_mut(p),
         ScionDpPathViewRefMut::Unsupported { path_type: _, buf } => {
             touch_slice_bounds(buf);
         }

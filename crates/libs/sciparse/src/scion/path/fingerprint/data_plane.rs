@@ -88,6 +88,18 @@ impl DpPathFingerprint {
                     hasher.update(hf.cons_egress().to_be_bytes());
                 });
             }
+            ScionDpPathViewRef::Hummingbird(hbird_path) => {
+                // Hashed exactly like a standard path but under its own path type: reservations
+                // are credentials rather than route properties, so two Hummingbird paths over the
+                // same interfaces fingerprint alike, just as differing MACs do.
+                hasher.update([u8::from(PathType::Hummingbird)]);
+                hasher.update(src_ia.to_be_bytes());
+                hasher.update(dst_ia.to_be_bytes());
+                hbird_path.hop_fields().for_each(|hf| {
+                    hasher.update(hf.cons_ingress().to_be_bytes());
+                    hasher.update(hf.cons_egress().to_be_bytes());
+                });
+            }
             ScionDpPathViewRef::Unsupported { path_type, data } => {
                 hasher.update([u8::from(path_type)]);
                 hasher.update(src_ia.to_be_bytes());

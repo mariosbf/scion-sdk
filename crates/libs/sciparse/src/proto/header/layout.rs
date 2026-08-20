@@ -24,6 +24,10 @@ use crate::{
         view::{View, ViewConversionError},
     },
     dataplane_path::{
+        hbird::{
+            layout::{HbirdPathDataLayout, HbirdPathMetaLayout},
+            view::HbirdPathView,
+        },
         layout::ScionHeaderPathLayout,
         model::DpPath,
         onehop::layout::OneHopPathLayout,
@@ -167,6 +171,31 @@ impl ScionHeaderLayout {
 
                 ScionHeaderPathLayout::Standard(StdPathMetaLayout, path_data_layout)
             }
+            PathType::Hummingbird => {
+                let (path_meta_buf, _rest) = HbirdPathMetaLayout
+                    .split_off_checked(&buf[addr_header_end..])
+                    .ok_or_else(|| {
+                        LayoutParseError::BufferTooSmall {
+                            at: "HbirdPathMeta",
+                            required: HbirdPathMetaLayout.size_bytes(),
+                            actual: buf.len() - addr_header_end,
+                        }
+                    })?;
+
+                // Safety: path_meta_buf is guaranteed to be of sufficient length by
+                // split_off_checked
+                let path_meta_view = unsafe { HbirdPathView::from_slice_unchecked(path_meta_buf) };
+
+                // Segment lengths are counted in 4-byte lines, which is what lets one segment
+                // hold hop fields of differing widths.
+                let path_data_layout = HbirdPathDataLayout::new(
+                    path_meta_view.seg0_len_bytes() as usize,
+                    path_meta_view.seg1_len_bytes() as usize,
+                    path_meta_view.seg2_len_bytes() as usize,
+                );
+
+                ScionHeaderPathLayout::Hummingbird(HbirdPathMetaLayout, path_data_layout)
+            }
             PathType::OneHop => ScionHeaderPathLayout::OneHop(OneHopPathLayout),
             PathType::Empty => ScionHeaderPathLayout::Empty,
             path_type => {
@@ -237,6 +266,14 @@ impl ScionHeaderLayout {
                 ScionHeaderPathLayout::Standard(
                     StdPathMetaLayout,
                     StdPathDataLayout::new(seg0, seg1, seg2),
+                )
+            }
+            DpPath::Hummingbird(hbird_path) => {
+                let (seg0, seg1, seg2) = hbird_path.segment_lengths_bytes();
+
+                ScionHeaderPathLayout::Hummingbird(
+                    HbirdPathMetaLayout,
+                    HbirdPathDataLayout::new(seg0, seg1, seg2),
                 )
             }
             DpPath::OneHop(_) => ScionHeaderPathLayout::OneHop(OneHopPathLayout),

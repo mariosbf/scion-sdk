@@ -29,6 +29,7 @@ use crate::{
 };
 
 /// Layout for the Hummingbird SCION path, composed of a meta header and data
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HbirdPathLayout {
     /// Layout of the path meta header
     pub meta: HbirdPathMetaLayout,
@@ -95,6 +96,7 @@ impl TryFrom<&[u8]> for HbirdPathLayout {
 }
 
 /// Layout for the Hummingbird SCION path meta header
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HbirdPathMetaLayout;
 impl HbirdPathMetaLayout {
     //  0                   1                   2                   3
@@ -153,7 +155,8 @@ impl Layout for HbirdPathMetaLayout {
     }
 }
 
-/// Layout for the standard SCION path data
+/// Layout for the Hummingbird SCION path data
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HbirdPathDataLayout {
     /// Lengths of the three path segments in bytes.
     pub segment_lengths_in_bytes: (usize, usize, usize),
@@ -329,6 +332,7 @@ impl From<FlyoverHopFieldLayout> for HummingbirdHopFieldLayout {
 }
 
 /// Layout for a SCION Hummingbird path flyover hop field
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FlyoverHopFieldLayout;
 impl FlyoverHopFieldLayout {
     //  0                   1                   2                   3

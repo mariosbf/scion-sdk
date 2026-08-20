@@ -17,7 +17,7 @@
 //! See [`View`](crate::core::view) for more information about views in general.
 
 use std::{
-    fmt::Debug,
+    fmt::{Debug, Display},
     mem::transmute,
     ops::{Deref, DerefMut, Range},
 };
@@ -40,7 +40,7 @@ use crate::{
         },
         standard::{
             layout::{HopFieldLayout, InfoFieldLayout},
-            types::{HopFieldFlags, HopFieldMac, InfoFieldFlags},
+            types::{HopFieldFlags, HopFieldMac, InfoFieldFlags, exp_time_to_duration},
             view::{HopFieldView, InfoFieldView},
         },
     },
@@ -48,17 +48,25 @@ use crate::{
 
 /// A view over a Hummingbird SCION path, including meta header and data
 #[repr(transparent)]
+#[derive(PartialEq, Eq)]
 pub struct HbirdPathView([u8]);
 gen_view_impl!(HbirdPathView, HbirdPathLayout);
 
 // Meta header
 impl HbirdPathView {
     gen_field_read!(
-        curr_info_field,
+        curr_info_field_idx,
         HbirdPathMetaLayout::CURR_INFO_FIELD_RNG,
         u8
     );
-    gen_field_read!(curr_hop_field, HbirdPathMetaLayout::CURR_HOP_FIELD_RNG, u8);
+    // `curr_hop_field_line` is the offset of the current hop field counted in 4-byte lines from
+    // the first hop field. Unlike the standard path this is *not* a hop field index: hop fields
+    // vary in width, so nothing but an offset can address them.
+    gen_field_read!(
+        curr_hop_field_line,
+        HbirdPathMetaLayout::CURR_HOP_FIELD_RNG,
+        u8
+    );
     gen_field_read!(seg0_len, HbirdPathMetaLayout::SEG0_LEN_RNG, u8);
     gen_field_read!(seg1_len, HbirdPathMetaLayout::SEG1_LEN_RNG, u8);
     gen_field_read!(seg2_len, HbirdPathMetaLayout::SEG2_LEN_RNG, u8);
@@ -217,6 +225,82 @@ impl HbirdPathView {
             unsafe { InfoFieldView::from_slice_unchecked(self.0.get_unchecked(field_range)) };
 
         Some(field)
+    }
+
+    /// Returns a view over the current info field, or None if the index is out of bounds.
+    #[inline]
+    pub fn curr_info_field(&self) -> Option<&InfoFieldView> {
+        self.info_field(self.curr_info_field_idx() as usize)
+    }
+
+    /// Returns a view over the current hop field, or None if the offset is out of bounds.
+    #[inline]
+    pub fn curr_hop_field(&self) -> Option<HbirdHopFieldView<&HopFieldView, &FlyoverHopFieldView>> {
+        self.hop_field(self.curr_hop_field_line() as usize * 4)
+    }
+
+    /// Returns the segments of the path as info field / hop field pairs.
+    ///
+    /// Hop fields are yielded per segment by walking byte offsets, since a segment's hop fields
+    /// vary in width and cannot be sliced at a fixed stride.
+    pub fn segments(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &InfoFieldView,
+            Vec<HbirdHopFieldView<&HopFieldView, &FlyoverHopFieldView>>,
+        ),
+    > {
+        let segment_bytes = [
+            self.seg0_len_bytes() as usize,
+            self.seg1_len_bytes() as usize,
+            self.seg2_len_bytes() as usize,
+        ];
+
+        let mut offset = 0usize;
+        self.info_fields()
+            .iter()
+            .zip(segment_bytes)
+            .map(move |(info_field, segment_len)| {
+                let mut hop_fields = Vec::new();
+                let segment_end = offset + segment_len;
+                while offset < segment_end {
+                    let Some(hop_field) = self.hop_field(offset) else {
+                        break;
+                    };
+                    offset += hop_field.size_bytes();
+                    hop_fields.push(hop_field);
+                }
+                (info_field, hop_fields)
+            })
+    }
+
+    /// Calculates the expiry time of the path by scanning info and hop fields.
+    ///
+    /// Returns the absolute expiry time as a UNIX timestamp in seconds, or 0 if the path has no
+    /// hop fields.
+    ///
+    /// A flyover reservation's own validity window is *not* consulted here: this is the path's
+    /// expiry, which is governed by the hop fields exactly as it is for a standard path.
+    pub fn expiration(&self) -> u32 {
+        let mut expiry_time = u32::MAX;
+        let mut saw_segment = false;
+
+        for (info_field, hop_fields) in self.segments() {
+            let Some(exp_time) = hop_fields.iter().map(|hop| hop.exp_time()).min() else {
+                continue;
+            };
+            saw_segment = true;
+
+            let exp_time: u32 = exp_time_to_duration(exp_time)
+                .as_secs()
+                .try_into()
+                .expect("maximum expiry time fits in u32");
+
+            expiry_time = expiry_time.min(info_field.timestamp().saturating_add(exp_time));
+        }
+
+        if saw_segment { expiry_time } else { 0 }
     }
 
     /// Returns the index of the hop field at the given byte offset.
@@ -392,13 +476,68 @@ impl HbirdPathView {
     }
 }
 
+impl Display for HbirdPathView {
+    /// Formats the path in a human-readable format, mirroring the standard path's format with a
+    /// `*` marking hop fields that carry a flyover reservation.
+    ///
+    /// Example:
+    /// `[hbird] ci:0 ch:0 segs: [0,1*; 1,2; 3,0]`
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[hbird] ci:{} ch:{} segs:",
+            self.curr_info_field_idx(),
+            self.curr_hop_field_line(),
+        )?;
+
+        for (info, hops) in self.segments() {
+            let cons_dir = match info.flags().contains(InfoFieldFlags::CONS_DIR) {
+                true => "",
+                false => "r",
+            };
+
+            write!(f, " {}[", cons_dir)?;
+
+            let Some((last, head)) = hops.split_last() else {
+                write!(f, "]")?;
+                continue;
+            };
+
+            for hop in head {
+                write!(f, "{}; ", HopInterfaces(hop, info))?;
+            }
+            write!(f, "{}]", HopInterfaces(last, info))?;
+        }
+
+        Ok(())
+    }
+}
+
+/// Formats one hop field's interface pair, suffixed with `*` when it carries a reservation.
+struct HopInterfaces<'a>(
+    &'a HbirdHopFieldView<&'a HopFieldView, &'a FlyoverHopFieldView>,
+    &'a InfoFieldView,
+);
+impl Display for HopInterfaces<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let HopInterfaces(hop, info) = self;
+        write!(
+            f,
+            "{},{}{}",
+            hop.ingress_interface(info),
+            hop.egress_interface(info),
+            if hop.is_flyover() { "*" } else { "" }
+        )
+    }
+}
+
 impl Debug for HbirdPathView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let hop_fields = self.hop_fields();
         let info_fields = self.info_fields();
         f.debug_struct("StandardPathMetaHeaderView")
-            .field("current_info_field", &self.curr_info_field())
-            .field("curr_hop_field", &self.curr_hop_field())
+            .field("current_info_field", &self.curr_info_field_idx())
+            .field("curr_hop_field_line", &self.curr_hop_field_line())
             .field("seg0_len", &self.seg0_len())
             .field("seg1_len", &self.seg1_len())
             .field("seg2_len", &self.seg2_len())
@@ -865,8 +1004,8 @@ mod tests {
             view.set_counter(0x3F_FFFF);
         }
 
-        assert_eq!(view.curr_info_field(), 2);
-        assert_eq!(view.curr_hop_field(), 37);
+        assert_eq!(view.curr_info_field_idx(), 2);
+        assert_eq!(view.curr_hop_field_line(), 37);
         assert_eq!(view.base_timestamp(), 0xDEAD_BEEF);
         assert_eq!(view.millis_timestamp(), 999);
         assert_eq!(view.counter(), 0x3F_FFFF);
