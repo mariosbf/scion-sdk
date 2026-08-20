@@ -21,7 +21,11 @@ use std::{
 
 use scion_quic::socket::{BoxedSocketError, GenericScionUdpSocket};
 use sciparse::{
-    address::{addr::ScionAddr, ip_socket_addr::ScionSocketIpAddr},
+    address::{
+        addr::ScionAddr,
+        ip_socket_addr::ScionSocketIpAddr,
+        socket_addr::{ScionSocketAddr, ScionSocketAddrSvc},
+    },
     core::{model::Model, view::View},
     dataplane_path::view::ScionDpPathViewExt,
     packet::{
@@ -91,10 +95,38 @@ impl PathUnawareUdpScionSocket {
         destination: ScionSocketIpAddr,
         path: &ScionPath,
     ) -> Result<(), ScionSocketSendError> {
+        self.send_to_addr_via(payload, destination.into(), path)
+            .await
+    }
+
+    /// Send a SCION UDP datagram to a service anycast address via the given path.
+    ///
+    /// The destination is resolved to a concrete host by the receiving AS, so replies come from
+    /// that host's address rather than from the service address the request was sent to.
+    ///
+    /// # Cancel safety
+    ///
+    /// Same as [`send_to_via`](Self::send_to_via).
+    pub async fn send_to_svc_via(
+        &self,
+        payload: &[u8],
+        destination: ScionSocketAddrSvc,
+        path: &ScionPath,
+    ) -> Result<(), ScionSocketSendError> {
+        self.send_to_addr_via(payload, destination.into(), path)
+            .await
+    }
+
+    async fn send_to_addr_via(
+        &self,
+        payload: &[u8],
+        destination: ScionSocketAddr,
+        path: &ScionPath,
+    ) -> Result<(), ScionSocketSendError> {
         // TODO: Should look into a way to encode without cloning payload and parsing dp_path
         let packet = ScionUdpPacket::new(
             self.local_addr.into(),
-            destination.into(),
+            destination,
             path.dp_path().to_model(),
             payload.to_vec(),
         )
@@ -570,6 +602,53 @@ impl<P: PathManager> UdpScionSocket<P> {
             )
             .await?;
         self.socket.send_to_via(payload, destination, path).await
+    }
+
+    /// Send a datagram to a service anycast address, using a path chosen by the path manager.
+    ///
+    /// The destination AS resolves the service address to one of its hosts, so the reply is sent
+    /// by that host and [`recv_from`](Self::recv_from) reports its concrete address, not the
+    /// service address addressed here.
+    ///
+    /// # Cancel safety
+    ///
+    /// Same as [`send_to`](Self::send_to).
+    pub async fn send_to_svc(
+        &self,
+        payload: &[u8],
+        destination: ScionSocketAddrSvc,
+    ) -> Result<(), ScionSocketSendError> {
+        let path = &self
+            .pather
+            .path_wait(
+                self.socket.local_addr().isd_asn(),
+                destination.isd_asn,
+                SystemTime::now(),
+            )
+            .await?;
+        self.send_to_svc_via(payload, destination, path).await
+    }
+
+    /// Send a datagram to a service anycast address via the specified path.
+    ///
+    /// See [`send_to_svc`](Self::send_to_svc) for how the destination is resolved.
+    ///
+    /// # Cancel safety
+    ///
+    /// Same as [`send_to_via`](Self::send_to_via).
+    pub async fn send_to_svc_via(
+        &self,
+        payload: &[u8],
+        destination: ScionSocketAddrSvc,
+        path: &ScionPath,
+    ) -> Result<(), ScionSocketSendError> {
+        self.socket
+            .send_to_svc_via(payload, destination, path)
+            .await
+            .inspect_err(|e| {
+                self.send_error_receivers
+                    .for_each(|receiver| receiver.report_send_error(e));
+            })
     }
 
     /// Send a datagram to the specified destination via the specified path.

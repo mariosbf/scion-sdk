@@ -5415,6 +5415,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
+name = "svc-resolution-client"
+version = "0.6.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ntest",
+ "pocketscion",
+ "prost",
+ "scion-protobuf",
+ "scion-sdk-utils",
+ "scion-stack",
+ "sciparse",
+ "snap-tokens",
+ "svc-resolution-models",
+ "test-log",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "svc-resolution-models"
+version = "0.6.1"
+dependencies = [
+ "async-trait",
+ "scion-protobuf",
+ "sciparse",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "symlink"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

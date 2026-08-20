@@ -1,0 +1,34 @@
+[package]
+name = "svc-resolution-client"
+version = "0.6.1"
+edition.workspace = true
+authors = ["Anapaya & contributors"]
+license = "Apache-2.0"
+description = "SCION service resolution UDP client"
+repository = "https://github.com/anapaya/scion-sdk"
+keywords = ["SCION", "networking"]
+
+[dependencies]
+# Local Dependencies
+svc-resolution-models = { workspace = true }
+sciparse = { workspace = true }
+scion-protobuf = { workspace = true }
+scion-stack = { workspace = true }
+
+# Global Dependencies
+async-trait = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }
+ntest = { workspace = true }
+pocketscion = { workspace = true }
+scion-sdk-utils = { workspace = true }
+snap-tokens = { workspace = true }
+test-log = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

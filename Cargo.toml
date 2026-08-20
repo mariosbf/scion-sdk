@@ -6,6 +6,7 @@ members = [
     "crates/apis/anapaya-ead/*",
     "crates/apis/anapaya-hsd-api/*",
     "crates/apis/endhost-api/*",
+    "crates/apis/svc-resolution/*",
     "crates/libs/*",
     "crates/pocketscion",
     "crates/scion-stack",
@@ -32,6 +33,9 @@ anapaya-ead-models = { path = "crates/apis/anapaya-ead/anapaya-ead-models", vers
 anapaya-hsd-api-protobuf = { path = "crates/apis/anapaya-hsd-api/anapaya-hsd-api-protobuf", version = "0.6.1" }
 
 anapaya-aa-protobuf = { path = "crates/apis/anapaya-aa/anapaya-aa-protobuf", version = "0.6.1" }
+
+svc-resolution-client = { path = "crates/apis/svc-resolution/svc-resolution-client", version = "0.6.1" }
+svc-resolution-models = { path = "crates/apis/svc-resolution/svc-resolution-models", version = "0.6.1" }
 
 axum-connect-rpc = { path = "crates/libs/axum-connect-rpc", version = "0.6.1" }
 scion-h3-axum = { path = "crates/libs/scion-h3-axum", version = "0.6.1" }
