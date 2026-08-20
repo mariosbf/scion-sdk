@@ -165,7 +165,7 @@ impl HummingbirdPath {
     /// Converts this path into the standard SCION path over the same hops.
     ///
     /// Every flyover hop field is replaced by the standard hop field it extends, dropping the
-    /// reservation fields. 
+    /// reservation fields.
     ///
     /// The resulting path's hop field MACs are those carried by this path. For a path taken from
     /// a received packet they are plain standard MACs, because border routers de-aggregate the
