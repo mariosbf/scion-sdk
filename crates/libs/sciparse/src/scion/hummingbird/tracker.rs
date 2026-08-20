@@ -20,7 +20,7 @@
 //!
 //! The two are separate because selection determines how many hop fields become flyovers, which
 //! in turn determines the packet length. Selection therefore necessarily runs against an *upper
-//! bound*, and only the commit sees the real figure. 
+//! bound*, and only the commit sees the real figure.
 //!
 //! Implementations decide their own enforcement policy. A tracker that returns an error fails the
 //! resolution; wrap it in [`Lenient`] to have unusable hops fall back to standard hop fields
