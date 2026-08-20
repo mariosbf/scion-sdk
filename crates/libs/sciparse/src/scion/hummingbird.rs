@@ -32,6 +32,8 @@ use aes::{Aes128Enc, cipher::KeyInit};
 
 use crate::identifier::isd_asn::IsdAsn;
 
+pub mod crypto;
+
 /// The key that authenticates use of a flyover reservation.
 ///
 /// Issued by the redemption service of the AS the reservation is for, and used to key the flyover
