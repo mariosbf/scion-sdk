@@ -18,7 +18,7 @@
 //! They contain the encoded dataplane path and optional metadata about the path, such as expiration
 //! time, MTU, and interfaces used by the path.
 
-use std::{collections::HashMap, fmt::Display, net::SocketAddr};
+use std::{collections::HashMap, fmt::Display, net::SocketAddr, sync::Arc, time::SystemTime};
 
 use prost_types::Timestamp;
 use scion_protobuf::daemon::v1 as rpc;
@@ -31,9 +31,11 @@ use crate::{
         types::PathReverseError,
         view::{ScionDpPathView, ScionDpPathViewExt, ScionDpPathViewExtMut},
     },
+    hummingbird::{Reservation, tracker::ReservationTracker},
     identifier::isd_asn::IsdAsn,
     path::{
         fingerprint::data_plane::DpPathFingerprint,
+        hbird_overlay::HbirdOverlay,
         metadata::{
             geo::GeoCoordinates,
             link::{LinkMeta, LinkType},
@@ -45,6 +47,7 @@ use crate::{
 
 pub mod combinator;
 pub mod fingerprint;
+pub mod hbird_overlay;
 pub mod metadata;
 pub mod policy;
 
@@ -53,14 +56,21 @@ pub mod policy;
 /// This contains a [ScionDpPathView], which is the encoded dataplane path as returned by the
 /// SCION daemon, and optional metadata about the path, such as expiration time, MTU, and interfaces
 /// used by the path
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ScionPath {
     /// The ISD-AS of the path's source.
     src_ia: IsdAsn,
     /// The ISD-AS of the path's destination.
     dst_ia: IsdAsn,
     /// The encoded dataplane path as returned by the SCION daemon.
+    ///
+    /// For a Hummingbird path this is the underlying *standard* path; the Hummingbird
+    /// part lives in `hbird` as an overlay on top of it.
     dp_path: ScionDpPathView,
+    /// Hummingbird overlay: attached reservations and the reservation tracker that chooses
+    /// between them. `None` for an ordinary path, and always `None` for a path parsed from a
+    /// received Hummingbird packet.
+    hbird: Option<HbirdOverlay>,
     /// Metadata about the path
     metadata: Option<metadata::PathMetadata>,
     /// The address of the SCION router which is used to exit the local AS on this path.
@@ -93,6 +103,7 @@ impl ScionPath {
 
         let mut this = Self {
             dp_path,
+            hbird: None,
             metadata,
             src_ia,
             dst_ia,
@@ -126,6 +137,18 @@ impl ScionPath {
         }
     }
 }
+impl PartialEq for ScionPath {
+    /// Two paths are equal when they are the same route, carrying the same metadata, reached
+    /// through the same next hop.
+    fn eq(&self, other: &Self) -> bool {
+        self.src_ia == other.src_ia
+            && self.dst_ia == other.dst_ia
+            && self.dp_path == other.dp_path
+            && self.metadata == other.metadata
+            && self.next_hop == other.next_hop
+    }
+}
+
 // utility
 impl ScionPath {
     /// Returns the egress interface of the first hop of the path.
@@ -195,6 +218,9 @@ impl ScionPath {
         // Next hop is not valid after reversal.
         self.next_hop = None;
 
+        // Flyover reservations are directional.
+        self.hbird = None;
+
         if let Some(metadata) = self.metadata.as_mut() {
             metadata.reverse();
 
@@ -251,6 +277,102 @@ impl ScionPath {
     pub fn is_expired(&self, timestamp: u32) -> Option<bool> {
         let expiration = self.expiration()?;
         Some(timestamp >= expiration)
+    }
+}
+
+/// Hummingbird send-side operations.
+///
+/// All of these need an overlay, and an overlay is only meaningful on a standard path: a path
+/// parsed from a received Hummingbird packet is a snapshot of one packet rather than a generator
+/// of encodings, and the remaining path types have no hops to attach reservations to. Those cases
+/// return [`PathResolveError::ReservationsUnsupported`].
+impl ScionPath {
+    /// The overlay for this path, created if it does not have one yet.
+    fn overlay_mut(&mut self) -> Result<&mut HbirdOverlay, PathResolveError> {
+        if self.hbird.is_none() {
+            let ScionDpPathView::Standard(view) = &self.dp_path else {
+                return Err(PathResolveError::ReservationsUnsupported);
+            };
+
+            self.hbird = Some(HbirdOverlay::new(view, self.src_ia, self.metadata.as_ref()));
+        }
+
+        Ok(self
+            .hbird
+            .as_mut()
+            .expect("the overlay was just created if it was missing"))
+    }
+
+    /// Attaches `reservation` to whichever of this path's hops it covers, matching by AS and
+    /// interface pair.
+    ///
+    /// Returns whether any hop matched.
+    ///
+    /// A hop's AS comes from the path's metadata. A path without metadata can therefore match
+    /// nothing; use [`add_reservation_at`](Self::add_reservation_at) for those.
+    pub fn try_add_reservation(
+        &mut self,
+        reservation: Reservation,
+    ) -> Result<bool, PathResolveError> {
+        Ok(self.overlay_mut()?.try_add_reservation(reservation))
+    }
+
+    /// Attaches `reservation` to the hop at flat index `hop_idx`, counting hops across all
+    /// segments in order, without matching it against that hop's interfaces.
+    ///
+    /// See also [`try_add_reservation`](Self::try_add_reservation).
+    pub fn add_reservation_at(
+        &mut self,
+        hop_idx: usize,
+        reservation: Reservation,
+    ) -> Result<(), PathResolveError> {
+        let overlay = self.overlay_mut()?;
+        match overlay.add_reservation_at(hop_idx, reservation) {
+            true => Ok(()),
+            false => {
+                Err(PathResolveError::HopIndexOutOfRange {
+                    index: hop_idx,
+                    hop_count: overlay.hops.len(),
+                })
+            }
+        }
+    }
+
+    /// Drops every attached reservation whose validity window has passed by `now`.
+    pub fn remove_expired_reservations(&mut self, now: SystemTime) {
+        if let Some(overlay) = self.hbird.as_mut() {
+            overlay.remove_expired_reservations(now);
+        }
+    }
+
+    /// Attaches or replaces the reservation tracker that decides which of a hop's reservations
+    /// each packet uses.
+    ///
+    /// The same tracker can be attached to multiple paths, e.g., to monitor the usage
+    /// of a reservation by multiple paths against the same bandwidth allowance.
+    pub fn set_tracker(
+        &mut self,
+        tracker: Arc<dyn ReservationTracker>,
+    ) -> Result<(), PathResolveError> {
+        self.overlay_mut()?.tracker = Some(tracker);
+        Ok(())
+    }
+
+    /// The Hummingbird overlay attached to this path, if one has been created.
+    ///
+    /// An overlay appears the first time a reservation or a tracker is attached; before that
+    /// this is `None`.
+    pub fn hbird_overlay(&self) -> Option<&HbirdOverlay> {
+        self.hbird.as_ref()
+    }
+
+    /// Whether any hop of this path carries a reservation.
+    ///
+    /// `false` means every send over this path is a plain copy of the standard path's bytes.
+    pub fn has_reservations(&self) -> bool {
+        self.hbird
+            .as_ref()
+            .is_some_and(HbirdOverlay::has_reservations)
     }
 }
 // accessors

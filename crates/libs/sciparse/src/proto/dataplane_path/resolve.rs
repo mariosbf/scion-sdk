@@ -93,6 +93,18 @@ pub enum PathResolveError {
     /// The resulting packet would be longer than the length field can express.
     #[error("packet length {0} exceeds the maximum encodeable value")]
     PacketTooLong(usize),
+    /// This path cannot carry flyover reservations, because reservations are layered over a
+    /// *standard* path and this path's dataplane path is not one.
+    #[error("flyover reservations are only supported on standard paths")]
+    ReservationsUnsupported,
+    /// The hop index named no hop on this path.
+    #[error("hop index {index} is out of range for a path with {hop_count} hops")]
+    HopIndexOutOfRange {
+        /// The index that was asked for.
+        index: usize,
+        /// The number of hops the path actually has.
+        hop_count: usize,
+    },
 }
 
 impl<'a> ResolvedPath<'a> {
