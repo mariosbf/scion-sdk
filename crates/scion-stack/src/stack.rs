@@ -168,6 +168,7 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use sciparse::{
     address::ip_socket_addr::ScionSocketIpAddr,
+    dataplane_path::resolve::PathResolveError,
     identifier::{isd::Isd, isd_asn::IsdAsn},
     packet::view::ScionRawPacketView,
 };
@@ -705,6 +706,38 @@ pub enum ScionSocketSendError {
     /// Error return when send is called on a socket that is not connected.
     #[error("socket is not connected")]
     NotConnected,
+    /// The packet would be longer than a SCION packet's length field can express.
+    #[error("packet length {0} exceeds the maximum encodeable value")]
+    PacketTooLong(usize),
+    /// No reservation on the path was still valid, and the tracker is strict.
+    ///
+    /// Renew the reservation, or wrap the tracker in
+    /// [`Lenient`](sciparse::hummingbird::tracker::Lenient) to fall back to best effort.
+    #[error("no reservation was valid at send time")]
+    ReservationExpired,
+    /// No reservation on the path had bandwidth left for this packet, and the tracker is strict.
+    ///
+    /// Distinct from [`ReservationExpired`](Self::ReservationExpired) because the remedy differs:
+    /// wait, send less, or obtain a larger reservation.
+    #[error("no reservation had bandwidth remaining")]
+    BandwidthExceeded,
+}
+
+impl From<PathResolveError> for ScionSocketSendError {
+    /// Carries the reservation failures across as themselves.
+    ///
+    /// A caller's decision — back off, renew, or buy more bandwidth — hangs on telling them apart,
+    /// and none of that survives being formatted into a string. The remaining variants describe a
+    /// path that was mis-assembled before any send, so they arrive here only as a programming
+    /// error and keep the generic form.
+    fn from(error: PathResolveError) -> Self {
+        match error {
+            PathResolveError::PacketTooLong(len) => Self::PacketTooLong(len),
+            PathResolveError::ReservationExpired => Self::ReservationExpired,
+            PathResolveError::BandwidthExceeded => Self::BandwidthExceeded,
+            other => Self::InvalidPacket(format!("could not resolve the path: {other}").into()),
+        }
+    }
 }
 
 /// SCION socket receive errors.

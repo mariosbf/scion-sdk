@@ -123,20 +123,28 @@ impl PathUnawareUdpScionSocket {
         destination: ScionSocketAddr,
         path: &ScionPath,
     ) -> Result<(), ScionSocketSendError> {
-        // TODO: Should look into a way to encode without cloning payload and parsing dp_path
-        let packet = ScionUdpPacket::new(
+        // Resolution happens per packet, because a Hummingbird path's bytes depend on this
+        // packet's destination, length and send time. For every other path type it is the same
+        // borrow of the same bytes the path already holds.
+        let packet = ScionUdpPacket::build(
             self.local_addr.into(),
             destination,
-            path.dp_path().to_model(),
+            path,
             payload.to_vec(),
-        )
-        .try_encode_to_owned_view()
+            SystemTime::now(),
+        )?
+        .try_encode_to_raw()
         .map_err(|e| {
             ScionSocketSendError::InvalidPacket(format!("error encoding packet: {e}").into())
-        })?
-        .into_raw();
+        })?;
 
-        self.inner.send(&packet).await
+        // The underlay takes a view rather than bytes. Borrowing one back is cheaper than the
+        // owned view this used to build, which allocated a second time.
+        let (packet, _rest) = ScionRawPacketView::try_from_slice(&packet).map_err(|e| {
+            ScionSocketSendError::InvalidPacket(format!("error encoding packet: {e}").into())
+        })?;
+
+        self.inner.send(packet).await
     }
 
     /// Receive a SCION packet with the sender and path.
@@ -1152,6 +1160,251 @@ mod cancel_safety_tests {
             &buf[..len],
             payload,
             "buffer must contain the real payload after Ok return"
+        );
+    }
+}
+
+#[cfg(test)]
+mod send_path_tests {
+    //! Unit tests for the UDP send path, which resolves the path per packet.
+    //!
+    //! The underlay is a double that keeps what it was asked to send instead of writing it
+    //! anywhere, because what these tests check is the bytes the socket produced. The simulated
+    //! router in `pocketscion` deliberately drops Hummingbird packets — it has no reservation keys
+    //! and forwarding without verifying them would let tests pass against a router that never
+    //! checks the reservations they exercise — so an end-to-end delivery test is not available
+    //! here. Delivery is covered against real border routers instead.
+
+    use std::{
+        net::Ipv4Addr,
+        sync::{Arc, Mutex},
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    use async_trait::async_trait;
+    use sciparse::{
+        core::view::View,
+        dataplane_path::{
+            hbird::view::HbirdHopFieldView, types::PathType, view::ScionDpPathViewRef,
+        },
+        hummingbird::{
+            Bandwidth, Reservation, ReservationInfo, token_bucket_tracker::TokenBucketTracker,
+        },
+        identifier::{asn::Asn, isd::Isd, isd_asn::IsdAsn},
+        util::test_builder::{TestPathBuilder, TestPathContext},
+    };
+
+    use super::*;
+    use crate::stack::{BoundUnderlaySocket, ScionSocketSendError, UnderlaySocket};
+
+    /// The socket stamps every packet with `SystemTime::now()`, so a test's path and reservations
+    /// have to be anchored to the real clock rather than to a fixed instant.
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs()
+    }
+
+    /// What the underlay was asked to send, shared with the test that owns the socket.
+    #[derive(Clone, Default)]
+    struct SentPackets(Arc<Mutex<Vec<Vec<u8>>>>);
+
+    impl SentPackets {
+        fn len(&self) -> usize {
+            self.0
+                .lock()
+                .expect("no test panics while holding this")
+                .len()
+        }
+
+        /// The one packet the socket emitted.
+        fn only(&self) -> Vec<u8> {
+            let sent = self.0.lock().expect("no test panics while holding this");
+            assert_eq!(sent.len(), 1, "expected exactly one packet");
+            sent[0].clone()
+        }
+    }
+
+    /// An underlay that keeps every packet handed to it instead of writing it anywhere.
+    struct CapturingUnderlaySocket(SentPackets);
+
+    #[async_trait]
+    impl UnderlaySocket for CapturingUnderlaySocket {
+        fn try_send(&self, packet: &ScionRawPacketView) -> Result<(), ScionSocketSendError> {
+            self.0
+                .0
+                .lock()
+                .expect("no test panics while holding this")
+                .push(packet.as_slice().to_vec());
+            Ok(())
+        }
+
+        async fn writeable(&self) {}
+
+        fn try_recv(&self, _buf: &mut [u8]) -> Result<usize, ScionSocketReceiveError> {
+            unreachable!("these tests never receive")
+        }
+
+        async fn readable(&self) {}
+    }
+
+    fn ia(asn: u64) -> IsdAsn {
+        IsdAsn::new(Isd::new(1), Asn::new(0xff00_0000_0000 | asn))
+    }
+
+    fn local_addr() -> ScionSocketIpAddr {
+        ScionSocketIpAddr::new(ia(0x110), Ipv4Addr::LOCALHOST.into(), 8080)
+    }
+
+    fn remote_addr() -> ScionSocketIpAddr {
+        ScionSocketIpAddr::new(ia(0x112), Ipv4Addr::new(127, 0, 0, 2).into(), 9090)
+    }
+
+    /// A two-hop path whose first hop enters on interface 0 and leaves on interface 1.
+    fn test_path() -> TestPathContext {
+        let now = now_secs() as u32;
+        TestPathBuilder::new(local_addr().scion_addr(), remote_addr().scion_addr())
+            .using_info_timestamp(now)
+            .up()
+            .add_hop(0, 1)
+            .add_hop(1, 0)
+            .build(now)
+    }
+
+    /// A reservation for the path's first hop, opened `age` seconds ago and running for
+    /// `duration` from then.
+    fn reservation(bytes_per_sec: u64, age: u64, duration: u16) -> Reservation {
+        Reservation::new(
+            ReservationInfo {
+                isd_as: ia(0x110),
+                ingress_interface: 0,
+                egress_interface: 1,
+                res_id: 0x1234,
+                bandwidth: Bandwidth::from_bytes_per_sec(bytes_per_sec).expect("representable"),
+                start: UNIX_EPOCH + Duration::from_secs(now_secs() - age),
+                duration,
+            },
+            [0x11; 16],
+        )
+    }
+
+    /// A reservation with room to spare, so a test that is not about bandwidth is not about
+    /// bandwidth by accident.
+    fn ample_reservation() -> Reservation {
+        reservation(1 << 20, 10, 3600)
+    }
+
+    fn socket() -> (PathUnawareUdpScionSocket, SentPackets) {
+        let sent = SentPackets::default();
+        let socket = PathUnawareUdpScionSocket::new(
+            BoundUnderlaySocket {
+                socket: Box::new(CapturingUnderlaySocket(sent.clone())),
+                local_addr: local_addr(),
+                snap_data_plane: None,
+            },
+            Vec::new(),
+        );
+        (socket, sent)
+    }
+
+    fn flyover_count(packet: &[u8]) -> usize {
+        let (view, _rest): (&ScionRawPacketView, _) =
+            ScionRawPacketView::try_from_slice(packet).expect("parses as a SCION packet");
+        assert_eq!(view.header().path_type(), PathType::Hummingbird);
+
+        let ScionDpPathViewRef::Hummingbird(path) = view.header().path() else {
+            panic!("a Hummingbird path type must carry a Hummingbird path");
+        };
+        path.hop_fields()
+            .filter(HbirdHopFieldView::is_flyover)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_send_over_a_path_with_reservations_emits_a_hummingbird_packet() {
+        // The proof that the socket is on the resolution seam. Without it every other test could
+        // pass while the socket still encoded a plain standard path.
+        let (socket, sent) = socket();
+        let mut path = test_path().path();
+        path.try_add_reservation(ample_reservation())
+            .expect("standard path");
+
+        socket
+            .send_to_via(b"hello", remote_addr(), &path)
+            .await
+            .expect("sends");
+
+        assert_eq!(flyover_count(&sent.only()), 1);
+    }
+
+    #[tokio::test]
+    async fn a_send_over_a_path_without_reservations_carries_the_path_unchanged() {
+        // Resolution takes the static arm, so this is the same memcpy the socket did before, and
+        // an ordinary path pays nothing for Hummingbird existing.
+        let (socket, sent) = socket();
+        let path = test_path().path();
+
+        socket
+            .send_to_via(b"hello", remote_addr(), &path)
+            .await
+            .expect("sends");
+
+        let packet = sent.only();
+        let (view, _rest): (&ScionRawPacketView, _) =
+            ScionRawPacketView::try_from_slice(&packet).expect("parses as a SCION packet");
+
+        assert_eq!(view.header().path_type(), PathType::Scion);
+        assert_eq!(view.header().path().as_slice(), path.dp_path().as_slice());
+    }
+
+    #[tokio::test]
+    async fn a_send_over_an_expired_reservation_says_so_rather_than_blaming_the_packet() {
+        // The caller's next move — renew, back off, or buy more bandwidth — hangs on this
+        // distinction, and none of it survives being formatted into a string.
+        let (socket, sent) = socket();
+        let mut path = test_path().path();
+        // Opened an hour ago and good for one second.
+        path.try_add_reservation(reservation(1 << 20, 3600, 1))
+            .expect("standard path");
+        path.set_tracker(Arc::new(TokenBucketTracker::new()))
+            .expect("standard path");
+
+        let error = socket
+            .send_to_via(b"hello", remote_addr(), &path)
+            .await
+            .expect_err("the reservation's window closed long ago");
+
+        assert!(
+            matches!(error, ScionSocketSendError::ReservationExpired),
+            "expected ReservationExpired, got {error:?}"
+        );
+        assert_eq!(
+            sent.len(),
+            0,
+            "a refused packet must not reach the underlay"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_send_over_an_exhausted_reservation_reports_bandwidth_not_a_malformed_packet() {
+        // The other typed failure. One byte per second cannot carry a packet of any size, so the
+        // bucket is empty however long the reservation has been open.
+        let (socket, _sent) = socket();
+        let mut path = test_path().path();
+        path.try_add_reservation(reservation(1, 10, 3600))
+            .expect("standard path");
+        path.set_tracker(Arc::new(TokenBucketTracker::new()))
+            .expect("standard path");
+
+        let error = socket
+            .send_to_via(b"hello", remote_addr(), &path)
+            .await
+            .expect_err("one byte per second carries nothing");
+
+        assert!(
+            matches!(error, ScionSocketSendError::BandwidthExceeded),
+            "expected BandwidthExceeded, got {error:?}"
         );
     }
 }
