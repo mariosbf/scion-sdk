@@ -807,7 +807,6 @@ impl HopField {
         pkt_len: u16,
     ) -> Result<(HopFieldMac, u16), HbirdEncodeError> {
         let res_start_offset = reservation
-            .info()
             .res_start_offset(meta.base_timestamp)
             .ok_or(HbirdEncodeError::ReservationNotValid)?;
 

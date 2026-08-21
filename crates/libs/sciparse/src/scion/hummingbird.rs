@@ -248,6 +248,12 @@ pub struct Reservation {
     /// End of the validity window, precomputed from `info`. Inclusive.
     valid_until: SystemTime,
 
+    /// The start time as the Unix timestamp the wire format carries, precomputed from `info`.
+    ///
+    /// `None` when the start lies outside what a `u32` second count can express, exactly as
+    /// [`ReservationInfo::encode_start`] reports.
+    encode_start: Option<u32>,
+
     /// AES key schedule for `auth_key`, expanded lazily on first MAC computation and reused for
     /// the lifetime of the reservation.
     ///
@@ -272,6 +278,7 @@ impl Reservation {
         Self {
             valid_from: info.start,
             valid_until: info.end(),
+            encode_start: info.encode_start(),
             info,
             auth_key,
             cipher: Arc::new(OnceLock::new()),
@@ -295,6 +302,15 @@ impl Reservation {
     /// a packet, so it answers from the window cached at construction rather than recomputing it.
     pub fn is_valid_at(&self, now: SystemTime) -> bool {
         self.valid_from <= now && now <= self.valid_until
+    }
+
+    /// Computes `ResStartOffset` for a packet whose meta header carries `base_timestamp`.
+    ///
+    /// As [`ReservationInfo::res_start_offset`], but answering from the start timestamp cached at
+    /// construction. Turning a `SystemTime` into a Unix second count is not free, and this is asked
+    /// once per flyover on every packet for a value that cannot change.
+    pub fn res_start_offset(&self, base_timestamp: u32) -> Option<u16> {
+        u16::try_from(base_timestamp.checked_sub(self.encode_start?)?).ok()
     }
 
     /// Whether the reservation's validity window has passed.
