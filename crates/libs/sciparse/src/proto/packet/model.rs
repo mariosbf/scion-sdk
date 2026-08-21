@@ -333,6 +333,41 @@ impl ScionScmpPacket {
         }
     }
 
+    /// Builds an SCMP packet whose path has been resolved for exactly this packet.
+    #[inline]
+    pub fn build(
+        src: ScionAddr,
+        dst: ScionAddr,
+        path: &ScionPath,
+        payload: ScmpMessage,
+        now: SystemTime,
+    ) -> Result<ResolvedScmpPacket<'_>, PathResolveError> {
+        let address = AddressHeader::new(src, dst);
+
+        let exterior_len = CommonHeaderLayout::SIZE_BYTES + address.required_size();
+        let payload_size = payload.required_size(exterior_len);
+
+        let frame = PacketFrame::new(
+            &address,
+            u16::try_from(payload_size)
+                .map_err(|_| PathResolveError::PacketTooLong(exterior_len + payload_size))?,
+            now,
+        );
+
+        Ok(ResolvedScmpPacket {
+            header: ScionPacketHeader {
+                common: CommonHeader {
+                    traffic_class: 0,
+                    flow_id: 0,
+                    next_header: ProtocolNumber::Scmp,
+                },
+                address,
+                path: path.resolve(frame)?,
+            },
+            payload,
+        })
+    }
+
     /// Attempts to construct a `ScionScmpPacket` from a `ScionRawPacket` by parsing the payload as
     /// a SCMP message.
     ///
@@ -639,7 +674,7 @@ pub mod ptest {
     }
 }
 
-/// A UDP packet whose path has been resolved for this packet, ready to encode.
+/// A packet whose path has been resolved for this packet, ready to encode.
 ///
 /// This is the only packet form that can carry a [`ResolvedPath`], and a `ResolvedPath` is the
 /// only path form an encoder accepts. Together those two facts mean a path can never reach the
@@ -648,16 +683,22 @@ pub mod ptest {
 /// the call that fills it.
 ///
 /// It borrows the path it resolved, so it is short-lived by construction: build it, encode it,
-/// drop it. Build a [`ScionUdpPacket`] instead when a packet needs to outlive its path.
+/// drop it. Build a [`ScionPacket`] instead when a packet needs to outlive its path.
 #[derive(Debug)]
-pub struct ResolvedUdpPacket<'a> {
+pub struct ResolvedPacket<'a, T: PayloadEncode> {
     /// SCION packet header, holding the resolved path.
     pub header: ScionPacketHeader<ResolvedPath<'a>>,
-    /// UDP payload.
-    pub payload: UdpDatagram,
+    /// Payload.
+    pub payload: T,
 }
 
-impl ResolvedUdpPacket<'_> {
+/// A UDP packet whose path has been resolved for one packet. See [`ResolvedPacket`].
+pub type ResolvedUdpPacket<'a> = ResolvedPacket<'a, UdpDatagram>;
+
+/// An SCMP packet whose path has been resolved for one packet. See [`ResolvedPacket`].
+pub type ResolvedScmpPacket<'a> = ResolvedPacket<'a, ScmpMessage>;
+
+impl<T: PayloadEncode> ResolvedPacket<'_, T> {
     /// Encodes the packet into a freshly allocated raw packet.
     #[inline]
     pub fn try_encode_to_raw(&self) -> Result<Vec<u8>, EncodeError> {
@@ -667,7 +708,7 @@ impl ResolvedUdpPacket<'_> {
     }
 }
 
-impl WireEncode for ResolvedUdpPacket<'_> {
+impl<T: PayloadEncode> WireEncode for ResolvedPacket<'_, T> {
     #[inline]
     fn required_size(&self) -> usize {
         let header_size = self.header.required_size();

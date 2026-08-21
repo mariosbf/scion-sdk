@@ -177,6 +177,12 @@ impl PathUnawareUdpScionSocket {
                             continue;
                         };
 
+                        // Not routed through `build`, and deliberately so: a handler replies over
+                        // the received path reversed, and reversing drops any Hummingbird overlay
+                        // — reservations are directional, so the return path has none of its own.
+                        // The reply is therefore always a standard path, whose bytes are already
+                        // final; resolving it would produce the same encoding by a longer route.
+
                         let reply = match reply.try_encode_to_owned_view() {
                             Ok(reply) => reply,
                             Err(e) => {
@@ -271,6 +277,12 @@ impl PathUnawareUdpScionSocket {
                             continue;
                         };
 
+                        // Not routed through `build`, and deliberately so: a handler replies over
+                        // the received path reversed, and reversing drops any Hummingbird overlay
+                        // — reservations are directional, so the return path has none of its own.
+                        // The reply is therefore always a standard path, whose bytes are already
+                        // final; resolving it would produce the same encoding by a longer route.
+
                         let reply = match reply.try_encode_to_owned_view() {
                             Ok(reply) => reply,
                             Err(e) => {
@@ -364,18 +376,25 @@ impl ScmpScionSocket {
         destination: ScionAddr,
         path: &ScionPath,
     ) -> Result<(), ScionSocketSendError> {
-        let packet = ScionScmpPacket::new(
+        // Resolution happens per packet, as it does for UDP: an SCMP message may be sent over a
+        // path carrying flyover reservations just as a datagram may.
+        let packet = ScionScmpPacket::build(
             self.local_addr.scion_ip_addr().into(),
             destination,
-            path.dp_path().to_model(),
+            path,
             message,
-        )
-        .try_encode_to_owned_view()
+            SystemTime::now(),
+        )?
+        .try_encode_to_raw()
         .map_err(|e| {
             ScionSocketSendError::InvalidPacket(format!("error encoding packet: {e}").into())
-        })?
-        .into_raw();
-        self.inner.send(&packet).await
+        })?;
+
+        let (packet, _rest) = ScionRawPacketView::try_from_slice(&packet).map_err(|e| {
+            ScionSocketSendError::InvalidPacket(format!("error encoding packet: {e}").into())
+        })?;
+
+        self.inner.send(packet).await
     }
 
     /// Receive a SCMP message with the sender and path.
@@ -1191,6 +1210,7 @@ mod send_path_tests {
             Bandwidth, Reservation, ReservationInfo, token_bucket_tracker::TokenBucketTracker,
         },
         identifier::{asn::Asn, isd::Isd, isd_asn::IsdAsn},
+        payload::scmp::model::ScmpEchoRequest,
         util::test_builder::{TestPathBuilder, TestPathContext},
     };
 
@@ -1356,6 +1376,67 @@ mod send_path_tests {
 
         assert_eq!(view.header().path_type(), PathType::Scion);
         assert_eq!(view.header().path().as_slice(), path.dp_path().as_slice());
+    }
+
+    fn scmp_socket() -> (ScmpScionSocket, SentPackets) {
+        let sent = SentPackets::default();
+        let socket = ScmpScionSocket::new(BoundUnderlaySocket {
+            socket: Box::new(CapturingUnderlaySocket(sent.clone())),
+            local_addr: local_addr(),
+            snap_data_plane: None,
+        });
+        (socket, sent)
+    }
+
+    #[tokio::test]
+    async fn an_scmp_send_over_a_path_with_reservations_emits_a_hummingbird_packet() {
+        // SCMP was the last place a stored dataplane path reached an encoder in the send
+        // direction, so an SCMP message over a reserved path used to go out best-effort while the
+        // identical UDP datagram went out with flyovers.
+        let (socket, sent) = scmp_socket();
+        let mut path = test_path().path();
+        path.try_add_reservation(ample_reservation())
+            .expect("standard path");
+
+        socket
+            .send_to_via(
+                ScmpMessage::EchoRequest(ScmpEchoRequest::new(1, 1, b"ping".to_vec())),
+                remote_addr().scion_addr(),
+                &path,
+            )
+            .await
+            .expect("sends");
+
+        assert_eq!(flyover_count(&sent.only()), 1);
+    }
+
+    #[tokio::test]
+    async fn an_scmp_send_reports_a_reservation_failure_as_itself() {
+        let (socket, sent) = scmp_socket();
+        let mut path = test_path().path();
+        path.try_add_reservation(reservation(1 << 20, 3600, 1))
+            .expect("standard path");
+        path.set_tracker(Arc::new(TokenBucketTracker::new()))
+            .expect("standard path");
+
+        let error = socket
+            .send_to_via(
+                ScmpMessage::EchoRequest(ScmpEchoRequest::new(1, 1, b"ping".to_vec())),
+                remote_addr().scion_addr(),
+                &path,
+            )
+            .await
+            .expect_err("the reservation's window closed long ago");
+
+        assert!(
+            matches!(error, ScionSocketSendError::ReservationExpired),
+            "expected ReservationExpired, got {error:?}"
+        );
+        assert_eq!(
+            sent.len(),
+            0,
+            "a refused packet must not reach the underlay"
+        );
     }
 
     #[tokio::test]

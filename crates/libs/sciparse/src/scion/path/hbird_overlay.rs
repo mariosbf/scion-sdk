@@ -2091,6 +2091,23 @@ mod tests {
     }
 
     #[test]
+    fn a_reversed_hummingbird_path_resolves_as_a_standard_path() {
+        // What an SCMP handler replies over. Reservations are directional, so the return path has
+        // none of its own, and reversal drops the overlay — leaving a standard path whose bytes
+        // are already final. This is why the reply handlers need no resolution: `Static` is not an
+        // oversight there, it is the only outcome available.
+        let mut path = received_hbird_path();
+        path.try_reverse().expect("a Hummingbird path reverses");
+
+        assert!(matches!(path.dp_path(), ScionDpPathView::Standard(_)));
+        assert!(!path.has_reservations());
+        assert!(matches!(
+            path.resolve(test_frame()).expect("resolves"),
+            ResolvedPath::Static(_)
+        ));
+    }
+
+    #[test]
     fn reversing_a_path_drops_its_reservations() {
         // Flyover reservations are directional: the reverse path traverses the same ASes by
         // different interfaces, so keeping them would mint MACs no router accepts.
