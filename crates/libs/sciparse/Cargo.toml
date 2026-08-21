@@ -47,5 +47,9 @@ sciparse = { path = ".", features = ["fuzz"] }
 name = "bench"
 harness = false
 
+[[bench]]
+name = "hummingbird_resolve"
+harness = false
+
 [lints]
 workspace = true
