@@ -1460,6 +1460,54 @@ mod tests {
     }
 
     #[test]
+    fn reservable_hops_names_every_hop_that_can_carry_a_flyover() {
+        // One segment, no crossover: every hop is its own AS's and can be reserved.
+        assert_eq!(
+            one_segment_path().reservable_hops().expect("standard path"),
+            vec![
+                (0, ia(0x110), 0, 1),
+                (1, ia(0x111), 2, 3),
+                (2, ia(0x112), 4, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn reservable_hops_skips_the_far_side_of_an_ordinary_crossover() {
+        // `1-ff00:0:111` terminates the first segment and starts the second, so it owns two hop
+        // fields. Only the earlier one can carry the flyover; the far side must not be offered,
+        // or a caller would buy the same AS twice and attach the second to a hop that cannot
+        // hold it.
+        let hops = two_segment_path().reservable_hops().expect("standard path");
+
+        assert_eq!(
+            hops,
+            vec![
+                (0, ia(0x110), 0, 1),
+                (1, ia(0x111), 2, 3),
+                (3, ia(0x112), 4, 0),
+            ]
+        );
+        assert!(
+            !hops.iter().any(|(idx, ..)| *idx == 2),
+            "hop 2 is the far side of the crossover"
+        );
+    }
+
+    #[test]
+    fn reservable_hops_does_not_attach_an_overlay() {
+        // Asking must not change what the path is: a plain path that is asked stays plain, so
+        // every send over it remains a memcpy of the standard path's bytes.
+        let path = one_segment_path();
+        assert!(path.hbird_overlay().is_none());
+
+        let _ = path.reservable_hops();
+
+        assert!(path.hbird_overlay().is_none());
+        assert!(!path.has_reservations());
+    }
+
+    #[test]
     fn a_clone_shares_the_duplicate_detection_counter() {
         // A clone is a second handle on one path, not a second path. If it copied the counter's
         // value instead of sharing it, both handles would go on to emit the same sequence -- two

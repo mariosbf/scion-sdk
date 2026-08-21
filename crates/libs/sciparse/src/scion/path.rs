@@ -18,7 +18,10 @@
 //! They contain the encoded dataplane path and optional metadata about the path, such as expiration
 //! time, MTU, and interfaces used by the path.
 
-use std::{collections::HashMap, fmt::Display, net::SocketAddr, sync::Arc, time::SystemTime};
+use std::{
+    borrow::Cow, collections::HashMap, fmt::Display, net::SocketAddr, sync::Arc,
+    time::SystemTime,
+};
 
 use prost_types::Timestamp;
 use scion_protobuf::daemon::v1 as rpc;
@@ -362,6 +365,42 @@ impl ScionPath {
     ) -> Result<(), PathResolveError> {
         self.overlay_mut()?.set_tracker(tracker);
         Ok(())
+    }
+
+    /// The hops of this path that could carry a flyover reservation, each with the AS that owns
+    /// it and the interfaces it is entered and left by.
+    ///
+    /// The tuple is `(hop_index, isd_asn, ingress, egress)`, where `hop_index` counts hops across
+    /// all segments in order — the same index [`add_reservation_at`](Self::add_reservation_at)
+    /// takes. Use it to ask each AS on a path for a reservation before attaching the results.
+    ///
+    /// Answers without disturbing the path: an overlay is built and discarded rather than
+    /// attached, so a path that carries no reservations still carries none afterwards.
+    ///
+    /// Returns `None` if this path cannot carry reservations at all — its dataplane path is not a
+    /// standard one. A hop whose AS the path's metadata does not identify is skipped, since there
+    /// is nobody to ask; a path with no metadata therefore yields an empty vector.
+    pub fn reservable_hops(&self) -> Option<Vec<(u8, IsdAsn, u16, u16)>> {
+        let ScionDpPathView::Standard(view) = &self.dp_path else {
+            return None;
+        };
+
+        let overlay = match self.hbird.as_ref() {
+            Some(overlay) => Cow::Borrowed(overlay),
+            None => Cow::Owned(HbirdOverlay::new(view, self.src_ia, self.metadata.as_ref())),
+        };
+
+        Some(
+            overlay
+                .hops()
+                .iter()
+                .enumerate()
+                .filter(|(_, hop)| hop.is_reservable())
+                .filter_map(|(idx, hop)| {
+                    Some((u8::try_from(idx).ok()?, hop.isd_asn()?, hop.ingress(), hop.egress()))
+                })
+                .collect(),
+        )
     }
 
     /// The Hummingbird overlay attached to this path, if one has been created.
