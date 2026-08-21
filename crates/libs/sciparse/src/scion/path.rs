@@ -248,7 +248,19 @@ impl ScionPath {
     /// only to check that the resulting packet is short enough to encode.
     #[inline]
     pub fn resolve(&self, frame: PacketFrame) -> Result<ResolvedPath<'_>, PathResolveError> {
-        ResolvedPath::resolve_static(self.dp_path.as_ref(), frame)
+        match self.hbird.as_ref() {
+            // An overlay only ever exists over a standard path, so it knows the hops it is layered
+            // on. One carrying no reservations takes the static arm and stays a plain memcpy,
+            // which is what makes attaching a tracker at path-handout time free.
+            Some(overlay) if overlay.has_reservations() => {
+                match overlay.resolve(frame)? {
+                    Some(resolved) => Ok(ResolvedPath::Hummingbird(resolved)),
+                    // No hop kept a flyover, so there is nothing Hummingbird to say.
+                    None => ResolvedPath::resolve_static(self.dp_path.as_ref(), frame),
+                }
+            }
+            _ => ResolvedPath::resolve_static(self.dp_path.as_ref(), frame),
+        }
     }
 
     /// Attempts to reverse the path by reversing the dataplane path and swapping the source and

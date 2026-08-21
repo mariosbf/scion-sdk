@@ -32,6 +32,7 @@ use std::time::SystemTime;
 use crate::{
     core::encode::{InvalidStructureError, WireEncode},
     dataplane_path::{
+        hbird::model::HbirdEncodeError,
         types::PathType,
         view::{ScionDpPathViewExt, ScionDpPathViewRef},
     },
@@ -39,7 +40,9 @@ use crate::{
         layout::CommonHeaderLayout,
         model::{AddressHeader, PacketPath},
     },
+    hummingbird::tracker::ReservationTrackerError,
     identifier::isd_asn::IsdAsn,
+    path::hbird_overlay::ResolvedHbirdPath,
 };
 
 /// What a dataplane path needs to know about the packet around it in order to encode itself.
@@ -77,7 +80,7 @@ impl PacketFrame {
 /// Only this type implements [`WireEncode`] among the path representations, which is what makes
 /// [`WireEncode::required_size`] safe to leave context-free: by the time an encoder can see a
 /// path, every per-packet decision has already been taken.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ResolvedPath<'a> {
     /// A path whose bytes are already final and are written out verbatim.
     ///
@@ -85,6 +88,10 @@ pub enum ResolvedPath<'a> {
     /// path that arrived in a received packet: its bytes are fixed and it is not something that
     /// gets sent onward without being reversed first.
     Static(ScionDpPathViewRef<'a>),
+
+    /// A standard path carrying flyover reservations, whose shape and MACs were fixed for this
+    /// one packet.
+    Hummingbird(ResolvedHbirdPath<'a>),
 }
 
 /// Why a path could not be resolved for a packet.
@@ -105,6 +112,32 @@ pub enum PathResolveError {
         /// The number of hops the path actually has.
         hop_count: usize,
     },
+    /// Every reservation on some hop was outside its validity window.
+    ///
+    /// The path itself is unharmed; renewing the reservation makes it sendable again. Wrap the
+    /// tracker in [`Lenient`](crate::hummingbird::tracker::Lenient) to send the packet without a
+    /// flyover on that hop instead of failing.
+    #[error("no reservation on one of the path's hops is still valid")]
+    ReservationExpired,
+    /// Some hop had valid reservations, but none with bandwidth left for this packet.
+    ///
+    /// Distinct from [`ReservationExpired`](Self::ReservationExpired) because the remedy is
+    /// different: wait, send less, or obtain a larger reservation.
+    #[error("no reservation on one of the path's hops has bandwidth left for this packet")]
+    BandwidthExceeded,
+    /// The path could not be laid out for this packet, or a selected reservation could not be
+    /// encoded against its timestamp.
+    #[error(transparent)]
+    Encode(#[from] HbirdEncodeError),
+}
+
+impl From<ReservationTrackerError> for PathResolveError {
+    fn from(error: ReservationTrackerError) -> Self {
+        match error {
+            ReservationTrackerError::ReservationExpired => Self::ReservationExpired,
+            ReservationTrackerError::BandwidthExceeded => Self::BandwidthExceeded,
+        }
+    }
 }
 
 impl<'a> ResolvedPath<'a> {
@@ -148,6 +181,8 @@ impl PacketPath for ResolvedPath<'_> {
                     ScionDpPathViewRef::Unsupported { path_type, .. } => *path_type,
                 }
             }
+            // The overlay's own path is standard; what goes on the wire is Hummingbird.
+            ResolvedPath::Hummingbird(_) => PathType::Hummingbird,
         }
     }
 }
@@ -157,6 +192,7 @@ impl WireEncode for ResolvedPath<'_> {
     fn required_size(&self) -> usize {
         match self {
             ResolvedPath::Static(view) => view.as_slice().len(),
+            ResolvedPath::Hummingbird(path) => path.encoded_len(),
         }
     }
 
@@ -165,6 +201,7 @@ impl WireEncode for ResolvedPath<'_> {
         match self {
             // The bytes came from a view, which cannot exist over an invalid encoding.
             ResolvedPath::Static(_) => Ok(()),
+            ResolvedPath::Hummingbird(path) => path.wire_valid(),
         }
     }
 
@@ -177,6 +214,8 @@ impl WireEncode for ResolvedPath<'_> {
                 unsafe { buf.get_unchecked_mut(..bytes.len()) }.copy_from_slice(bytes);
                 bytes.len()
             }
+            // SAFETY: the caller guarantees buf.len() >= required_size(), which is encoded_len()
+            ResolvedPath::Hummingbird(path) => unsafe { path.encode_unchecked(buf) },
         }
     }
 }

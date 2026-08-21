@@ -68,6 +68,18 @@ pub enum HbirdEncodeError {
         bytes: usize,
     },
 
+    /// A hop encoded as a standard hop field set the bit that Hummingbird reads as the flyover
+    /// discriminator.
+    ///
+    /// The bit is merely reserved in a standard SCION path, so such a path is well-formed; it just
+    /// cannot be carried by Hummingbird, where the field would be written as 12 bytes and read
+    /// back as a 20-byte one that swallows its successor.
+    #[error("hop {hop} is not a flyover but sets the flyover bit")]
+    FlyoverBitInStandardHopField {
+        /// Which of the path's hops, counting across all segments in order.
+        hop: usize,
+    },
+
     /// The current hop field landed past the 8-bit line offset the meta header can express, or at
     /// an offset that is not a whole number of lines.
     #[error("a current hop field at byte {bytes} cannot be addressed by the meta header")]

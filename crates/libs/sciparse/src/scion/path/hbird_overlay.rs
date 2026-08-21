@@ -24,25 +24,43 @@
 //! dataplane path is *standard*, and everything Hummingbird-specific lives here, so a path
 //! without an overlay pays nothing.
 
-use std::{sync::Arc, time::SystemTime};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
-    core::{convert::FromView, encode::WireEncode},
+    core::{
+        convert::FromView,
+        encode::{InvalidStructureError, WireEncode},
+    },
     dataplane_path::{
         hbird::{
             layout::FlyoverHopFieldLayout,
             model::{FlyoverHopField, HbirdEncodeError, HbirdHopField, HbirdMetaFields},
+            types::HbirdHopFieldFlags,
         },
+        resolve::{PacketFrame, PathResolveError},
         standard::{
             layout::HopFieldLayout,
             model::{HopField, InfoField},
+            types::HopFieldMac,
             view::StandardPathView,
         },
     },
-    hummingbird::{Reservation, tracker::ReservationTracker},
+    hummingbird::{
+        Reservation,
+        tracker::{PacketSession, ReservationTracker, ReservationTrackerError, Selected},
+    },
     identifier::isd_asn::IsdAsn,
     path::metadata::PathMetadata,
 };
+
+/// The 22-bit duplicate-detection counter wraps here, as it does on the wire.
+const COUNTER_MODULUS: u32 = 1 << 22;
 
 /// A precomputed encoding of the path header for the shape in which every hop that carries a
 /// reservation is a flyover hop field.
@@ -146,7 +164,6 @@ impl HbirdHop {
 /// Always an overlay on a *standard* path. A path parsed from a received Hummingbird packet never
 /// has one, because its bytes are already fixed and it is not something that gets sent onward
 /// without being reversed first.
-#[derive(Clone)]
 pub struct HbirdOverlay {
     /// The path's hops in encode order, each owning its own reservations. They are nested inside
     /// the hop rather than held in a parallel array, so they cannot desynchronise from it.
@@ -169,6 +186,13 @@ pub struct HbirdOverlay {
     /// Shared: one tracker may police several paths against one allowance.
     pub(crate) tracker: Option<Arc<dyn ReservationTracker>>,
 
+    /// Duplicate-detection counter, stamped into the meta header and covered by every flyover MAC.
+    ///
+    /// It is what separates two packets a router would otherwise see as identical: same path, same
+    /// length, same millisecond. Atomic because resolution takes `&self`, so one path may be sent
+    /// on from several threads at once.
+    pub(crate) counter: AtomicU32,
+
     /// The encoding of the all-flyover shape, rebuilt whenever the set of hops carrying
     /// reservations changes.
     ///
@@ -177,6 +201,22 @@ pub struct HbirdOverlay {
     /// bytes). Both need many flyovers on a long path, and neither rules the path out: resolution
     /// lays out the shape it actually selected, which is never wider.
     pub(crate) template: Option<Template>,
+}
+
+impl Clone for HbirdOverlay {
+    /// The clone continues the original's counter rather than restarting it, so a path that is
+    /// cloned and sent on does not immediately re-emit values the original already used.
+    fn clone(&self) -> Self {
+        Self {
+            hops: self.hops.clone(),
+            info_fields: self.info_fields.clone(),
+            current_info_field: self.current_info_field,
+            current_hop_field_index: self.current_hop_field_index,
+            tracker: self.tracker.clone(),
+            counter: AtomicU32::new(self.counter.load(Ordering::Relaxed)),
+            template: self.template.clone(),
+        }
+    }
 }
 
 impl std::fmt::Debug for HbirdOverlay {
@@ -189,6 +229,7 @@ impl std::fmt::Debug for HbirdOverlay {
             .field("current_info_field", &self.current_info_field)
             .field("current_hop_field_index", &self.current_hop_field_index)
             .field("tracker", &self.tracker.is_some())
+            .field("counter", &self.counter.load(Ordering::Relaxed))
             .field("template", &self.template)
             .finish()
     }
@@ -256,6 +297,7 @@ impl HbirdOverlay {
             current_info_field: view.curr_info_field_idx(),
             current_hop_field_index: view.curr_hop_field_idx() as usize,
             tracker: None,
+            counter: AtomicU32::new(0),
             template: None,
         };
         overlay.rebuild_template();
@@ -422,6 +464,158 @@ impl HbirdOverlay {
         Ok(meta.encoded_len())
     }
 
+    /// Fixes this path's shape, timing and MACs for one packet.
+    ///
+    /// **Selection and commit are one critical section.** A tracker that opens a
+    /// [`PacketSession`] holds its lock across both, so two threads cannot both pass a bandwidth
+    /// check before either deducts. The consequence is that a packet resolved and then dropped is
+    /// still accounted for: over-accounting only causes an early demotion, where under-accounting
+    /// would let the path over-send.
+    ///
+    /// The order of what follows is fixed by a circularity and must not be rearranged. Selection
+    /// is offered `max_pkt_len`, an upper bound, because the exact length depends on which hops
+    /// become flyovers — which is what selection decides. Only once the layout is applied to the
+    /// actual selection is the real length known, and it is never larger than the bound, so the
+    /// accounting stays conservative.
+    /// Returns `None` when no hop ended up with a flyover. Such a packet has nothing Hummingbird
+    /// to say, and saying it anyway would cost eight bytes of meta header and make every router on
+    /// the path parse a wider header to find no reservations — so the caller sends the underlying
+    /// standard path instead.
+    pub(crate) fn resolve(
+        &self,
+        frame: PacketFrame,
+    ) -> Result<Option<ResolvedHbirdPath<'_>>, PathResolveError> {
+        let max_pkt_len = frame.exterior_len as usize + self.max_encoded_len()?;
+        let mut session = self
+            .tracker
+            .as_ref()
+            .and_then(|t| t.begin_packet(frame.now));
+
+        let mut decisions: Vec<Option<HopDecision<'_>>> = Vec::with_capacity(self.hops.len());
+        for hop in &self.hops {
+            decisions.push(self.select(session.as_deref_mut(), hop, frame.now, max_pkt_len)?);
+        }
+
+        if decisions.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+
+        // A hop going out as a standard hop field must not set the bit Hummingbird reads as the
+        // flyover discriminator. Checked here rather than at encode time so the failure is a typed
+        // resolution error, before any buffer has been sized for it.
+        for (index, hop) in self.hops.iter().enumerate() {
+            if decisions[index].is_none()
+                && hop.hop_field.flags.bits() & HbirdHopFieldFlags::FLYOVER.bits() != 0
+            {
+                return Err(HbirdEncodeError::FlyoverBitInStandardHopField { hop: index }.into());
+            }
+        }
+
+        let mut meta = HbirdMetaFields {
+            current_info_field: self.current_info_field,
+            ..Default::default()
+        };
+        let encoded_len =
+            self.apply_header_layout(&mut meta, |index, _| decisions[index].is_some())?;
+
+        let packet_len = frame.exterior_len as usize + encoded_len;
+        if packet_len > u16::MAX as usize {
+            return Err(PathResolveError::PacketTooLong(packet_len));
+        }
+        self.stamp(&mut meta, frame.now);
+
+        // Every MAC is minted before any reservation is charged, so a packet that cannot be
+        // encoded costs nothing.
+        for (hop, decision) in self.hops.iter().zip(&mut decisions) {
+            if let Some(decision) = decision {
+                let (mac, res_start_offset) = hop.hop_field.aggregated_flyover_mac(
+                    meta,
+                    decision.selected.reservation,
+                    frame.dst_ia,
+                    packet_len as u16,
+                )?;
+                decision.mac = mac;
+                decision.res_start_offset = res_start_offset;
+            }
+        }
+
+        for decision in decisions.iter().flatten() {
+            match session.as_deref_mut() {
+                Some(session) => session.commit(&decision.selected, packet_len),
+                None => {
+                    if let Some(tracker) = self.tracker.as_ref() {
+                        tracker.commit(&decision.selected, packet_len);
+                    }
+                }
+            }
+        }
+
+        Ok(Some(ResolvedHbirdPath {
+            overlay: self,
+            decisions,
+            meta,
+            encoded_len,
+        }))
+    }
+
+    /// Chooses the reservation `hop` uses for this packet, if any.
+    ///
+    /// The MAC fields are filled in later, once the packet's exact length is known.
+    fn select<'a>(
+        &'a self,
+        session: Option<&mut (dyn PacketSession + '_)>,
+        hop: &'a HbirdHop,
+        now: SystemTime,
+        max_pkt_len: usize,
+    ) -> Result<Option<HopDecision<'a>>, PathResolveError> {
+        let selected = match (session, self.tracker.as_ref()) {
+            (Some(session), _) => session.select(&hop.reservations, now, max_pkt_len)?,
+            (None, Some(tracker)) => tracker.select(&hop.reservations, now, max_pkt_len)?,
+            // With no tracker there is no policy to consult, only validity: the first reservation
+            // still inside its window carries the hop, and none being valid is the same failure a
+            // tracker would report.
+            (None, None) => {
+                match hop.reservations.first() {
+                    None => None,
+                    Some(_) => {
+                        Some(Selected::untracked(
+                            hop.reservations
+                                .iter()
+                                .find(|reservation| reservation.is_valid_at(now))
+                                .ok_or(ReservationTrackerError::ReservationExpired)?,
+                        ))
+                    }
+                }
+            }
+        };
+
+        Ok(selected.map(|selected| {
+            HopDecision {
+                selected,
+                mac: HopFieldMac::zero(),
+                res_start_offset: 0,
+            }
+        }))
+    }
+
+    /// Writes this packet's send time and its duplicate-detection counter into `meta`.
+    fn stamp(&self, meta: &mut HbirdMetaFields, now: SystemTime) {
+        let since_epoch = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+
+        meta.base_timestamp = since_epoch.as_secs() as u32;
+        meta.millis_timestamp = since_epoch.subsec_millis() as u16;
+        meta.counter = self.counter.fetch_add(1, Ordering::Relaxed) % COUNTER_MODULUS;
+    }
+
+    /// The longest this path's header can encode to: every hop a flyover.
+    ///
+    /// Selection is offered this bound rather than the exact length, which is not knowable until
+    /// selection has answered. It is never smaller than what the packet turns out to be.
+    fn max_encoded_len(&self) -> Result<usize, HbirdEncodeError> {
+        let mut meta = HbirdMetaFields::default();
+        self.apply_header_layout(&mut meta, |_, _| true)
+    }
+
     /// Whether any hop carries a reservation.
     ///
     /// `false` means every send over this path is a plain copy of the standard path's bytes: no
@@ -429,6 +623,154 @@ impl HbirdOverlay {
     pub(crate) fn has_reservations(&self) -> bool {
         self.hops.iter().any(HbirdHop::has_reservation)
     }
+}
+
+/// One hop's outcome for one packet: which reservation carries it, and the two values that
+/// depend on both the reservation and the packet.
+#[derive(Debug, Clone, Copy)]
+struct HopDecision<'a> {
+    /// The reservation this packet uses for the hop, and the tracker's handle for it.
+    selected: Selected<'a>,
+    /// The standard MAC aggregated with the flyover MAC, ready to write.
+    mac: HopFieldMac,
+    /// Whole seconds from the reservation's start to this packet's base timestamp.
+    res_start_offset: u16,
+}
+
+/// A Hummingbird path whose shape — and therefore length — is fixed for one packet.
+///
+/// Holds the decisions resolution took rather than the bytes they imply, so encoding writes
+/// straight into the packet's own buffer and the template copy lands where the bytes belong
+/// instead of in an intermediate allocation.
+///
+/// Borrowing the overlay is what stops one resolution being reused for a second packet: it cannot
+/// outlive the path it came from, and the path cannot be mutated while it is alive.
+#[derive(Debug, Clone)]
+pub struct ResolvedHbirdPath<'a> {
+    overlay: &'a HbirdOverlay,
+
+    /// Per hop in encode order, `None` for a hop encoded as a plain standard hop field.
+    decisions: Vec<Option<HopDecision<'a>>>,
+
+    /// This packet's meta header, with layout and timing fields both final.
+    meta: HbirdMetaFields,
+
+    /// The encoded length of this path, frozen here so [`WireEncode::required_size`] cannot
+    /// answer differently on two calls.
+    encoded_len: usize,
+}
+
+impl ResolvedHbirdPath<'_> {
+    /// The encoded length of this path, fixed when it was resolved.
+    #[inline]
+    pub fn encoded_len(&self) -> usize {
+        self.encoded_len
+    }
+
+    /// Whether the template describes this packet's shape.
+    ///
+    /// The template encodes the shape in which *every* hop carrying a reservation is a flyover, so
+    /// it applies exactly when selection produced one for each of them. A hop can only be selected
+    /// if it has reservations, so counting decisions is enough: a hop that had reservations but
+    /// was declined leaves the count short, and the layout differs from that hop onward.
+    fn template(&self) -> Option<&Template> {
+        let template = self.overlay.template.as_ref()?;
+        let selected = self.decisions.iter().filter(|d| d.is_some()).count();
+        (selected == template.flyover_offsets.len()).then_some(template)
+    }
+
+    /// Always `Ok`: the layout, the packet length, every reservation and every hop field were
+    /// settled during resolution, which is the whole reason resolution exists.
+    pub(crate) fn wire_valid(&self) -> Result<(), InvalidStructureError> {
+        Ok(())
+    }
+
+    /// Writes this packet's path header into `buf`.
+    ///
+    /// # Safety
+    ///
+    /// `buf` must be at least [`encoded_len`](Self::encoded_len) bytes long.
+    pub(crate) unsafe fn encode_unchecked(&self, buf: &mut [u8]) -> usize {
+        // SAFETY: the caller guarantees the buffer is long enough for the whole header, and every
+        // write below stays inside the length the same layout produced.
+        unsafe {
+            match self.template() {
+                Some(template) => self.encode_from_template(template, buf),
+                None => self.encode_from_parts(buf),
+            }
+        }
+        self.encoded_len
+    }
+
+    /// Copies the precomputed header and overwrites only what this packet changes.
+    ///
+    /// # Safety
+    ///
+    /// As [`encode_unchecked`](Self::encode_unchecked).
+    unsafe fn encode_from_template(&self, template: &Template, buf: &mut [u8]) {
+        debug_assert_eq!(template.encoded.len(), self.encoded_len);
+
+        // SAFETY: the caller guarantees the buffer is long enough.
+        let buf = unsafe { buf.get_unchecked_mut(..self.encoded_len) };
+        buf.copy_from_slice(&template.encoded);
+
+        // The template's meta header carries the layout but no timing; this one carries both.
+        // SAFETY: the meta header is the first field of a header the buffer already holds.
+        unsafe { self.meta.encode_unchecked(buf) };
+
+        let decisions = self.decisions.iter().flatten();
+        for (&offset, decision) in template.flyover_offsets.iter().zip(decisions) {
+            let field = &mut buf[offset..offset + FlyoverHopFieldLayout::SIZE_BYTES];
+            patch_flyover(field.try_into().expect("one flyover hop field"), decision);
+        }
+    }
+
+    /// Builds the header field by field, for a packet whose shape the template does not describe.
+    ///
+    /// # Safety
+    ///
+    /// As [`encode_unchecked`](Self::encode_unchecked).
+    unsafe fn encode_from_parts(&self, buf: &mut [u8]) {
+        // SAFETY: every offset below comes from the same layout that produced `encoded_len`, which
+        // the caller guarantees the buffer covers.
+        unsafe {
+            let mut at = self.meta.encode_unchecked(buf);
+            for info_field in &self.overlay.info_fields {
+                at += info_field.encode_unchecked(buf.get_unchecked_mut(at..));
+            }
+
+            for (hop, decision) in self.overlay.hops.iter().zip(&self.decisions) {
+                match decision {
+                    Some(decision) => {
+                        let field: &mut [u8; FlyoverHopFieldLayout::SIZE_BYTES] = buf
+                            .get_unchecked_mut(at..at + FlyoverHopFieldLayout::SIZE_BYTES)
+                            .try_into()
+                            .expect("one flyover hop field");
+                        FlyoverHopField::encode_template(&hop.hop_field, &mut *field);
+                        patch_flyover(field, decision);
+                        at += FlyoverHopFieldLayout::SIZE_BYTES;
+                    }
+                    None => at += hop.hop_field.encode_unchecked(buf.get_unchecked_mut(at..)),
+                }
+            }
+
+            debug_assert_eq!(at, self.encoded_len, "the layout and the encoder disagree");
+        }
+    }
+}
+
+/// Writes the five fields of a flyover hop field that depend on the packet or on which reservation
+/// was chosen for it, over a buffer that already holds the rest.
+fn patch_flyover(field: &mut [u8; FlyoverHopFieldLayout::SIZE_BYTES], decision: &HopDecision<'_>) {
+    let info = decision.selected.reservation.info();
+    FlyoverHopField::patch_per_packet_fields(
+        field,
+        &decision.mac,
+        info.res_id,
+        info.bandwidth.encode(),
+        decision.res_start_offset,
+        info.duration,
+    );
 }
 
 /// The ASes a path traverses, in order, one entry per AS rather than per hop field.
@@ -470,16 +812,19 @@ mod tests {
                 model::{HbirdHopField, HbirdSegment, HummingbirdPath},
                 view::HbirdPathView,
             },
-            resolve::PathResolveError,
+            resolve::{PathResolveError, ResolvedPath},
             standard::{
                 layout::InfoFieldLayout,
                 model::{InfoField, Segment, StandardPath},
                 types::{HopFieldFlags, HopFieldMac, InfoFieldFlags},
             },
-            view::ScionDpPathView,
+            types::PathType,
+            view::{ScionDpPathView, ScionDpPathViewExt},
         },
+        header::model::PacketPath,
         hummingbird::{
             Bandwidth, Reservation, ReservationInfo, probabilistic_tracker::ProbabilisticTracker,
+            token_bucket_tracker::TokenBucketTracker, tracker::Lenient,
         },
         path::{
             ScionPath,
@@ -919,6 +1264,415 @@ mod tests {
             .expect("the shape fits");
         assert_eq!(meta.segment_lengths[0] as usize * 4, 508);
         assert_eq!(length, template_len(1, 508));
+    }
+
+    // --- Task 20: per-packet resolution ---------------------------------------------------------
+
+    /// A tracker that keeps no state but records how often a packet session was opened, so the
+    /// "no reservations costs nothing" guarantee is observable.
+    #[derive(Debug, Default)]
+    struct SessionCounter {
+        sessions: AtomicU32,
+    }
+
+    impl SessionCounter {
+        fn sessions_opened(&self) -> u32 {
+            self.sessions.load(Ordering::Relaxed)
+        }
+    }
+
+    impl ReservationTracker for SessionCounter {
+        fn begin_packet(&self, _now: SystemTime) -> Option<Box<dyn PacketSession + '_>> {
+            self.sessions.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+
+        fn select<'a>(
+            &self,
+            reservations: &'a [Reservation],
+            _now: SystemTime,
+            _max_pkt_len: usize,
+        ) -> Result<Option<Selected<'a>>, ReservationTrackerError> {
+            Ok(reservations.first().map(Selected::untracked))
+        }
+
+        fn commit(&self, _selected: &Selected<'_>, _pkt_len: usize) {}
+    }
+
+    fn at(offset: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(START + offset)
+    }
+
+    fn frame_at(dst_ia: IsdAsn, exterior_len: u16, now: SystemTime) -> PacketFrame {
+        PacketFrame {
+            dst_ia,
+            exterior_len,
+            now,
+        }
+    }
+
+    fn test_frame() -> PacketFrame {
+        frame_at(ia(0x112), 100, at(1))
+    }
+
+    /// A one-segment path with a reservation on its middle hop.
+    fn path_with_one_reservation() -> ScionPath {
+        let mut path = one_segment_path();
+        assert!(
+            path.try_add_reservation(reservation(ia(0x111), 2, 3, 600))
+                .expect("standard path")
+        );
+        path
+    }
+
+    fn encode_resolved(path: &ScionPath, frame: PacketFrame) -> Vec<u8> {
+        let resolved = path.resolve(frame).expect("resolves");
+        let mut buf = vec![0u8; resolved.required_size()];
+        let written = resolved.try_encode(&mut buf).expect("encodes");
+        assert_eq!(written, resolved.required_size(), "short write");
+        buf
+    }
+
+    fn flyover_count(encoded: &[u8]) -> usize {
+        let (view, rest): (&HbirdPathView, _) =
+            HbirdPathView::try_from_slice(encoded).expect("parses as Hummingbird");
+        assert!(rest.is_empty(), "trailing bytes");
+        view.hop_fields().filter(|hop| hop.is_flyover()).count()
+    }
+
+    #[test]
+    fn a_resolved_hummingbird_path_round_trips_through_the_wire() {
+        // The whole send side end to end: attach a reservation, resolve for a packet, encode,
+        // parse back, and find a flyover where the reservation was attached.
+        let path = path_with_one_reservation();
+        let encoded = encode_resolved(&path, test_frame());
+
+        assert_eq!(
+            PacketPath::path_type(&path.resolve(test_frame()).expect("resolves")),
+            PathType::Hummingbird
+        );
+        assert_eq!(flyover_count(&encoded), 1);
+    }
+
+    #[test]
+    fn a_path_without_reservations_resolves_to_its_own_bytes() {
+        // The overlay exists but carries nothing, so the packet is the standard path verbatim —
+        // no Hummingbird header, no MAC, no allocation.
+        let mut path = one_segment_path();
+        path.set_tracker(Arc::new(ProbabilisticTracker::new()))
+            .expect("standard path");
+
+        let resolved = path.resolve(test_frame()).expect("resolves");
+
+        assert_eq!(PacketPath::path_type(&resolved), PathType::Scion);
+        assert_eq!(
+            encode_resolved(&path, test_frame()),
+            path.dp_path().as_slice()
+        );
+    }
+
+    #[test]
+    fn a_path_without_reservations_never_opens_a_session() {
+        // What lets a tracker be attached when a path is handed out, before anyone knows whether
+        // it will carry reservations.
+        let counter = Arc::new(SessionCounter::default());
+        let mut path = one_segment_path();
+        path.set_tracker(counter.clone()).expect("standard path");
+
+        path.resolve(test_frame()).expect("resolves");
+        assert_eq!(counter.sessions_opened(), 0);
+
+        path.try_add_reservation(reservation(ia(0x111), 2, 3, 600))
+            .expect("standard path");
+        path.resolve(test_frame()).expect("resolves");
+        assert_eq!(counter.sessions_opened(), 1);
+    }
+
+    #[test]
+    fn the_template_and_the_full_encoder_agree_byte_for_byte() {
+        // A packet's validity must not depend on which encoder ran. Exercised across shapes,
+        // because the template only applies when every reserved hop was selected.
+        for reserved in [vec![0], vec![1, 2], vec![0, 1, 2, 3]] {
+            let mut path = two_segment_path();
+            for &hop_idx in &reserved {
+                path.add_reservation_at(hop_idx, reservation(ia(0x110), 0, 1, 600))
+                    .expect("standard path");
+            }
+
+            // Cloned before either resolution so both start from the same duplicate-detection
+            // counter; without that the two would legitimately differ.
+            let with_template = path.hbird_overlay().expect("overlay").clone();
+            let mut without_template = with_template.clone();
+            without_template.template = None;
+
+            let encode = |overlay: &HbirdOverlay| {
+                let resolved = overlay
+                    .resolve(test_frame())
+                    .expect("resolves")
+                    .expect("a hop was selected");
+                let mut buf = vec![0u8; resolved.encoded_len()];
+                unsafe { resolved.encode_unchecked(&mut buf) };
+                buf
+            };
+
+            assert_eq!(
+                encode(&with_template),
+                encode(&without_template),
+                "reservations on {reserved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_strict_tracker_reports_why_it_refused() {
+        // The typed variants are the point: a caller can tell "renew the reservation" from "buy
+        // more bandwidth" without parsing a message.
+        let mut path = one_segment_path();
+        path.try_add_reservation(reservation(ia(0x111), 2, 3, 600))
+            .expect("standard path");
+        path.set_tracker(Arc::new(TokenBucketTracker::new()))
+            .expect("standard path");
+
+        // Long after the reservation's window closed.
+        let frame = frame_at(ia(0x112), 100, at(10_000));
+
+        assert_eq!(
+            path.resolve(frame)
+                .expect_err("the reservation has expired"),
+            PathResolveError::ReservationExpired
+        );
+    }
+
+    #[test]
+    fn a_lenient_tracker_demotes_instead_of_failing() {
+        // Nothing degrades silently unless asked to: the same path and the same expired
+        // reservation succeed once the tracker is wrapped. With its only flyover gone the packet
+        // carries the underlying standard path, not an empty Hummingbird one.
+        let mut path = one_segment_path();
+        path.try_add_reservation(reservation(ia(0x111), 2, 3, 600))
+            .expect("standard path");
+        path.set_tracker(Arc::new(Lenient(TokenBucketTracker::new())))
+            .expect("standard path");
+
+        let frame = frame_at(ia(0x112), 100, at(10_000));
+
+        assert_eq!(
+            PacketPath::path_type(&path.resolve(frame).expect("demotes")),
+            PathType::Scion
+        );
+        assert_eq!(encode_resolved(&path, frame), path.dp_path().as_slice());
+    }
+
+    #[test]
+    fn required_size_is_stable_even_when_a_tracker_demotes() {
+        // `required_size` takes &self, receives no context and is called twice per encode; an
+        // answer that shrank in between is documented undefined behaviour. A demotion is the one
+        // case where the length genuinely could have changed, so this is the case the whole
+        // resolution seam exists for.
+        let mut path = one_segment_path();
+        path.try_add_reservation(reservation(ia(0x111), 2, 3, 600))
+            .expect("standard path");
+        path.set_tracker(Arc::new(Lenient(TokenBucketTracker::new())))
+            .expect("standard path");
+
+        let frame = frame_at(ia(0x112), 100, at(10_000));
+        let resolved = path
+            .resolve(frame)
+            .expect("Lenient demotes rather than failing");
+
+        let first = resolved.required_size();
+        assert_eq!(first, resolved.required_size());
+        assert_eq!(first, resolved.required_size());
+
+        // And the frozen length is the demoted one, not the optimistic all-flyover one.
+        assert_eq!(
+            first,
+            path.dp_path().as_slice().len(),
+            "a fully demoted path is the standard path's own length"
+        );
+    }
+
+    #[test]
+    fn the_flyover_mac_covers_the_whole_packet_length() {
+        // PktLen in the MAC input is the common header, address header, path and payload together.
+        // Two packets differing only in payload size must produce different MACs, or the MAC would
+        // be replayable across packet sizes.
+        let path = path_with_one_reservation();
+        let now = at(1);
+
+        assert_ne!(
+            encode_resolved(&path, frame_at(ia(0x112), 100, now)),
+            encode_resolved(&path, frame_at(ia(0x112), 200, now)),
+        );
+    }
+
+    #[test]
+    fn the_flyover_mac_covers_the_destination_as() {
+        // The other MAC input no caller ever names. A reservation minted for one destination must
+        // not authenticate a packet to another.
+        let path = path_with_one_reservation();
+        let now = at(1);
+
+        assert_ne!(
+            encode_resolved(&path, frame_at(ia(0x112), 100, now)),
+            encode_resolved(&path, frame_at(ia(0x113), 100, now)),
+        );
+    }
+
+    #[test]
+    fn two_packets_in_the_same_millisecond_differ_by_their_counter() {
+        // The duplicate-detection counter is the only thing separating them, and the flyover MAC
+        // covers it — so without it a router would see one packet twice.
+        let path = path_with_one_reservation();
+        let frame = test_frame();
+
+        assert_ne!(encode_resolved(&path, frame), encode_resolved(&path, frame));
+    }
+
+    #[test]
+    fn resolution_stamps_the_packets_send_time() {
+        let path = path_with_one_reservation();
+        let now = UNIX_EPOCH + Duration::from_millis((START + 1) * 1000 + 250);
+
+        let resolved = path
+            .resolve(frame_at(ia(0x112), 100, now))
+            .expect("resolves");
+        let ResolvedPath::Hummingbird(hbird) = &resolved else {
+            panic!("a path with reservations resolves as Hummingbird");
+        };
+
+        assert_eq!(hbird.meta.base_timestamp, (START + 1) as u32);
+        assert_eq!(hbird.meta.millis_timestamp, 250);
+    }
+
+    #[test]
+    fn a_packet_too_long_to_encode_does_not_resolve() {
+        // Caught before any reservation is charged, so an oversized packet costs no bandwidth.
+        let path = path_with_one_reservation();
+
+        assert!(matches!(
+            path.resolve(frame_at(ia(0x112), u16::MAX, at(1))),
+            Err(PathResolveError::PacketTooLong(_))
+        ));
+    }
+
+    #[test]
+    fn a_demoted_hop_shrinks_the_packet_the_macs_cover() {
+        // The exact length is settled after selection, not before: a hop that loses its flyover
+        // takes eight bytes off the packet, and every remaining MAC must cover the shorter figure.
+        let mut path = two_segment_path();
+        path.add_reservation_at(0, reservation(ia(0x110), 0, 1, 600))
+            .expect("standard path");
+        path.add_reservation_at(1, reservation(ia(0x111), 2, 0, 600))
+            .expect("standard path");
+
+        let all = encode_resolved(&path, test_frame());
+        assert_eq!(flyover_count(&all), 2);
+
+        // Expiring the second hop's reservation leaves one flyover and a shorter path.
+        path.set_tracker(Arc::new(Lenient(TokenBucketTracker::new())))
+            .expect("standard path");
+        path.remove_expired_reservations(at(10_000));
+        path.add_reservation_at(0, reservation(ia(0x110), 0, 1, 600))
+            .expect("standard path");
+
+        let one = encode_resolved(&path, test_frame());
+        assert_eq!(flyover_count(&one), 1);
+        assert_eq!(all.len() - one.len(), 8);
+    }
+
+    /// Resolution over arbitrary path shapes and arbitrary sets of reserved hops.
+    ///
+    /// Proptest found two genuine wire-format bugs earlier in this port, and this is the same
+    /// class of code: a layout computed one way and read back another.
+    #[test]
+    fn any_path_resolves_to_something_that_parses_back() {
+        use proptest::{prelude::*, test_runner::Config};
+
+        use crate::dataplane_path::standard::model::ptest::ArbitraryPathContext;
+
+        proptest!(
+            Config::with_cases(200),
+            |(
+                path in StandardPath::arbitrary_with(ArbitraryPathContext {
+                    // Twenty-five flyovers fill a segment's 508-byte line count, so staying under
+                    // that keeps every generated shape encodeable and the interesting failures
+                    // reachable.
+                    hops_per_segment: 1..=8,
+                    ..Default::default()
+                }),
+                reserved_mask: u32,
+                exterior_len: u16,
+                offset: u16,
+            )| {
+                resolves_and_parses(path, reserved_mask, exterior_len, offset)?;
+            }
+        );
+
+        fn resolves_and_parses(
+            path: StandardPath,
+            reserved_mask: u32,
+            exterior_len: u16,
+            offset: u16,
+        ) -> Result<(), proptest::test_runner::TestCaseError> {
+            let hop_count = path.hop_field_count();
+            let standard = path.try_encode_to_owned_view()?;
+            let mut scion_path = ScionPath::new(
+                ia(0x110),
+                ia(0x112),
+                ScionDpPathView::Standard(standard),
+                None,
+                None,
+            );
+
+            let reserved: Vec<usize> = (0..hop_count)
+                .filter(|index| reserved_mask & (1 << (index % 32)) != 0)
+                .collect();
+            for &index in &reserved {
+                scion_path
+                    .add_reservation_at(index, reservation(ia(0x110), 0, 1, u16::MAX))
+                    .expect("a standard path takes an indexed reservation");
+            }
+
+            let frame = frame_at(ia(0x112), exterior_len, at(u64::from(offset)));
+            let resolved = match scion_path.resolve(frame) {
+                Ok(resolved) => resolved,
+                // The only failures a well-formed path may produce, both of them about this
+                // packet rather than about the path.
+                Err(PathResolveError::PacketTooLong(_) | PathResolveError::Encode(_)) => {
+                    return Ok(());
+                }
+                Err(other) => {
+                    return Err(proptest::test_runner::TestCaseError::fail(format!(
+                        "unexpected resolution failure: {other}"
+                    )));
+                }
+            };
+
+            let mut buf = vec![0u8; resolved.required_size()];
+            let written = resolved.try_encode(&mut buf)?;
+            prop_assert_eq!(written, resolved.required_size(), "short write");
+
+            if reserved.is_empty() {
+                prop_assert_eq!(&buf, scion_path.dp_path().as_slice());
+                return Ok(());
+            }
+
+            let (view, rest): (&HbirdPathView, _) = HbirdPathView::try_from_slice(&buf)?;
+            prop_assert!(rest.is_empty(), "trailing bytes after the path");
+            prop_assert_eq!(view.hop_fields().count(), hop_count);
+            prop_assert_eq!(
+                view.hop_fields().filter(|hop| hop.is_flyover()).count(),
+                reserved.len()
+            );
+            prop_assert_eq!(
+                HummingbirdPath::from_view(view).current_hop_field_index(),
+                path.current_hop_field as usize,
+                "the current hop field moved to another hop"
+            );
+
+            Ok(())
+        }
     }
 
     #[test]
