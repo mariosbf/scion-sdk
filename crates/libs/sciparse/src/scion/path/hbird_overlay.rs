@@ -112,6 +112,16 @@ pub struct HbirdHop {
     /// the pair of interfaces the traffic actually enters and leaves by.
     pub(crate) egress: u16,
 
+    /// Whether this hop can carry a flyover at all.
+    ///
+    /// False for the first hop field after an ordinary crossover. An AS terminating one segment
+    /// and starting the next owns both hop fields, but the crossover carries a *single*
+    /// reservation, and it lives on the earlier one — whose egress was resolved to this hop's at
+    /// construction for exactly that reason. A border router de-aggregates that earlier hop field,
+    /// steps to this one and verifies its plain SCION MAC without de-aggregating again, so a
+    /// flyover here is rejected as a MAC failure.
+    pub(crate) reservable: bool,
+
     /// The reservations attached to this hop. Any of them can turn it into a flyover; which one
     /// a given packet uses is the tracker's decision.
     pub(crate) reservations: Vec<Reservation>,
@@ -155,6 +165,14 @@ impl HbirdHop {
     /// Index of the segment this hop belongs to.
     pub fn segment_index(&self) -> usize {
         self.seg_idx
+    }
+
+    /// Whether this hop can carry a flyover.
+    ///
+    /// False only for the first hop field after an ordinary crossover, whose reservation belongs
+    /// to the preceding hop instead.
+    pub fn is_reservable(&self) -> bool {
+        self.reservable
     }
 }
 
@@ -264,6 +282,7 @@ impl HbirdOverlay {
                     isd_asn: as_sequence.get(as_idx).copied(),
                     ingress: hop_field.ingress_interface(info_field),
                     egress: hop_field.egress_interface(info_field),
+                    reservable: true,
                     reservations: Vec::new(),
                 });
 
@@ -288,6 +307,8 @@ impl HbirdOverlay {
 
             if crosses_segment && !segment_peering[hops[index].seg_idx] {
                 hops[index].egress = hops[index + 1].egress;
+                // The pair those two hop fields share is reserved once, here.
+                hops[index + 1].reservable = false;
             }
         }
 
@@ -310,14 +331,15 @@ impl HbirdOverlay {
     /// reservation is not for this path" without inspecting the path.
     ///
     /// A reservation covering an ordinary segment change matches the last hop of the earlier
-    /// segment, because that hop's egress was resolved to the next segment's at construction. A
-    /// peering crossover is not a segment change for this purpose: its two hop fields sit in
-    /// different ASes and each matches on its own interfaces.
+    /// segment, because that hop's egress was resolved to the next segment's at construction, and
+    /// the hop after it is skipped as unreservable. A peering crossover is not a segment change for
+    /// this purpose: its two hop fields sit in different ASes and each matches on its own
+    /// interfaces.
     pub(crate) fn try_add_reservation(&mut self, reservation: Reservation) -> bool {
         let info = reservation.info().clone();
         let mut matched = false;
 
-        for hop in &mut self.hops {
+        for hop in self.hops.iter_mut().filter(|hop| hop.reservable) {
             if hop.ingress == info.ingress_interface
                 && hop.egress == info.egress_interface
                 && hop.isd_asn.is_some_and(|isd_asn| isd_asn == info.isd_as)
@@ -337,16 +359,28 @@ impl HbirdOverlay {
     /// Attaches `reservation` to the hop at flat index `hop_idx`, counting hops across all
     /// segments in order, without matching it against the hop's interfaces.
     ///
-    /// Returns whether the index named a hop.
-    pub(crate) fn add_reservation_at(&mut self, hop_idx: usize, reservation: Reservation) -> bool {
-        match self.hops.get_mut(hop_idx) {
-            Some(hop) => {
-                hop.reservations.push(reservation);
-                self.rebuild_template();
-                true
-            }
-            None => false,
+    /// Fails if the index names no hop, or names one that cannot carry a flyover.
+    pub(crate) fn add_reservation_at(
+        &mut self,
+        hop_idx: usize,
+        reservation: Reservation,
+    ) -> Result<(), PathResolveError> {
+        let hop_count = self.hops.len();
+        let hop = self
+            .hops
+            .get_mut(hop_idx)
+            .ok_or(PathResolveError::HopIndexOutOfRange {
+                index: hop_idx,
+                hop_count,
+            })?;
+
+        if !hop.reservable {
+            return Err(PathResolveError::HopCannotCarryReservation { index: hop_idx });
         }
+
+        hop.reservations.push(reservation);
+        self.rebuild_template();
+        Ok(())
     }
 
     /// Drops every reservation whose validity window has passed by `now`.
@@ -1005,6 +1039,23 @@ mod tests {
         )
     }
 
+    /// Attaches a reservation to each of `hop_indices` that can carry one, and returns the indices
+    /// that took it.
+    ///
+    /// The first hop field after an ordinary crossover refuses, so a test that wants "a
+    /// reservation on these hops" has to ask the path which of them that means.
+    fn reserve_hops(path: &mut ScionPath, hop_indices: &[usize]) -> Vec<usize> {
+        let mut attached = Vec::new();
+        for &hop_idx in hop_indices {
+            match path.add_reservation_at(hop_idx, reservation(ia(0x110), 0, 1, 600)) {
+                Ok(()) => attached.push(hop_idx),
+                Err(PathResolveError::HopCannotCarryReservation { .. }) => {}
+                Err(err) => panic!("unexpected refusal for hop {hop_idx}: {err}"),
+            }
+        }
+        attached
+    }
+
     /// The path's overlay, built on demand for the cases that never attach a reservation and so
     /// never trigger the lazy one a `ScionPath` keeps.
     fn overlay_of(path: &ScionPath) -> HbirdOverlay {
@@ -1136,10 +1187,7 @@ mod tests {
         // Exercised across shapes because the layout depends on where the flyovers sit.
         for hops_with_reservations in [vec![], vec![0], vec![3], vec![1, 2], vec![0, 1, 2, 3]] {
             let mut path = two_segment_path();
-            for &hop_idx in &hops_with_reservations {
-                path.add_reservation_at(hop_idx, reservation(ia(0x110), 0, 1, 600))
-                    .expect("standard path");
-            }
+            reserve_hops(&mut path, &hops_with_reservations);
 
             let overlay = overlay_of(&path);
             let template = overlay.template.as_ref().expect("the shape fits");
@@ -1394,10 +1442,11 @@ mod tests {
         // because the template only applies when every reserved hop was selected.
         for reserved in [vec![0], vec![1, 2], vec![0, 1, 2, 3]] {
             let mut path = two_segment_path();
-            for &hop_idx in &reserved {
-                path.add_reservation_at(hop_idx, reservation(ia(0x110), 0, 1, 600))
-                    .expect("standard path");
-            }
+            let reserved = reserve_hops(&mut path, &reserved);
+            assert!(
+                !reserved.is_empty(),
+                "the shape must keep at least one flyover"
+            );
 
             // Cloned before either resolution so both start from the same duplicate-detection
             // counter; without that the two would legitimately differ.
@@ -1625,13 +1674,22 @@ mod tests {
                 None,
             );
 
-            let reserved: Vec<usize> = (0..hop_count)
+            let asked: Vec<usize> = (0..hop_count)
                 .filter(|index| reserved_mask & (1 << (index % 32)) != 0)
                 .collect();
-            for &index in &reserved {
-                scion_path
-                    .add_reservation_at(index, reservation(ia(0x110), 0, 1, u16::MAX))
-                    .expect("a standard path takes an indexed reservation");
+            let mut reserved = Vec::new();
+            for &index in &asked {
+                match scion_path.add_reservation_at(index, reservation(ia(0x110), 0, 1, u16::MAX)) {
+                    Ok(()) => reserved.push(index),
+                    // The first hop field after an ordinary crossover carries no flyover of its
+                    // own; the crossover's reservation lives on the hop before it.
+                    Err(PathResolveError::HopCannotCarryReservation { .. }) => {}
+                    Err(err) => {
+                        return Err(proptest::test_runner::TestCaseError::fail(format!(
+                            "unexpected refusal for hop {index}: {err}"
+                        )));
+                    }
+                }
             }
 
             let frame = frame_at(ia(0x112), exterior_len, at(u64::from(offset)));
@@ -1831,6 +1889,53 @@ mod tests {
             ])),
             None,
         )
+    }
+
+    #[test]
+    fn the_hop_after_an_ordinary_crossover_cannot_carry_a_reservation() {
+        // The crossover AS owns both hop fields but reserves the pair once, on the earlier one.
+        // A border router de-aggregates that hop field, steps to this one and verifies its plain
+        // SCION MAC without de-aggregating again — so a flyover here is dropped at the router.
+        let mut path = two_segment_path();
+
+        assert_eq!(
+            path.add_reservation_at(2, reservation(ia(0x111), 0, 3, 600))
+                .expect_err("the hop after a crossover refuses"),
+            PathResolveError::HopCannotCarryReservation { index: 2 }
+        );
+
+        let overlay = overlay_of(&path);
+        let reservable: Vec<bool> = overlay.hops.iter().map(HbirdHop::is_reservable).collect();
+        assert_eq!(reservable, [true, true, false, true]);
+    }
+
+    #[test]
+    fn a_reservation_for_the_hop_after_a_crossover_attaches_nowhere() {
+        // Its interface pair belongs to the crossover, whose reservation the hop before it already
+        // matches. Attaching here as well would mean two reservations for one pair.
+        let mut path = two_segment_path();
+
+        assert!(
+            !path
+                .try_add_reservation(reservation(ia(0x111), 0, 3, 600))
+                .expect("standard path"),
+            "the crossover's own pair is (2, 3), not (0, 3)"
+        );
+        assert!(!path.has_reservations());
+    }
+
+    #[test]
+    fn a_peering_crossover_leaves_both_of_its_hops_reservable() {
+        // A peering link joins an AS to its *peer*, so the two hop fields belong to different ASes
+        // and each carries its own reservation. The router skips its crossover handling here for
+        // the same reason.
+        let path = peering_path();
+        let overlay = overlay_of(&path);
+
+        assert!(
+            overlay.hops.iter().all(HbirdHop::is_reservable),
+            "a peering boundary reserves like any other link"
+        );
     }
 
     #[test]
@@ -2307,12 +2412,10 @@ mod tests {
     /// `path` with a reservation on every hop whose bit is set in `flyover_mask`.
     fn with_flyovers(path: &ScionPath, hop_count: usize, flyover_mask: u32) -> ScionPath {
         let mut path = path.clone();
-        for hop_idx in 0..hop_count {
-            if flyover_mask & (1 << hop_idx) != 0 {
-                path.add_reservation_at(hop_idx, reservation(ia(0x110), 0, 1, 600))
-                    .expect("standard path");
-            }
-        }
+        let asked: Vec<usize> = (0..hop_count)
+            .filter(|hop_idx| flyover_mask & (1 << hop_idx) != 0)
+            .collect();
+        reserve_hops(&mut path, &asked);
         path
     }
 

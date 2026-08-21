@@ -112,6 +112,17 @@ pub enum PathResolveError {
         /// The number of hops the path actually has.
         hop_count: usize,
     },
+    /// The hop exists but cannot carry a flyover, because it is the first hop field after an
+    /// ordinary crossover.
+    ///
+    /// Such a crossover carries one reservation, on the *preceding* hop field, whose egress is
+    /// already this hop's. Attach it there instead — which is what
+    /// [`try_add_reservation`](crate::path::ScionPath::try_add_reservation) does on its own.
+    #[error("hop {index} is the first after a crossover and cannot carry a reservation")]
+    HopCannotCarryReservation {
+        /// The index that was asked for.
+        index: usize,
+    },
     /// Every reservation on some hop was outside its validity window.
     ///
     /// The path itself is unharmed; renewing the reservation makes it sendable again. Wrap the

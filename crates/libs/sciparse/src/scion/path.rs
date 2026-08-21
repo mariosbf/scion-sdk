@@ -332,22 +332,16 @@ impl ScionPath {
     /// Attaches `reservation` to the hop at flat index `hop_idx`, counting hops across all
     /// segments in order, without matching it against that hop's interfaces.
     ///
+    /// Fails if the index names no hop, or names the first hop field after an ordinary crossover,
+    /// which cannot carry a flyover.
+    ///
     /// See also [`try_add_reservation`](Self::try_add_reservation).
     pub fn add_reservation_at(
         &mut self,
         hop_idx: usize,
         reservation: Reservation,
     ) -> Result<(), PathResolveError> {
-        let overlay = self.overlay_mut()?;
-        match overlay.add_reservation_at(hop_idx, reservation) {
-            true => Ok(()),
-            false => {
-                Err(PathResolveError::HopIndexOutOfRange {
-                    index: hop_idx,
-                    hop_count: overlay.hops.len(),
-                })
-            }
-        }
+        self.overlay_mut()?.add_reservation_at(hop_idx, reservation)
     }
 
     /// Drops every attached reservation whose validity window has passed by `now`.
