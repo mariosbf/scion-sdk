@@ -889,14 +889,35 @@ impl FlyoverHopField {
     ) {
         use FlyoverHopFieldLayout as FHFL;
 
-        // SAFETY: `buf` is exactly one flyover hop field, so every range is in bounds.
+        // The five per-packet fields are contiguous and between them cover bytes 6..20 exactly,
+        // so nothing here is a read-modify-write: the MAC is six bytes, and the remaining four
+        // fields pack into one big-endian u64 (22 + 10 + 16 + 16 bits). Writing them as two
+        // stores rather than through four bit-range writes is worth roughly a tenth of the encode
+        // — each bit-range write otherwise reads its lane, masks, and writes it back.
+        //
+        // Hand-packing is only safe while it agrees with the layout, so the layout checks it.
+        const {
+            assert!(FHFL::MAC_RNG.start == 48 && FHFL::MAC_RNG.end == 96);
+            assert!(FHFL::RES_ID_RNG.start == 96 && FHFL::RES_ID_RNG.end == 118);
+            assert!(FHFL::BW_RANGE.start == 118 && FHFL::BW_RANGE.end == 128);
+            assert!(FHFL::RES_START_OFFSET_RNG.start == 128);
+            assert!(FHFL::RES_START_OFFSET_RNG.end == 144);
+            assert!(FHFL::RES_DURATION_RNG.start == 144 && FHFL::RES_DURATION_RNG.end == 160);
+        }
+
+        // Masked for the same reason the flyover MAC's inputs are: `res_id` and `bw` are narrower
+        // than their Rust types, and an over-wide value would silently overwrite its neighbour
+        // rather than being truncated to its own field.
+        let tail = (u64::from(res_id & 0x003F_FFFF) << 42)
+            | (u64::from(bw & 0x03FF) << 32)
+            | (u64::from(res_start_offset) << 16)
+            | u64::from(res_duration);
+
+        // SAFETY: `buf` is exactly one flyover hop field, so bytes 6..20 are in bounds.
         unsafe {
-            buf.get_unchecked_mut(FHFL::MAC_RNG.aligned_byte_range())
-                .copy_from_slice(&mac.0);
-            unchecked_bit_range_be_write(buf, FHFL::RES_ID_RNG, res_id);
-            unchecked_bit_range_be_write(buf, FHFL::BW_RANGE, bw);
-            unchecked_bit_range_be_write(buf, FHFL::RES_START_OFFSET_RNG, res_start_offset);
-            unchecked_bit_range_be_write(buf, FHFL::RES_DURATION_RNG, res_duration);
+            buf.get_unchecked_mut(6..12).copy_from_slice(&mac.0);
+            buf.get_unchecked_mut(12..20)
+                .copy_from_slice(&tail.to_be_bytes());
         }
     }
 }
