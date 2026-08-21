@@ -526,11 +526,14 @@ impl HbirdOverlay {
             .and_then(|t| t.begin_packet(frame.now));
 
         let mut decisions: Vec<Option<HopDecision<'_>>> = Vec::with_capacity(self.hops.len());
+        let mut selected = 0usize;
         for hop in &self.hops {
-            decisions.push(self.select(session.as_deref_mut(), hop, frame.now, max_pkt_len)?);
+            let decision = self.select(session.as_deref_mut(), hop, frame.now, max_pkt_len)?;
+            selected += usize::from(decision.is_some());
+            decisions.push(decision);
         }
 
-        if decisions.iter().all(Option::is_none) {
+        if selected == 0 {
             return Ok(None);
         }
 
@@ -545,12 +548,27 @@ impl HbirdOverlay {
             }
         }
 
-        let mut meta = HbirdMetaFields {
-            current_info_field: self.current_info_field,
-            ..Default::default()
+        // The layout depends only on which hops go out as flyovers, so for the shape the template
+        // describes it is the layout the template already holds. That is the common case — a
+        // tracker refuses a hop only when it is out of bandwidth — and recomputing it walks every
+        // hop again for an answer fixed when the reservations were last changed.
+        let template = self
+            .template
+            .as_ref()
+            .filter(|template| template.flyover_offsets.len() == selected);
+
+        let (mut meta, encoded_len) = match template {
+            Some(template) => (template.meta, template.encoded.len()),
+            None => {
+                let mut meta = HbirdMetaFields {
+                    current_info_field: self.current_info_field,
+                    ..Default::default()
+                };
+                let encoded_len =
+                    self.apply_header_layout(&mut meta, |index, _| decisions[index].is_some())?;
+                (meta, encoded_len)
+            }
         };
-        let encoded_len =
-            self.apply_header_layout(&mut meta, |index, _| decisions[index].is_some())?;
 
         let packet_len = frame.exterior_len as usize + encoded_len;
         if packet_len > u16::MAX as usize {
