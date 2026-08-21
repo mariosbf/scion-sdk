@@ -209,7 +209,12 @@ pub struct HbirdOverlay {
     /// It is what separates two packets a router would otherwise see as identical: same path, same
     /// length, same millisecond. Atomic because resolution takes `&self`, so one path may be sent
     /// on from several threads at once.
-    pub(crate) counter: AtomicU32,
+    ///
+    /// Shared across clones rather than copied: a clone is a second handle on one path, not a
+    /// second path, and two handles emitting the same sequence is exactly the collision the
+    /// counter exists to prevent. An embedder that clones a path per packet — or forks one with
+    /// `Arc::make_mut` while packets are in flight — therefore cannot fork the sequence.
+    pub(crate) counter: Arc<AtomicU32>,
 
     /// The encoding of the all-flyover shape, rebuilt whenever the set of hops carrying
     /// reservations changes.
@@ -222,8 +227,8 @@ pub struct HbirdOverlay {
 }
 
 impl Clone for HbirdOverlay {
-    /// The clone continues the original's counter rather than restarting it, so a path that is
-    /// cloned and sent on does not immediately re-emit values the original already used.
+    /// The clone shares the original's counter rather than copying its value, so two handles on
+    /// one path advance a single sequence and can never emit the same value.
     fn clone(&self) -> Self {
         Self {
             hops: self.hops.clone(),
@@ -231,7 +236,7 @@ impl Clone for HbirdOverlay {
             current_info_field: self.current_info_field,
             current_hop_field_index: self.current_hop_field_index,
             tracker: self.tracker.clone(),
-            counter: AtomicU32::new(self.counter.load(Ordering::Relaxed)),
+            counter: Arc::clone(&self.counter),
             template: self.template.clone(),
         }
     }
@@ -318,7 +323,7 @@ impl HbirdOverlay {
             current_info_field: view.curr_info_field_idx(),
             current_hop_field_index: view.curr_hop_field_idx() as usize,
             tracker: None,
-            counter: AtomicU32::new(0),
+            counter: Arc::new(AtomicU32::new(0)),
             template: None,
         };
         overlay.rebuild_template();
@@ -1455,6 +1460,34 @@ mod tests {
     }
 
     #[test]
+    fn a_clone_shares_the_duplicate_detection_counter() {
+        // A clone is a second handle on one path, not a second path. If it copied the counter's
+        // value instead of sharing it, both handles would go on to emit the same sequence -- two
+        // packets a router sees as identical, which is the collision the counter exists to
+        // prevent. quiche relies on this: it hands out `Arc<ScionPath>` per packet and forks with
+        // `Arc::make_mut` when reservations change, both while packets are in flight.
+        let mut path = one_segment_path();
+        path.try_add_reservation(reservation(ia(0x111), 2, 3, 600))
+            .expect("standard path");
+
+        let original = path.hbird_overlay().expect("overlay").clone();
+        let clone = original.clone();
+
+        let first = original.counter.fetch_add(1, Ordering::Relaxed);
+        let second = clone.counter.fetch_add(1, Ordering::Relaxed);
+
+        assert_ne!(
+            first, second,
+            "a clone must not re-emit a value the original already used"
+        );
+        assert_eq!(
+            original.counter.load(Ordering::Relaxed),
+            clone.counter.load(Ordering::Relaxed),
+            "both handles must observe one sequence"
+        );
+    }
+
+    #[test]
     fn the_template_and_the_full_encoder_agree_byte_for_byte() {
         // A packet's validity must not depend on which encoder ran. Exercised across shapes,
         // because the template only applies when every reserved hop was selected.
@@ -1466,11 +1499,15 @@ mod tests {
                 "the shape must keep at least one flyover"
             );
 
-            // Cloned before either resolution so both start from the same duplicate-detection
-            // counter; without that the two would legitimately differ.
+            // The two overlays share one counter, so the second resolution would otherwise
+            // stamp a later value than the first and the encodings would legitimately differ.
+            // Pinned rather than avoided: the counter is an input to the encoding, and this test
+            // is about the encoders agreeing on equal inputs.
             let with_template = path.hbird_overlay().expect("overlay").clone();
             let mut without_template = with_template.clone();
             without_template.template = None;
+
+            let counter_at_start = with_template.counter.load(Ordering::Relaxed);
 
             let encode = |overlay: &HbirdOverlay| {
                 let resolved = overlay
@@ -1482,11 +1519,13 @@ mod tests {
                 buf
             };
 
-            assert_eq!(
-                encode(&with_template),
-                encode(&without_template),
-                "reservations on {reserved:?}"
-            );
+            let templated = encode(&with_template);
+            with_template
+                .counter
+                .store(counter_at_start, Ordering::Relaxed);
+            let full = encode(&without_template);
+
+            assert_eq!(templated, full, "reservations on {reserved:?}");
         }
     }
 
