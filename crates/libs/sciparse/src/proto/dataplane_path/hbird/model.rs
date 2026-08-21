@@ -47,16 +47,38 @@ use crate::{
 
 /// Why a Hummingbird path could not be encoded for a particular packet.
 ///
-/// Distinct from [`InvalidStructureError`] because these are failures of *this packet's*
-/// reservation material rather than of the path's structure: a path that fails one of these is
-/// still a perfectly good path a moment later, or for a different packet.
+/// Distinct from [`InvalidStructureError`] because these describe a path that is well-formed but
+/// cannot be laid out this way: with this reservation material, or with this many hops widened
+/// into flyovers. The same path may encode perfectly a moment later, or for a different packet,
+/// or with fewer flyovers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum HbirdEncodeError {
     /// The reservation did not start before the packet's base timestamp, or started so long
     /// before it that the offset does not fit its 16-bit field.
     #[error("the reservation is not valid for this packet's base timestamp")]
     ReservationNotValid,
+
+    /// A segment grew past the 7-bit line count the meta header can express. Reachable only on a
+    /// long segment with many flyovers, since each one widens a hop by two lines.
+    #[error("segment {segment} is {bytes} bytes, over the {max} the meta header can express", max = HbirdPathMetaLayout::MAX_SEGMENT_BYTES)]
+    SegmentTooLong {
+        /// Which of the path's segments overflowed.
+        segment: usize,
+        /// The length it would have needed, in bytes.
+        bytes: usize,
+    },
+
+    /// The current hop field landed past the 8-bit line offset the meta header can express, or at
+    /// an offset that is not a whole number of lines.
+    #[error("a current hop field at byte {bytes} cannot be addressed by the meta header")]
+    CurrentHopFieldUnaddressable {
+        /// The offset it would have needed, in bytes from the start of the hop fields.
+        bytes: usize,
+    },
 }
+
+/// Width of the 4-byte line the meta header counts segment lengths and hop field offsets in.
+pub const LINE_BYTES: usize = 4;
 
 /// The meta-header fields fixed for one packet.
 ///
@@ -81,6 +103,62 @@ pub struct HbirdMetaFields {
     pub millis_timestamp: u16,
     /// Packet counter. Twenty-two bits on the wire.
     pub counter: u32,
+}
+
+impl HbirdMetaFields {
+    /// Offset of the current hop field from the start of the hop fields, in bytes.
+    pub fn current_hop_field_bytes(&self) -> usize {
+        self.current_hop_field as usize * LINE_BYTES
+    }
+
+    /// Points the meta header at the hop field that starts `bytes` into the hop fields.
+    ///
+    /// Fails when that offset is not a whole number of lines, or is past the 255 lines the 8-bit
+    /// field can express.
+    pub fn set_current_hop_field_bytes(&mut self, bytes: usize) -> Result<(), HbirdEncodeError> {
+        let lines = bytes / LINE_BYTES;
+        if !bytes.is_multiple_of(LINE_BYTES) || lines > u8::MAX as usize {
+            return Err(HbirdEncodeError::CurrentHopFieldUnaddressable { bytes });
+        }
+
+        self.current_hop_field = lines as u8;
+        Ok(())
+    }
+
+    /// Records the length of each segment, given in bytes.
+    ///
+    /// Fails on the first segment past [`HbirdPathMetaLayout::MAX_SEGMENT_BYTES`], the largest a
+    /// 7-bit line count reaches.
+    pub fn set_segment_lengths_bytes(&mut self, bytes: [usize; 3]) -> Result<(), HbirdEncodeError> {
+        for (segment, &len) in bytes.iter().enumerate() {
+            if !len.is_multiple_of(LINE_BYTES) || len > HbirdPathMetaLayout::MAX_SEGMENT_BYTES {
+                return Err(HbirdEncodeError::SegmentTooLong {
+                    segment,
+                    bytes: len,
+                });
+            }
+            self.segment_lengths[segment] = (len / LINE_BYTES) as u8;
+        }
+
+        Ok(())
+    }
+
+    /// Number of info fields the segment lengths imply, one per non-empty segment.
+    pub fn info_field_count(&self) -> usize {
+        self.segment_lengths.iter().filter(|&&len| len > 0).count()
+    }
+
+    /// Total encoded size of the path header these fields describe.
+    pub fn encoded_len(&self) -> usize {
+        HbirdPathMetaLayout::SIZE_BYTES
+            + self.info_field_count() * InfoFieldLayout::SIZE_BYTES
+            + self
+                .segment_lengths
+                .iter()
+                .map(|&len| len as usize)
+                .sum::<usize>()
+                * LINE_BYTES
+    }
 }
 
 impl WireEncode for HbirdMetaFields {
@@ -1585,5 +1663,94 @@ mod flyover_encode_tests {
         meta().try_encode(&mut from_meta).expect("encodes");
 
         assert_eq!(&from_path[..HbirdPathMetaLayout::SIZE_BYTES], &from_meta);
+    }
+
+    /// One standard hop field followed by one flyover: 32 bytes, and both widths in one segment.
+    fn mixed_segment() -> HbirdSegment {
+        HbirdSegment {
+            info_field: InfoField {
+                flags: InfoFieldFlags::CONS_DIR,
+                segment_id: 7,
+                timestamp: RES_START as u32,
+            },
+            hop_fields: [
+                HbirdHopField::Standard(hop()),
+                HbirdHopField::Flyover(FlyoverHopField::from_hop_field(
+                    &hop(),
+                    &test_reservation(),
+                    HopFieldMac([1, 2, 3, 4, 5, 6]),
+                    0,
+                )),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    #[test]
+    fn the_meta_header_addresses_hop_fields_in_lines() {
+        let mut meta = HbirdMetaFields::default();
+
+        meta.set_current_hop_field_bytes(20 + 12)
+            .expect("two lines");
+        assert_eq!(meta.current_hop_field, 8);
+        assert_eq!(meta.current_hop_field_bytes(), 32);
+    }
+
+    #[test]
+    fn an_unaddressable_current_hop_field_is_refused() {
+        // Eight bits of line count reach 1020 bytes, and an offset that is not a whole number of
+        // lines has no encoding at all. Either would otherwise be truncated into an offset that
+        // names a different hop field.
+        let mut meta = HbirdMetaFields::default();
+
+        assert_eq!(
+            meta.set_current_hop_field_bytes(1024),
+            Err(HbirdEncodeError::CurrentHopFieldUnaddressable { bytes: 1024 })
+        );
+        assert_eq!(
+            meta.set_current_hop_field_bytes(14),
+            Err(HbirdEncodeError::CurrentHopFieldUnaddressable { bytes: 14 })
+        );
+        assert_eq!(meta.set_current_hop_field_bytes(1020), Ok(()));
+    }
+
+    #[test]
+    fn a_segment_past_the_line_count_field_is_refused() {
+        // Seven bits per segment length, so 127 lines and 508 bytes. This is the limit that makes
+        // mixing 12- and 20-byte hop fields in one segment possible at all, and the one a long
+        // path with many flyovers runs into.
+        let mut meta = HbirdMetaFields::default();
+
+        assert_eq!(meta.set_segment_lengths_bytes([508, 0, 0]), Ok(()));
+        assert_eq!(meta.segment_lengths, [127, 0, 0]);
+
+        assert_eq!(
+            meta.set_segment_lengths_bytes([12, 512, 0]),
+            Err(HbirdEncodeError::SegmentTooLong {
+                segment: 1,
+                bytes: 512
+            })
+        );
+    }
+
+    #[test]
+    fn the_meta_header_reports_the_length_of_the_path_it_describes() {
+        // Resolution sizes the packet from these fields alone, without building a path model.
+        let path = HummingbirdPath {
+            current_info_field: 0,
+            current_hop_field: 0,
+            segments: vec![mixed_segment(), mixed_segment()],
+            base_timestamp: RES_START as u32,
+            millis_timestamp: 0,
+            counter: 0,
+        };
+
+        let mut meta = HbirdMetaFields::default();
+        meta.set_segment_lengths_bytes([12 + 20, 20 + 12, 0])
+            .expect("both segments fit");
+
+        assert_eq!(meta.info_field_count(), 2);
+        assert_eq!(meta.encoded_len(), path.required_size());
     }
 }

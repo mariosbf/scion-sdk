@@ -123,7 +123,10 @@ impl HbirdPathMetaLayout {
     /// Size of meta header in bytes
     pub const SIZE_BYTES: usize = Self::TOTAL_RNG.end / 8;
 
-    /// Maximum length of a path segment in bytes
+    /// Maximum length of a path segment in bytes: the 127 lines a 7-bit line count reaches.
+    ///
+    /// Counting lines rather than hop fields is what lets one segment mix the 12-byte standard
+    /// hop field with the 20-byte flyover.
     pub const MAX_SEGMENT_BYTES: usize = 508;
 }
 

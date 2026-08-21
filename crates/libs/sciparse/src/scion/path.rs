@@ -354,7 +354,7 @@ impl ScionPath {
         &mut self,
         tracker: Arc<dyn ReservationTracker>,
     ) -> Result<(), PathResolveError> {
-        self.overlay_mut()?.tracker = Some(tracker);
+        self.overlay_mut()?.set_tracker(tracker);
         Ok(())
     }
 
