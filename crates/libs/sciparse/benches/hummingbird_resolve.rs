@@ -14,7 +14,10 @@
 
 //! What it costs to put a Hummingbird path on the wire, per packet.
 //!
-//! Four groups over the same paths, so the differences between them isolate one cost each:
+//! Two criterion groups, each sweeping a different axis of the same cost model.
+//!
+//! `hummingbird_resolve` runs four groups over the same paths, so the differences between them
+//! isolate one cost each:
 //!
 //! | group | tracker | adds |
 //! |---|---|---|
@@ -26,6 +29,19 @@
 //! So *probabilistic − untracked* is what selection costs and *tracked − probabilistic* is what
 //! client-side enforcement costs. Hop counts are swept so the per-hop slope is visible, and all
 //! four groups run together so the numbers are comparable without cross-run noise.
+//!
+//! `hummingbird_candidates` holds the path fixed at 6 hops, all reserved, and instead sweeps how
+//! many candidate reservations are offered at *each* hop:
+//!
+//! | group | held fixed | swept | isolates |
+//! |---|---|---|---|
+//! | `hummingbird_candidates` | 6 hops, all reserved | reservations per hop, 1–16 | tracker
+//!   selection alone — candidates are invisible on the wire |
+//!
+//! Selection scans every candidate on every hop for every packet, so its cost grows with
+//! candidate count while the encoded bytes do not: exactly one flyover per hop is chosen and
+//! written regardless of how many were offered. That makes this group a probe of the tracker's
+//! selection algorithm in isolation from `hummingbird_resolve`'s hop-count slope.
 
 use std::{
     hint::black_box,
@@ -58,6 +74,12 @@ use sciparse::{
 
 /// Hop counts to sweep. Real paths in a test topology run from 2 to 11 hop fields.
 const HOP_COUNTS: [usize; 5] = [2, 4, 6, 8, 11];
+
+/// Hop count `hummingbird_candidates` holds fixed while it sweeps candidates per hop.
+const CANDIDATES_HOP_COUNT: usize = 6;
+
+/// Candidate reservations offered per hop, swept by `hummingbird_candidates`.
+const CANDIDATE_COUNTS: [usize; 5] = [1, 2, 4, 8, 16];
 
 /// Payload size the packet-rate ceiling is quoted at.
 const PAYLOAD_BYTES: u16 = 1200;
@@ -123,28 +145,38 @@ fn standard_path(hops: usize) -> ScionPath {
     )
 }
 
-/// `standard_path`, with one reservation on every hop and `tracker` attached.
-fn reserved_path(hops: usize, tracker: Option<Arc<dyn ReservationTracker>>) -> ScionPath {
+/// `standard_path`, with `candidates` reservations on every hop and `tracker` attached.
+///
+/// Each hop's candidates get distinct `res_id`s. The tracker keys its buckets by reservation
+/// identity, so reusing one id across candidates would collapse them into a single bucket and
+/// silently benchmark 1 candidate no matter what `candidates` says.
+fn reserved_path_with_candidates(
+    hops: usize,
+    candidates: usize,
+    tracker: Option<Arc<dyn ReservationTracker>>,
+) -> ScionPath {
     let mut path = standard_path(hops);
 
     for index in 0..hops {
-        path.add_reservation_at(
-            index,
-            Reservation::new(
-                ReservationInfo {
-                    isd_as: ia(0x110),
-                    ingress_interface: index as u16,
-                    egress_interface: index as u16 + 1,
-                    res_id: index as u32,
-                    bandwidth: Bandwidth::from_bytes_per_sec(RESERVATION_BYTES_PER_SEC)
-                        .expect("representable"),
-                    start: now() - Duration::from_secs(60),
-                    duration: u16::MAX,
-                },
-                [0x11; 16],
-            ),
-        )
-        .expect("a standard path takes an indexed reservation");
+        for candidate in 0..candidates {
+            path.add_reservation_at(
+                index,
+                Reservation::new(
+                    ReservationInfo {
+                        isd_as: ia(0x110),
+                        ingress_interface: index as u16,
+                        egress_interface: index as u16 + 1,
+                        res_id: (index * candidates + candidate) as u32,
+                        bandwidth: Bandwidth::from_bytes_per_sec(RESERVATION_BYTES_PER_SEC)
+                            .expect("representable"),
+                        start: now() - Duration::from_secs(60),
+                        duration: u16::MAX,
+                    },
+                    [0x11; 16],
+                ),
+            )
+            .expect("a standard path takes an indexed reservation");
+        }
     }
 
     if let Some(tracker) = tracker {
@@ -152,6 +184,11 @@ fn reserved_path(hops: usize, tracker: Option<Arc<dyn ReservationTracker>>) -> S
     }
 
     path
+}
+
+/// `standard_path`, with one reservation on every hop and `tracker` attached.
+fn reserved_path(hops: usize, tracker: Option<Arc<dyn ReservationTracker>>) -> ScionPath {
+    reserved_path_with_candidates(hops, 1, tracker)
 }
 
 fn address() -> AddressHeader {
@@ -237,5 +274,57 @@ fn resolve_and_encode(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, resolve_and_encode);
+/// Sweeps candidates per hop at a fixed 6-hop, fully-reserved path, for the two trackers that
+/// actually select among candidates. `standard`/`untracked` have no candidate-selection cost to
+/// probe (untracked always takes the first reservation it sees), so they are not repeated here —
+/// `hummingbird_resolve` already covers them.
+fn candidates_sweep(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hummingbird_candidates");
+    // One element per packet, so criterion reports the single-core packet-rate ceiling directly.
+    group.throughput(Throughput::Elements(1));
+
+    for candidates in CANDIDATE_COUNTS {
+        let cases: [(&str, ScionPath); 2] = [
+            (
+                "probabilistic",
+                reserved_path_with_candidates(
+                    CANDIDATES_HOP_COUNT,
+                    candidates,
+                    Some(Arc::new(ProbabilisticTracker::new())),
+                ),
+            ),
+            (
+                "tracked",
+                reserved_path_with_candidates(
+                    CANDIDATES_HOP_COUNT,
+                    candidates,
+                    Some(Arc::new(TokenBucketTracker::new())),
+                ),
+            ),
+        ];
+
+        for (label, path) in cases {
+            // Also warms the token bucket tracker's slab, so the first timed iteration is not the
+            // one that allocates every bucket.
+            assert_shape(&path, CANDIDATES_HOP_COUNT, label);
+
+            let frame = PacketFrame::new(&address(), PAYLOAD_BYTES, now());
+            let mut buf = vec![0u8; 1024];
+
+            group.bench_with_input(BenchmarkId::new(label, candidates), &candidates, |b, _| {
+                b.iter(|| {
+                    let resolved = path.resolve(black_box(frame)).expect("resolves");
+                    let written = resolved
+                        .try_encode(&mut buf[..resolved.required_size()])
+                        .expect("encodes");
+                    black_box(written)
+                })
+            });
+        }
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, resolve_and_encode, candidates_sweep);
 criterion_main!(benches);
