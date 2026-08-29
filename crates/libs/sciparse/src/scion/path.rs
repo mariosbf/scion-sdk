@@ -19,8 +19,7 @@
 //! time, MTU, and interfaces used by the path.
 
 use std::{
-    borrow::Cow, collections::HashMap, fmt::Display, net::SocketAddr, sync::Arc,
-    time::SystemTime,
+    borrow::Cow, collections::HashMap, fmt::Display, net::SocketAddr, sync::Arc, time::SystemTime,
 };
 
 use prost_types::Timestamp;
@@ -397,7 +396,12 @@ impl ScionPath {
                 .enumerate()
                 .filter(|(_, hop)| hop.is_reservable())
                 .filter_map(|(idx, hop)| {
-                    Some((u8::try_from(idx).ok()?, hop.isd_asn()?, hop.ingress(), hop.egress()))
+                    Some((
+                        u8::try_from(idx).ok()?,
+                        hop.isd_asn()?,
+                        hop.ingress(),
+                        hop.egress(),
+                    ))
                 })
                 .collect(),
         )
@@ -418,6 +422,25 @@ impl ScionPath {
         self.hbird
             .as_ref()
             .is_some_and(HbirdOverlay::has_reservations)
+    }
+
+    /// The longest header any resolution of this path can produce, in bytes.
+    ///
+    /// For a path with attached reservations this is the shape in which every hop that carries a
+    /// reservation resolves as a flyover. For any other path — including one whose reservations
+    /// have all been removed — it is the dataplane path's encoded length, since such packets are
+    /// sent as plain standard bytes.
+    ///
+    /// The value changes only when a hop's reservation count crosses zero: attaching a further
+    /// reservation to an already-reserved hop does not change it, because resolution places at
+    /// most one fixed-size flyover per hop. A caller can therefore treat growth as "the header
+    /// may now exceed what was previously validated" (e.g. to re-validate path MTU) and a shrink
+    /// as free headroom.
+    pub fn max_encoded_len(&self) -> Result<usize, PathResolveError> {
+        match self.hbird.as_ref() {
+            Some(overlay) if overlay.has_reservations() => Ok(overlay.max_encoded_len()?),
+            _ => Ok(self.dp_path.as_slice().len()),
+        }
     }
 }
 // accessors

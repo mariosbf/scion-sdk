@@ -2733,4 +2733,66 @@ mod tests {
         walked.template = None;
         assert_eq!(walked.max_encoded_len().unwrap(), fast);
     }
+
+    #[test]
+    fn max_encoded_len_of_an_unreserved_path_is_the_dataplane_length() {
+        // No overlay at all, and an overlay with no reservations left, both
+        // resolve to plain standard bytes -- the bound must say so.
+        let path = one_segment_path();
+        let dp_len = path.dp_path().as_slice().len();
+        assert_eq!(path.max_encoded_len().unwrap(), dp_len);
+    }
+
+    #[test]
+    fn max_encoded_len_changes_only_when_a_hop_count_crosses_zero() {
+        let mut path = one_segment_path();
+        let plain = path.max_encoded_len().unwrap();
+
+        // 0 -> 1 on hop 0: the meta header appears and the hop widens.
+        assert_eq!(reserve_hops(&mut path, &[0]), vec![0]);
+        let one_hop = path.max_encoded_len().unwrap();
+        assert!(one_hop > plain, "first reservation must grow the bound");
+
+        // 1 -> 2 on the same hop: renewal-in-place, must be free.
+        assert_eq!(reserve_hops(&mut path, &[0]), vec![0]);
+        assert_eq!(
+            path.max_encoded_len().unwrap(),
+            one_hop,
+            "a second reservation on a reserved hop must not change the bound"
+        );
+
+        // 0 -> 1 on a second hop: grows by exactly one flyover delta.
+        assert_eq!(reserve_hops(&mut path, &[1]), vec![1]);
+        assert_eq!(
+            path.max_encoded_len().unwrap(),
+            one_hop + FlyoverHopFieldLayout::SIZE_BYTES - HopFieldLayout::SIZE_BYTES,
+        );
+    }
+
+    #[test]
+    fn max_encoded_len_shrinks_when_expired_reservations_are_removed() {
+        let mut path = one_segment_path();
+        let plain = path.max_encoded_len().unwrap();
+        assert_eq!(reserve_hops(&mut path, &[0]), vec![0]);
+        let reserved = path.max_encoded_len().unwrap();
+
+        // The fixture reservations run 600 seconds from START; step past them.
+        path.remove_expired_reservations(at(601));
+
+        let stripped = path.max_encoded_len().unwrap();
+        assert!(stripped < reserved);
+        assert_eq!(
+            stripped, plain,
+            "a reserved path with no reservations left resolves standard"
+        );
+    }
+
+    #[test]
+    fn max_encoded_len_matches_the_resolved_length_when_every_reserved_hop_is_selected() {
+        // The bound is not just an upper bound: with valid reservations on
+        // every reserved hop, resolution reaches it exactly.
+        let path = path_with_one_reservation();
+        let resolved_len = encode_resolved(&path, test_frame()).len();
+        assert_eq!(path.max_encoded_len().unwrap(), resolved_len);
+    }
 }
