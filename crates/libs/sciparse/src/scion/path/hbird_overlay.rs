@@ -664,13 +664,23 @@ impl HbirdOverlay {
         meta.counter = self.counter.fetch_add(1, Ordering::Relaxed) % COUNTER_MODULUS;
     }
 
-    /// The longest this path's header can encode to: every hop a flyover.
+    /// The longest this path's header can encode to: every hop that carries a reservation
+    /// becomes a flyover.
+    ///
+    /// This is the template shape — when a template exists its encoded length is the answer,
+    /// already computed; the layout walk covers shapes that have none. A hop without
+    /// reservations can never be selected, so it never widens; the value therefore changes only
+    /// when a hop's reservation count crosses zero.
     ///
     /// Selection is offered this bound rather than the exact length, which is not knowable until
     /// selection has answered. It is never smaller than what the packet turns out to be.
-    fn max_encoded_len(&self) -> Result<usize, HbirdEncodeError> {
+    pub(crate) fn max_encoded_len(&self) -> Result<usize, HbirdEncodeError> {
+        if let Some(template) = &self.template {
+            return Ok(template.encoded.len());
+        }
+
         let mut meta = HbirdMetaFields::default();
-        self.apply_header_layout(&mut meta, |_, _| true)
+        self.apply_header_layout(&mut meta, |_, hop| hop.has_reservation())
     }
 
     /// Whether any hop carries a reservation.
@@ -2691,5 +2701,36 @@ mod tests {
                 live.name
             );
         }
+    }
+
+    #[test]
+    fn the_length_bound_counts_only_hops_that_carry_reservations() {
+        // Same path, one hop reserved vs. none: the bound must differ, and
+        // the unreserved shape must not be billed at flyover width.
+        let bare = one_segment_path();
+        let mut reserved = one_segment_path();
+        assert_eq!(reserve_hops(&mut reserved, &[0]), vec![0]);
+
+        let bare_len = overlay_of(&bare).max_encoded_len().unwrap();
+        let reserved_len = overlay_of(&reserved).max_encoded_len().unwrap();
+
+        assert!(
+            reserved_len > bare_len,
+            "reserving a hop must widen the bound: {reserved_len} vs {bare_len}"
+        );
+    }
+
+    #[test]
+    fn the_length_bound_agrees_with_and_without_the_template() {
+        let mut path = one_segment_path();
+        assert_eq!(reserve_hops(&mut path, &[0]), vec![0]);
+
+        let overlay = overlay_of(&path);
+        assert!(overlay.template.is_some(), "the shape has a template");
+        let fast = overlay.max_encoded_len().unwrap();
+
+        let mut walked = overlay.clone();
+        walked.template = None;
+        assert_eq!(walked.max_encoded_len().unwrap(), fast);
     }
 }
