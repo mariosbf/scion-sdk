@@ -206,14 +206,14 @@ pub struct HbirdOverlay {
 
     /// Duplicate-detection counter, stamped into the meta header and covered by every flyover MAC.
     ///
-    /// It is what separates two packets a router would otherwise see as identical: same path, same
+    /// Separates two packets a router would otherwise see as identical: same path, same
     /// length, same millisecond. Atomic because resolution takes `&self`, so one path may be sent
     /// on from several threads at once.
     ///
-    /// Shared across clones rather than copied: a clone is a second handle on one path, not a
-    /// second path, and two handles emitting the same sequence is exactly the collision the
-    /// counter exists to prevent. An embedder that clones a path per packet — or forks one with
-    /// `Arc::make_mut` while packets are in flight — therefore cannot fork the sequence.
+    /// Shared across clones rather than copied.
+    ///
+    /// Starts at a random value: two paths built separately from the same reservation do not
+    /// share a counter, and a common start of zero would make them emit the same sequence.
     pub(crate) counter: Arc<AtomicU32>,
 
     /// The encoding of the all-flyover shape, rebuilt whenever the set of hops carrying
@@ -323,7 +323,7 @@ impl HbirdOverlay {
             current_info_field: view.curr_info_field_idx(),
             current_hop_field_index: view.curr_hop_field_idx() as usize,
             tracker: None,
-            counter: Arc::new(AtomicU32::new(0)),
+            counter: Arc::new(AtomicU32::new(rand::random_range(0..COUNTER_MODULUS))),
             template: None,
         };
         overlay.rebuild_template();
@@ -631,27 +631,21 @@ impl HbirdOverlay {
             // With no tracker there is no policy to consult, only validity: the first reservation
             // still inside its window carries the hop, and none being valid is the same failure a
             // tracker would report.
-            (None, None) => {
-                match hop.reservations.first() {
-                    None => None,
-                    Some(_) => {
-                        Some(Selected::untracked(
-                            hop.reservations
-                                .iter()
-                                .find(|reservation| reservation.is_valid_at(now))
-                                .ok_or(ReservationTrackerError::ReservationExpired)?,
-                        ))
-                    }
-                }
-            }
+            (None, None) => match hop.reservations.first() {
+                None => None,
+                Some(_) => Some(Selected::untracked(
+                    hop.reservations
+                        .iter()
+                        .find(|reservation| reservation.is_valid_at(now))
+                        .ok_or(ReservationTrackerError::ReservationExpired)?,
+                )),
+            },
         };
 
-        Ok(selected.map(|selected| {
-            HopDecision {
-                selected,
-                mac: HopFieldMac::zero(),
-                res_start_offset: 0,
-            }
+        Ok(selected.map(|selected| HopDecision {
+            selected,
+            mac: HopFieldMac::zero(),
+            res_start_offset: 0,
         }))
     }
 
@@ -1109,11 +1103,9 @@ mod tests {
         let mut segments: Vec<HbirdSegment> = overlay
             .info_fields
             .iter()
-            .map(|info_field| {
-                HbirdSegment {
-                    info_field: *info_field,
-                    hop_fields: Default::default(),
-                }
+            .map(|info_field| HbirdSegment {
+                info_field: *info_field,
+                hop_fields: Default::default(),
             })
             .collect();
 
